@@ -134,3 +134,21 @@ C2C 普通消息实际提供的原生私聊 ID 与私聊 union 显示身份也�
 批量成员操作最多 500 项，返回逐项 `saved/failed` 和成功／失败计数；部分失败须逐项处理，不能假定全部成功。`POST /api/ext/account-sharing/account-batches` 接受 `{operation:"update",ids:[...],data:{...}}` 或 `{operation:"delete",ids:[...]}`，同样返回逐项结果。新增账户及新增授权来源会生成新 ID，重试前先核对已保存项。
 
 通用模块消费方通过 `register_function(bot,function)` 注册功能，以 `register_resources(bot,namespace,[{id,groups,enabled}])` 发布该命名空间的完整资源清单。`decide(...,resource_namespace=...)` 可显式共享同一资源清单，默认命名空间为自身功能；调用资格、群白名单和成员核验始终单独检查。账户共享管理入口固定使用自身账户命名空间。旧单功能／单资源授权按一次来源兼容读取，不扩展为未来范围。
+
+## 范围拒绝、期限与主人解释
+
+拉黑沿用 `scope:"member"` 或 `scope:"group"` 选择主体，另用 `function_scope` 选择单功能、功能授权组或全部功能。功能授权组及全部范围按当前注册集合解释，新增符合范围的功能同样受拒绝约束。每条拒绝有独立 ID；解除指定 `source` 只移除该条，其他适用拒绝继续生效。框架黑名单、模块拒绝始终优先，重新授予权限不解除拉黑。
+
+```text
+账户管理 拉黑 {"group":"fake-group","member":"fake-member","scope":"member","function_scope":{"kind":"all"}}
+账户管理 解除拉黑 {"group":"fake-group","member":"fake-member","scope":"member","source":"拒绝ID"}
+账户管理 期限 {"group":"fake-group","member":"fake-member","source":"授权来源ID","expires_at":2000000000}
+账户管理 批量期限 {"group":"fake-group","members":[{"member":"fake-member"}],"expires_at":null}
+账户管理 解释 {"group":"fake-group","member":"fake-member","resource":"账户ID","action":"private"}
+```
+
+单人及批量授权可设置 `expires_at`，为 Unix 秒数；省略或 `null` 为长期，到达该秒立即到期。页面使用本地时间输入并转换为 Unix 秒。`set_expiry`／`bulk_expiry` 修改已有来源的期限，不创建新来源；未填写 `source` 时处理当前管理功能在此群为该成员保存的全部来源，找不到来源会明确失败。批量返回逐项结果与计数，不能把失败项当成已修改。修改期限不会解除拉黑或重新授予已撤销的来源。
+
+解释 API 的 `action` 默认为 `view`（资源资格），也支持 `invoke`（只检查功能调用）及账户插件的 `private`（同时需要可靠私聊映射）。缺少绑定不影响普通资源资格；私聊解释返回 `qualification_allowed`、`binding` 并可给出 `pending_binding`。解释列出适用拒绝、授权来源及其 `active/expired` 状态、期限、成员状态、判断时间和版本；原因区分框架拒绝、模块拒绝、群未准入、待核验、无调用资格、无资源资格、到期与停用。详情仅供主人及已登录后台，私聊解释同时复用实际发送的接收者框架黑名单检查，不预测平台是否接受发送；普通成员只收到统一拒绝提示。
+
+目录、关键词和旧按钮均实时重算。发送前在读取最新内容并检查私聊目标后再次判断权限和当前时间；到期无需等待后台清理。旧单功能拒绝仍按单功能解释，旧无期限授权保持长期，授权状态格式升级到 v3，随后续保存写回。通用模块另提供同步 `decision_current(bot,decision)`，供消费方在异步准备后、实际派发前检查版本和 `valid_until`；它不能代替重新计算授权。多个仍有效来源按可用的最长持续期限组合，某个冗余短期来源到期不会废除其他有效来源。

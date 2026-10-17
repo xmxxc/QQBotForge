@@ -31,6 +31,8 @@ ACCESS_COMMANDS = {
     '功能组': 'function_group',
     '批量授权': 'bulk_grant',
     '批量撤权': 'bulk_revoke',
+    '期限': 'set_expiry',
+    '批量期限': 'bulk_expiry',
 }
 ACCOUNT_FIELDS = {'name', 'login', 'password', 'enabled', 'description', 'url', 'groups'}
 
@@ -322,7 +324,31 @@ class AccountSharing:
         text = title + f'（{page + 1}/{last + 1}）\n' + '\n'.join(lines)
         if context['menu'] == 'accounts':
             text += f'\n文字翻页：账户列表 {page + 2}' if page < last else '\n发送“账户列表”刷新当前资格'
+        module = self.access()
+        decisions = []
+        for _, action in selected:
+            if action['kind'] == 'page':
+                continue
+            target = action if action['kind'] == 'group' else context
+            decision = await module.decide(
+                event.appid,
+                FUNCTION,
+                target['group'],
+                target['member'],
+                action.get('resource', ''),
+                action='view' if action['kind'] == 'query' else 'invoke',
+                framework_allowed=await self.framework_event_allowed(event)
+                and await self.framework_context_allowed(event.appid, target['group'], target['member']),
+            )
+            decisions.append(decision)
         rows = await self.menus.issue(event, context, selected)
+
+        def current():
+            return self.access_provider() is module and all(module.decision_current(event.appid, d) for d in decisions)
+
+        if not current():
+            await self.deny(event)
+            return
         for row in rows:
             for button in row:
                 if button['text'] in {'上一页', '下一页'}:
@@ -334,7 +360,10 @@ class AccountSharing:
             if not response or not response[0]:
                 raise RuntimeError('Buttons rejected')
         except Exception:
-            await event.reply(text + '\n按钮暂不可用，请使用以上文字命令。')
+            if current():
+                await event.reply(text + '\n按钮暂不可用，请使用以上文字命令。')
+            else:
+                await self.deny(event)
 
     async def on_interaction(self, event):
         payload = event.content or ''
@@ -444,6 +473,7 @@ class AccountSharing:
             await self.deny(event)
             return
         content = await self.query_content(bot, resource, rule_id)
+        private_allowed = await self.framework_private_allowed(bot, binding['private_id'])
         final = await self.query_decision(event, context, resource, rule_id)
         if (
             not final['allowed']
@@ -451,7 +481,8 @@ class AccountSharing:
             or content is None
             or not self.active
             or not self.current_rules(bot, qa_guard)
-            or not await self.framework_private_allowed(bot, binding['private_id'])
+            or not private_allowed
+            or not self.access().decision_current(bot, final)
         ):
             await self.deny(event)
             return
@@ -580,6 +611,9 @@ class AccountSharing:
             raise BusinessError('授权请求须为对象')
         values = dict(data)
         operation = values.pop('operation', '')
+        private_explanation = operation == 'explain' and values.get('action') == 'private'
+        if private_explanation:
+            values['action'] = 'view'
         values.setdefault('function', FUNCTION)
         try:
             await self.sync_access_resources(bot)
@@ -600,9 +634,17 @@ class AccountSharing:
                     if not isinstance(resource, str) or not await self.store.get(bot, 'accounts', resource):
                         raise BusinessError('账户不存在', 404)
             result = await self.access().execute(bot, operation, **values)
+            if private_explanation:
+                result['qualification_allowed'] = result['allowed']
+                binding = await self.identities.lookup(bot, values.get('group', ''), values.get('member', ''))
+                result['binding'] = 'verified' if binding else 'pending'
+                if result['allowed'] and not binding:
+                    result.update(allowed=False, reason='pending_binding')
+                elif result['allowed'] and binding and not await self.framework_private_allowed(bot, binding['private_id']):
+                    result.update(allowed=False, reason='framework_denied')
             if operation == 'grant':
                 result['operation_result'] = await self.grant_result(bot, result)
-            elif operation in {'bulk_grant', 'bulk_revoke'}:
+            elif operation in {'bulk_grant', 'bulk_revoke', 'bulk_expiry'}:
                 await self.bulk_result(bot, operation, values.get('group', ''), result)
             return result
         except BusinessError:

@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import json
+import math
 import sqlite3
 import time
 from uuid import uuid4
@@ -20,6 +21,12 @@ def identity_key(*parts):
 def identifier(value):
     if not isinstance(value, str) or not value.strip() or len(value) > 256:
         raise ValueError('请提供明确的 Bot、功能、群和原生身份标识')
+    return value
+
+
+def expiry(value):
+    if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or value > 253402300799 or not math.isfinite(value)):
+        raise ValueError('到期时间须为非负有限 Unix 秒数或 null（长期）')
     return value
 
 
@@ -61,13 +68,17 @@ class AccessControl:
                         'denies': [],
                     }
         state = self.states[bot]
-        if state.get('schema_version', 1) > 2:
+        if state.get('schema_version', 1) > 3:
             raise RuntimeError('授权数据版本高于当前模块')
-        state['schema_version'] = 2
+        state['schema_version'] = 3
         state.setdefault('functions', {})
         state.setdefault('function_groups', {})
         state.setdefault('resources', {})
+        for deny in state['denies']:
+            deny.setdefault('id', uuid4().hex)
+            deny.setdefault('function_scope', {'kind': 'function', 'id': deny['function']})
         for grant in state['grants']:
+            grant.setdefault('expires_at', None)
             state['functions'].setdefault(grant['function'], {'id': grant['function']})
         for key in state['whitelist']:
             function = json.loads(key)[1]
@@ -191,10 +202,17 @@ class AccessControl:
                     raise ValueError('批量目标须使用 group_member_openid 类型')
                 native = identifier(target.get('member'))
                 values = {**common, **{k: v for k, v in target.items() if k != 'member'}}
-                if operation == 'bulk_revoke':
+                if operation != 'bulk_grant':
                     values.pop('identity_type', None)
                     values.pop('confirmed', None)
-                result = await self.execute(bot, 'grant' if operation == 'bulk_grant' else 'revoke', function=function, group=group, member=native, **values)
+                result = await self.execute(
+                    bot,
+                    {'bulk_grant': 'grant', 'bulk_revoke': 'revoke', 'bulk_expiry': 'set_expiry'}[operation],
+                    function=function,
+                    group=group,
+                    member=native,
+                    **values,
+                )
                 results.append({'member': native, 'status': 'saved', 'result': result})
             except (ValueError, RuntimeError, sqlite3.Error, OSError) as error:
                 results.append({'member': target.get('member', '') if isinstance(target, dict) else '', 'status': 'failed', 'error': str(error)})
@@ -202,16 +220,17 @@ class AccessControl:
         return {'items': results, 'summary': {'success': success, 'failed': len(results) - success}}
 
     async def execute(self, bot, operation, *, function, group='', member='', **data):
-        if operation in {'bulk_grant', 'bulk_revoke'}:
+        if operation in {'bulk_grant', 'bulk_revoke', 'bulk_expiry'}:
             return await self._bulk(bot, operation, function, identifier(group), data)
         allowed_fields = {
             'whitelist': {'enabled'},
             'function_group': {'id', 'functions'},
-            'grant': {'resources', 'identity_type', 'confirmed', 'invoke', 'function_scope', 'resource_scope', 'resource_namespace', 'mode'},
+            'grant': {'resources', 'identity_type', 'confirmed', 'invoke', 'function_scope', 'resource_scope', 'resource_namespace', 'mode', 'expires_at'},
             'revoke': {'source'},
-            'deny': {'scope'},
-            'allow': {'scope'},
-            'explain': {'resource', 'framework_allowed', 'resource_namespace'},
+            'set_expiry': {'source', 'expires_at'},
+            'deny': {'scope', 'function_scope'},
+            'allow': {'scope', 'function_scope', 'source'},
+            'explain': {'resource', 'framework_allowed', 'resource_namespace', 'action'},
         }
         if operation not in allowed_fields or set(data) - allowed_fields[operation]:
             raise ValueError('未知授权操作或字段')
@@ -228,6 +247,7 @@ class AccessControl:
                 data.get('resource', ''),
                 framework_allowed=data.get('framework_allowed', True),
                 resource_namespace=data.get('resource_namespace'),
+                action=data.get('action', 'view'),
             )
         async with self.locks.setdefault(bot, asyncio.Lock()):
             source = None
@@ -261,6 +281,7 @@ class AccessControl:
                 invoke = data.get('invoke', True)
                 if not isinstance(invoke, bool):
                     raise ValueError('invoke 须为布尔值')
+                expires_at = expiry(data.get('expires_at'))
                 key = identity_key(group, member)
                 membership = state['members'].setdefault(key, {'group': group, 'member': member, 'cycle': uuid4().hex})
                 membership.update(status='present', verified_by='owner', verified_at=self.clock())
@@ -271,6 +292,7 @@ class AccessControl:
                     'cycle': membership['cycle'],
                     'function': function,
                     'invoke': invoke,
+                    'expires_at': expires_at,
                     'resources': resources,
                     'functions': functions,
                     'function_scope': function_scope,
@@ -284,6 +306,21 @@ class AccessControl:
                     else 'snapshot',
                 }
                 state['grants'].append(source)
+            elif operation == 'set_expiry':
+                identifier(member)
+                if 'expires_at' not in data:
+                    raise ValueError('须明确 expires_at，长期请设置 null')
+                expires_at = expiry(data['expires_at'])
+                targets = [
+                    g
+                    for g in state['grants']
+                    if g['group'] == group and g['member'] == member and g['function'] == function and (not data.get('source') or g['id'] == data['source'])
+                ]
+                if not targets:
+                    raise ValueError('没有可修改的授权来源')
+                for target_source in targets:
+                    target_source['expires_at'] = expires_at
+                source = {'updated': len(targets), 'sources': copy.deepcopy(targets)}
             elif operation == 'revoke':
                 identifier(member)
                 state['grants'] = [
@@ -298,11 +335,36 @@ class AccessControl:
                 if scope not in {'group', 'member'}:
                     raise ValueError('拒绝范围须为 group 或 member')
                 target = identifier(member) if scope == 'member' else ''
-                deny = {'group': group, 'member': target, 'function': function}
-                if operation == 'deny' and deny not in state['denies']:
-                    state['denies'].append(deny)
-                if operation == 'allow':
-                    state['denies'] = [d for d in state['denies'] if d != deny]
+                function_scope = copy.deepcopy(data.get('function_scope', {'kind': 'function', 'id': function}))
+                self._function_members({**state, 'functions': candidate_functions}, function_scope)
+                matching = [
+                    d
+                    for d in state['denies']
+                    if d['group'] == group
+                    and d['member'] == target
+                    and d['function'] == function
+                    and (
+                        d.get('id') == data['source']
+                        if data.get('source')
+                        else d.get('function_scope', {'kind': 'function', 'id': d['function']}) == function_scope
+                    )
+                ]
+                if operation == 'deny':
+                    source = (
+                        matching[0]
+                        if matching
+                        else {
+                            'id': uuid4().hex,
+                            'group': group,
+                            'member': target,
+                            'function': function,
+                            'function_scope': function_scope,
+                        }
+                    )
+                    if not matching:
+                        state['denies'].append(source)
+                else:
+                    state['denies'] = [d for d in state['denies'] if d not in matching]
             state['functions'].setdefault(function, {'id': function})
             state['version'] += 1
             await self._save(bot, state)
@@ -310,32 +372,81 @@ class AccessControl:
             return copy.deepcopy(source) if source else {'version': state['version']}
 
     async def decide(self, bot, function, group, member, resource='', *, action='view', framework_allowed=True, resource_namespace=None):
+        if action not in {'view', 'invoke'}:
+            raise ValueError('授权动作须为 view 或 invoke')
         state = await self._state(bot)
         membership = state['members'].get(identity_key(group, member), {})
-        result = {'allowed': False, 'reason': '', 'sources': [], 'membership': membership.get('status', 'unknown'), 'version': state['version']}
+        now = self.clock()
+        grants = [
+            g
+            for g in state['grants']
+            if g['group'] == group and g['member'] == member and self._source_matches_function(state, g, function) and g['cycle'] == membership.get('cycle')
+        ]
+        current = [g for g in grants if g.get('expires_at') is None or now < g['expires_at']]
+        result = {
+            'bot': bot,
+            'allowed': False,
+            'reason': '',
+            'sources': [{**copy.deepcopy(g), 'status': 'active' if g in current else 'expired'} for g in grants],
+            'membership': membership.get('status', 'unknown'),
+            'version': state['version'],
+            'evaluated_at': now,
+            'denies': copy.deepcopy(
+                [
+                    d
+                    for d in state['denies']
+                    if d['group'] == group
+                    and d['member'] in {'', member}
+                    and function in self._function_members(state, d.get('function_scope', {'kind': 'function', 'id': d['function']}))
+                ]
+            ),
+        }
         if not framework_allowed:
             result['reason'] = 'framework_denied'
-        elif any(d['group'] == group and d['function'] == function and d['member'] in {'', member} for d in state['denies']):
+        elif result['denies']:
             result['reason'] = 'denied'
         elif not state['whitelist'].get(identity_key(group, function), False):
             result['reason'] = 'group_not_allowed'
         elif membership.get('status') != 'present':
             result['reason'] = 'pending_verification'
+        elif not any(g['invoke'] for g in current):
+            result['reason'] = 'expired' if any(g['invoke'] for g in grants) else 'no_function_permission'
+        elif action != 'invoke' and not any(self._source_matches_resource(state, g, resource_namespace or function, resource) for g in current):
+            result['reason'] = (
+                'expired'
+                if any(self._source_matches_resource(state, g, resource_namespace or function, resource) for g in grants)
+                else 'no_resource_permission'
+            )
+        elif action != 'invoke' and not state['resources'].get(resource_namespace or function, {}).get(resource, {}).get('enabled', True):
+            result['reason'] = 'resource_disabled'
         else:
-            grants = [
-                g
-                for g in state['grants']
-                if g['group'] == group and g['member'] == member and self._source_matches_function(state, g, function) and g['cycle'] == membership.get('cycle')
-            ]
-            if not any(g['invoke'] for g in grants):
-                result['reason'] = 'no_function_permission'
-            elif action != 'invoke' and not any(self._source_matches_resource(state, g, resource_namespace or function, resource) for g in grants):
-                result['reason'] = 'no_resource_permission'
-            elif action != 'invoke' and not state['resources'].get(resource_namespace or function, {}).get(resource, {}).get('enabled', True):
-                result['reason'] = 'resource_disabled'
-            else:
-                result.update(allowed=True, reason='allowed', sources=copy.deepcopy(grants))
+            result.update(allowed=True, reason='allowed')
+            invoke_until = max(g.get('expires_at') if g.get('expires_at') is not None else math.inf for g in current if g['invoke'])
+            resource_until = (
+                math.inf
+                if action == 'invoke'
+                else max(
+                    g.get('expires_at') if g.get('expires_at') is not None else math.inf
+                    for g in current
+                    if self._source_matches_resource(state, g, resource_namespace or function, resource)
+                )
+            )
+            until = min(invoke_until, resource_until)
+            result['valid_until'] = None if math.isinf(until) else until
         return result
+
+    def decision_current(self, bot, decision):
+        """Non-awaiting final gate after asynchronous consumer work, before dispatch."""
+        state = self.states.get(bot)
+        return bool(
+            self.active
+            and self.healthy
+            and state
+            and decision['allowed']
+            and decision.get('bot') == bot
+            and state['version'] == decision['version']
+            and (decision.get('valid_until') is None or self.clock() < decision['valid_until'])
+        )
 
     async def subject_identity(self, bot, group, member):
         state = await self._state(bot)
