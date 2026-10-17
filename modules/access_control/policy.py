@@ -68,12 +68,14 @@ class AccessControl:
                         'denies': [],
                     }
         state = self.states[bot]
-        if state.get('schema_version', 1) > 3:
+        if state.get('schema_version', 1) > 4:
             raise RuntimeError('授权数据版本高于当前模块')
-        state['schema_version'] = 3
+        state['schema_version'] = 4
         state.setdefault('functions', {})
         state.setdefault('function_groups', {})
         state.setdefault('resources', {})
+        state.setdefault('revocations', [])
+        state.setdefault('group_versions', {})
         for deny in state['denies']:
             deny.setdefault('id', uuid4().hex)
             deny.setdefault('function_scope', {'kind': 'function', 'id': deny['function']})
@@ -225,6 +227,7 @@ class AccessControl:
         allowed_fields = {
             'whitelist': {'enabled'},
             'function_group': {'id', 'functions'},
+            'members': set(),
             'grant': {'resources', 'identity_type', 'confirmed', 'invoke', 'function_scope', 'resource_scope', 'resource_namespace', 'mode', 'expires_at'},
             'revoke': {'source'},
             'set_expiry': {'source', 'expires_at'},
@@ -238,6 +241,14 @@ class AccessControl:
         if operation != 'function_group':
             identifier(group)
         state = await self._state(bot)
+        if operation == 'members':
+            return copy.deepcopy(
+                {
+                    'members': [m for m in state['members'].values() if m['group'] == group and (not member or m['member'] == member)],
+                    'revocations': [g for g in state['revocations'] if g['group'] == group and (not member or g['member'] == member)],
+                    'group_version': state['group_versions'].get(group, 0),
+                }
+            )
         if operation == 'explain':
             return await self.decide(
                 bot,
@@ -249,7 +260,10 @@ class AccessControl:
                 resource_namespace=data.get('resource_namespace'),
                 action=data.get('action', 'view'),
             )
+        expected_version = state['version']
         async with self.locks.setdefault(bot, asyncio.Lock()):
+            if operation == 'grant' and state['version'] != expected_version:
+                raise ValueError('成员或授权状态已变化，请重新核对后授权')
             source = None
             candidate_functions = {**state['functions'], function: {'id': function}}
             if operation == 'function_group':
@@ -283,8 +297,11 @@ class AccessControl:
                     raise ValueError('invoke 须为布尔值')
                 expires_at = expiry(data.get('expires_at'))
                 key = identity_key(group, member)
-                membership = state['members'].setdefault(key, {'group': group, 'member': member, 'cycle': uuid4().hex})
-                membership.update(status='present', verified_by='owner', verified_at=self.clock())
+                membership = state['members'].setdefault(key, {'group': group, 'member': member, 'cycle': uuid4().hex, 'status': 'unverified'})
+                if membership.get('status') in {'left', 'pending'}:
+                    self._retire_sources(state, group, member, 'owner_new_cycle')
+                    membership['cycle'] = uuid4().hex
+                membership.update(status='present', verified_by='owner', verified_at=self.clock(), verification_reason='owner_confirmed')
                 source = {
                     'id': uuid4().hex,
                     'group': group,
@@ -389,6 +406,8 @@ class AccessControl:
             'reason': '',
             'sources': [{**copy.deepcopy(g), 'status': 'active' if g in current else 'expired'} for g in grants],
             'membership': membership.get('status', 'unknown'),
+            'cycle': membership.get('cycle'),
+            'verification_reason': membership.get('verification_reason', ''),
             'version': state['version'],
             'evaluated_at': now,
             'denies': copy.deepcopy(
@@ -407,6 +426,8 @@ class AccessControl:
             result['reason'] = 'denied'
         elif not state['whitelist'].get(identity_key(group, function), False):
             result['reason'] = 'group_not_allowed'
+        elif membership.get('status') == 'left':
+            result['reason'] = 'left_group'
         elif membership.get('status') != 'present':
             result['reason'] = 'pending_verification'
         elif not any(g['invoke'] for g in current):
@@ -452,7 +473,64 @@ class AccessControl:
         state = await self._state(bot)
         return copy.deepcopy(state['members'].get(identity_key(group, member), {}))
 
+    def _retire_sources(self, state, group, member, reason):
+        removed = [g for g in state['grants'] if g['group'] == group and g['member'] == member]
+        state['revocations'].extend({**copy.deepcopy(g), 'revoked_at': self.clock(), 'reason': reason} for g in removed)
+        state['grants'] = [g for g in state['grants'] if g not in removed]
+
+    async def _observe_membership(self, event):
+        group = event.get('d/group_openid')
+        if not isinstance(group, str) or not group:
+            return
+        state = await self._state(event.appid)
+        member = event.get('d/member_openid')
+        if not isinstance(member, str) or not member:
+            for membership in state['members'].values():
+                if membership['group'] == group and membership.get('status') != 'left':
+                    membership.update(status='pending', verification_reason='native_identity_unavailable')
+        else:
+            new_member = identity_key(group, member) not in state['members']
+            membership = state['members'].setdefault(
+                identity_key(group, member), {'group': group, 'member': member, 'cycle': uuid4().hex, 'status': 'unverified'}
+            )
+            timestamp = event.get('d/timestamp')
+            valid_time = isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool) and 0 <= timestamp <= 253402300799
+            if not valid_time:
+                timestamp = None
+            event_id = event.event_id or event.message_id
+            key = event_id or identity_key(event.event_type, timestamp)
+            record = {'key': key, 'kind': event.event_type, 'timestamp': timestamp}
+            history = membership.setdefault('lifecycle_events', [])
+            if event_id and record in history:
+                return
+            conflict = any(old['key'] == key for old in history)
+            history.append(record)
+            del history[:-128]
+            previous = membership.get('last_lifecycle', {}).get('timestamp', 0)
+            anchor = max(previous or 0, membership.get('verified_at', 0))
+            if conflict or timestamp is None or timestamp <= anchor:
+                if new_member and event.event_type == 'GROUP_MEMBER_ADD':
+                    membership.update(status='unverified', verification_reason='new_membership_cycle')
+                else:
+                    membership.update(status='pending', verification_reason='ambiguous_lifecycle')
+            else:
+                membership['last_lifecycle'] = record
+                self._retire_sources(state, group, member, 'member_left' if event.event_type == 'GROUP_MEMBER_REMOVE' else 'new_membership_cycle')
+                if event.event_type == 'GROUP_MEMBER_REMOVE':
+                    membership.update(status='left', verification_reason='member_left', left_at=timestamp)
+                else:
+                    membership.update(cycle=uuid4().hex, status='unverified', verification_reason='new_membership_cycle', joined_at=timestamp)
+        # All in-memory eligibility changes happen without a durable await, even if
+        # another owner mutation currently holds the persistence lock.
+        state['version'] += 1
+        state['group_versions'][group] = state['group_versions'].get(group, 0) + 1
+        async with self.locks.setdefault(event.appid, asyncio.Lock()):
+            await self._save(event.appid, state)
+
     async def observe(self, event):
+        if event.event_type in {'GROUP_MEMBER_ADD', 'GROUP_MEMBER_REMOVE'}:
+            await self._observe_membership(event)
+            return
         if not event.group_id or not event.raw_user_id:
             return
         state = await self._state(event.appid)

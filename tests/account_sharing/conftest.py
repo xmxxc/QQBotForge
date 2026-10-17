@@ -128,8 +128,15 @@ async def host(tmp_path, monkeypatch):
         async def event(self, text, **kwargs):
             return await self.dispatch(message(text, **kwargs))
 
-        async def lifecycle(self, kind, *, bot='bot-a', group='group-a', member='new-member'):
-            return await self.dispatch(Event.from_websocket(bot, {'t': kind, 'd': {'id': 'fake-event', 'group_openid': group, 'member_openid': member}}))
+        async def lifecycle(self, kind, *, bot='bot-a', group='group-a', member='new-member', timestamp=None, event_id='', plugin=True):
+            data = {'id': event_id, 'group_openid': group, 'member_openid': member}
+            if timestamp is not None:
+                data['timestamp'] = timestamp
+            event = Event.from_websocket(bot, {'t': kind, 'd': data})
+            if plugin:
+                return await self.dispatch(event)
+            await hooks.emit('qq_event', event)
+            return event
 
         async def click(self, data, *, bot='bot-a', user='private-a', group=''):
             event = Event.from_websocket(

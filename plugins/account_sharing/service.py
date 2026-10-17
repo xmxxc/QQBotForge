@@ -33,6 +33,7 @@ ACCESS_COMMANDS = {
     '批量撤权': 'bulk_revoke',
     '期限': 'set_expiry',
     '批量期限': 'bulk_expiry',
+    '成员': 'members',
 }
 ACCOUNT_FIELDS = {'name', 'login', 'password', 'enabled', 'description', 'url', 'groups'}
 
