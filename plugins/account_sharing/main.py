@@ -19,7 +19,9 @@ _instance = None
 async def web_entry(request):
     if _instance is None:
         return web.json_response({'success': False, 'error': UNAVAILABLE}, status=503)
-    return await _instance.http(request)
+    response = await _instance.http(request)
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 register_page('account-sharing', '账户共享', source_name='account_sharing', html_file=str(Path(__file__).with_name('page.html')))
@@ -48,7 +50,7 @@ async def unload():
         _instance = None
 
 
-@handler(r'^(?:账户管理(?:\s|$)|账户列表$)', name='账户管理', priority=20)
+@handler(r'^(?:账户管理(?:\s|$)|账户列表$|账户(?:查询|群|绑定)\s)', name='账户管理', priority=20)
 async def account_management(event, _match):
     if _instance is None:
         await event.reply('账户共享未加载，请联系主人')

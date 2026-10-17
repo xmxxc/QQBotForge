@@ -14,14 +14,21 @@ class Platform:
     def __init__(self):
         self.messages = []
         self.fail_private = False
+        self.private_error = 'not_friends'
+        self.after_reply = None
 
     async def reply(self, event, content=None, **kwargs):
         target = event.group_id if event.is_group else event.raw_user_id
-        return await self.send('group' if event.is_group else 'private', target, content, **kwargs)
+        result = await self.send('group' if event.is_group else 'private', target, content, **kwargs)
+        if self.after_reply:
+            await self.after_reply(event, content)
+        return result
 
     async def send(self, scene, target, content, **kwargs):
         if scene == 'private' and self.fail_private:
-            return False, {'code': 'not_friends'}
+            if self.private_error == 'network_error':
+                raise ConnectionError('fake network failure')
+            return False, {'code': self.private_error}
         self.messages.append((scene, target, content, kwargs))
         return True, {'id': str(len(self.messages))}
 
@@ -75,6 +82,7 @@ async def host(tmp_path, monkeypatch):
     hooks = HookManager()
     acl = await access_module.setup(ModuleContext('access_control', str(tmp_path / 'access'), hooks))
     plugin._instance.access_provider = lambda: acl
+    plugin._instance.sender_provider = lambda bot: platform
     monkeypatch.setattr(auth, 'valid_sessions', {'test-session': {'expires': datetime.now() + timedelta(days=1), 'created': datetime.now()}})
     app = web.Application()
     app.router.add_route('*', '/api/ext/{tail:.*}', handle_ext_route)

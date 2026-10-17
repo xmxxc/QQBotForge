@@ -169,19 +169,37 @@ class AccessControl:
                 result.update(allowed=True, reason='allowed', sources=copy.deepcopy(grants))
         return result
 
+    async def subject_identity(self, bot, group, member):
+        state = await self._state(bot)
+        return copy.deepcopy(state['members'].get(identity_key(group, member), {}))
+
     async def observe(self, event):
         if not event.group_id or not event.raw_user_id:
             return
         state = await self._state(event.appid)
         async with self.locks.setdefault(event.appid, asyncio.Lock()):
             key = identity_key(event.group_id, event.raw_user_id)
-            if key not in state['members']:
-                state['members'][key] = {
-                    'group': event.group_id,
-                    'member': event.raw_user_id,
-                    'name': event.username or '',
-                    'cycle': uuid4().hex,
-                    'status': 'unverified',
-                }
+            changed = key not in state['members']
+            membership = state['members'].setdefault(
+                key, {'group': event.group_id, 'member': event.raw_user_id, 'name': event.username or '', 'cycle': uuid4().hex, 'status': 'unverified'}
+            )
+            # A platform group-message author supplies this relation. It is not a C2C binding.
+            if event.event_type in {'GROUP_AT_MESSAGE_CREATE', 'GROUP_MESSAGE_CREATE'}:
+                if not membership.get('identity_observed'):
+                    membership['identity_observed'] = True
+                    changed = True
+                union_id = event.get('d/author/union_openid')
+                if isinstance(union_id, str) and 0 < len(union_id) <= 256 and union_id != event.raw_user_id:
+                    aliases = membership.setdefault('union_ids', [])
+                    if union_id not in aliases:
+                        aliases.append(union_id)
+                        changed = True
+                    if membership.get('current_union_id') != union_id:
+                        membership['current_union_id'] = union_id
+                        changed = True
+                elif membership.get('current_union_id') != event.raw_user_id:
+                    membership['current_union_id'] = event.raw_user_id
+                    changed = True
+            if changed:
                 state['version'] += 1
                 await self._save(event.appid, state)
