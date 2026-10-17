@@ -1,0 +1,14 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>账户共享</title>
+<style>body{font:16px system-ui;max-width:1100px;margin:24px auto;padding:16px;color:#263347}input,button,select,textarea{padding:9px;margin:4px}table{width:100%;border-collapse:collapse}td,th{padding:10px;border-bottom:1px solid #ddd;text-align:left}#status{white-space:pre-wrap}label{display:inline-block}</style>
+<h1>账户共享管理</h1><p>账户及操作按 Bot 隔离。沿用框架现有持久化、消息及日志记录机制；账密回复可能被记录。请妥善管理后台与日志访问权限。</p>
+<label>Bot AppID <input id="bot" autocomplete="off"></label><button id="refresh">加载账户</button><p id="status" role="status"></p>
+<form id="account"><input id="id" type="hidden"><label>名称<input id="name" required></label><label>账号<input id="login" required autocomplete="off"></label><label>密码<input id="password" type="password" autocomplete="new-password" required></label><label>说明<input id="description"></label><label>地址<input id="url"></label><label><input id="enabled" type="checkbox" checked>启用</label><button>保存账户</button><button type="button" id="reset">新增</button></form>
+<table><thead><tr><th>标识</th><th>名称</th><th>状态</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
+<script>
+const $=id=>document.getElementById(id);let records=[];
+async function api(method,path='',data){let r=await fetch('/api/ext/account-sharing/'+path+'?bot='+encodeURIComponent($('bot').value),{method,credentials:'same-origin',headers:{'Content-Type':'application/json'},body:data?JSON.stringify(data):undefined});let v=await r.json();if(!r.ok)throw Error(v.error||'操作失败');return v.data;}
+function status(v){$('status').textContent=v;}
+function reset(){$('account').reset();$('id').value='';}
+async function refresh(){try{records=await api('GET','accounts');$('rows').replaceChildren();for(const a of records){let row=document.createElement('tr');for(const v of [a.id,a.name,a.enabled?'启用':'停用']){let c=document.createElement('td');c.textContent=v;row.append(c);}let actions=document.createElement('td');for(const [label,fn] of [['编辑',()=>{for(const k of ['id','name','login','password','description','url'])$(k).value=a[k];$('enabled').checked=a.enabled;}],['删除',async()=>{if(confirm('删除此账户及查询入口？')){await api('DELETE','accounts/'+a.id);reset();await refresh();}}]]){let b=document.createElement('button');b.textContent=label;b.onclick=()=>Promise.resolve(fn()).catch(e=>status(e.message));actions.append(b);}row.append(actions);$('rows').append(row);}status('已加载 '+records.length+' 条账户');}catch(e){status(e.message);}}
+$('refresh').onclick=refresh;$('reset').onclick=reset;$('account').onsubmit=async e=>{e.preventDefault();try{let data={};for(const k of ['name','login','password','description','url'])data[k]=$(k).value;data.enabled=$('enabled').checked;let id=$('id').value;await api(id?'PATCH':'POST','accounts'+(id?'/'+id:''),data);reset();await refresh();}catch(e){status(e.message);}};
+</script></html>
