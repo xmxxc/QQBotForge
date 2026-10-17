@@ -1,4 +1,8 @@
-"""Real HTTP/session + parsed QQ events; only platform I/O and time are replaced."""
+"""Business simulations with real HTTP/SQLite and an explicit synthetic observer source.
+
+The production framework has no matching module observer hook; separate boundary
+coverage verifies that sensitive member queries remain unavailable by default.
+"""
 
 from datetime import datetime, timedelta
 
@@ -89,6 +93,9 @@ async def host(tmp_path, monkeypatch):
 
     hooks = HookManager()
     acl = await access_module.setup(ModuleContext('access_control', str(tmp_path / 'access'), hooks))
+    # A simulated platform source exercises policy algorithms, not production wiring.
+    acl.lifecycle_available = True
+    hooks.register('qq_event', acl.observe, owner='simulated-platform', priority=0)
     plugin._instance.access_provider = lambda: acl
     plugin._instance.sender_provider = lambda bot: platform
     from modules.self_qa import main as qa_module

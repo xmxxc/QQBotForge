@@ -11,7 +11,7 @@ from aiohttp import web
 from core.base.config import cfg
 from core.base.logger import PLUGIN, get_logger
 from core.plugin._blacklist import get_blacklist_map
-from core.storage.extension import ExtensionStore
+from modules.access_control.storage import ExtensionStore
 
 from .identities import IdentityBindings
 from .menus import MenuSessions
@@ -232,7 +232,9 @@ class AccountSharing:
             notification='pending',
             delivery='not_requested',
         )
-        if not binding:
+        if not self.access().lifecycle_available:
+            result.update(event_integration='unavailable', guidance='unavailable')
+        elif not binding:
             sender = self.sender_provider(bot)
             try:
                 response = (
@@ -593,7 +595,9 @@ class AccountSharing:
             items=result['items'],
             summary=summary,
         )
-        if pending:
+        if not self.access().lifecycle_available:
+            record.update(event_integration='unavailable', guidance='unavailable')
+        elif pending:
             sender = self.sender_provider(bot)
             try:
                 response = (

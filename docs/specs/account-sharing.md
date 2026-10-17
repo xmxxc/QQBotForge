@@ -259,3 +259,10 @@ Web 测试通过真实的已鉴权/未鉴权 HTTP 请求进入扩展接口，验
 - [单个群成员查询](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_members_member_openid.get.html)
 - [群成员移出事件](https://bot.q.qq.com/wiki/develop/api-v2/autogen/event/group_member_remove.html)
 - [机器人被移出群事件](https://bot.q.qq.com/wiki/develop/api-v2/autogen/event/group_del_robot.html)
+
+
+## 补充实施约束（2026-10-17）
+
+交付仅安装自助问答、授权两个模块及账户共享一个插件，框架源码保持不变。存储位于扩展目录，通过现有上下文数据路径接入。退群撤权、连接连续性等能力若缺少可靠扩展接口，必须说明接口、方案及限制，等待用户选择；不得自行修改框架或将未实现能力标记完成。此约束优先于前文允许随票修改通用框架接口的实施假设。
+
+当前接口检查及待选方案见 [扩展接入检查](../plans/account-sharing-extension-boundary.md)。成员敏感查询在可靠接入确定前暂停。

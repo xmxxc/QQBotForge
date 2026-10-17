@@ -10,7 +10,6 @@ async def setup(ctx):
     global _instance
     candidate = AccessControl(ctx.get_data_path('access-control.db'))
     await candidate.initialize()
-    ctx.register_hook('qq_event', candidate.observe, priority=0)
     _instance = candidate
     return candidate
 

@@ -4,7 +4,7 @@
 <label>Bot AppID <input id="bot" autocomplete="off"></label><button id="refresh">加载账户</button><p id="status" role="status"></p>
 <form id="account"><input id="id" type="hidden"><label>名称<input id="name" required></label><label>账号<input id="login" required autocomplete="off"></label><label>密码<input id="password" type="password" autocomplete="new-password" required></label><label>说明<input id="description"></label><label>地址<input id="url"></label><label>账户分组（逗号分隔）<input id="account-groups"></label><label><input id="enabled" type="checkbox" checked>启用</label><button>保存账户</button><button type="button" id="reset">新增</button></form>
 <table><thead><tr><th>标识</th><th>名称</th><th>状态</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
-<h2>群准入与成员授权</h2><p>请先启用“黑白名单授权”模块。已识别成员仅用于选人，不代表完整名册。绑定不等于授权。</p>
+<h2>群准入与成员授权</h2><p>当前框架尚无已接入的可靠生命周期观察接口，成员敏感查询暂停。授权记录可管理；退群撤权与离线核验接入待确定。</p><p>请先启用“黑白名单授权”模块。已识别成员仅用于选人，不代表完整名册。绑定不等于授权。</p>
 <label>群原生 ID<input id="group"></label><label>成员原生 OpenID<input id="member" list="known-members"></label><datalist id="known-members"></datalist>
 <label>身份类型<select id="identity-type"><option value="group_member_openid">群原生成员 OpenID</option></select></label>
 <label><input id="confirmed" type="checkbox">我已核对成员当前在群</label><label><input id="invoke" type="checkbox" checked>授予调用资格</label>

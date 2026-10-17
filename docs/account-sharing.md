@@ -1,6 +1,8 @@
 # 账户共享
 
-本功能逐票实施，当前已提供主人账户管理、授权目录、身份绑定与成员私聊查询；部署与合并需审核后单独进行。
+交付目录为 `modules/access_control/`、`modules/self_qa/` 和 `plugins/account_sharing/`，框架源码保持原样。存储随授权模块提供，使用现有上下文数据路径，三个扩展共同复用。
+
+当前可使用主人账户管理与私聊预览、自助问答匹配及授权记录管理。可靠生命周期事件接入尚未确定，成员敏感查询暂停，后台显示此限制。以下成员目录、绑定、关键词和按钮流程是已实现的业务策略及模拟测试说明，生产接入仍待验收；详见[扩展接入检查](plans/account-sharing-extension-boundary.md)。部署与合并需审核后单独进行。
 
 插件加载后，后台扩展页面选择“账户共享”，填写当前 Bot 的 AppID 并加载账户。页面沿用后台会话，支持新增、修改、启停和删除。默认启用新账户；每条账户使用独立稳定 ID，同名账户不共享身份或授权。所有数据按 AppID 分区。
 
@@ -51,7 +53,7 @@ QQ 管理命令使用当前 Bot 的 `owner_ids`：
 
 `GET /api/ext/account-sharing/access?bot=<AppID>` 返回主人可见的准入、成员、授权及拒绝状态；`POST` 接受与上面命令同形的 JSON，另加 `operation`（`whitelist/grant/revoke/deny/allow/explain`）。此接口同样要求现有面板会话。授权新增来源不能无条件重试；白名单、撤销和拒绝设置是目标状态操作。
 
-授权模块的公共消费接口是 `execute(bot, operation, function=..., group=..., member=..., ...)` 和 `decide(bot, function, group, member, resource, action='view', framework_allowed=True)`。消费方必须传入框架拒绝结果，不得用模块放行覆盖框架拒绝；返回允许状态、原因、来源、成员核验状态和版本，不保存或发送账户密码。`qq_event` 通用观察 Hook 位于 Bot 事件入口，在 union 显示身份转换和插件过滤前执行。
+授权模块的公共消费接口是 `execute(bot, operation, function=..., group=..., member=..., ...)` 和 `decide(bot, function, group, member, resource, action='view', framework_allowed=True)`。消费方必须传入框架拒绝结果，不得用模块放行覆盖框架拒绝；返回允许状态、原因、来源、成员核验状态和版本，不保存或发送账户密码。模块提供 `observe(event)` 消费入口；当前框架没有已接通的可靠观察源。`snapshot()` 返回 `capabilities.lifecycle_events:false`，`decide()` 拒绝敏感查询并给出 `event_integration_unavailable`。此能力状态不接受管理 API 设置。
 
 
 ## 绑定、私聊群选择及发送状态
@@ -155,7 +157,7 @@ C2C 普通消息实际提供的原生私聊 ID 与私聊 union 显示身份也�
 
 ## 退群、重入与原生成员周期
 
-授权模块通过 `qq_event` 通用 Hook 接收 `GROUP_MEMBER_ADD/REMOVE`，在显示身份转换和插件过滤之前处理群原生 `group_openid + member_openid`。普通消息黑白名单、维护状态和账户插件是否处理消息不影响此模块级撤权；退出事件不使用可能为空的用户 OpenID 或 union 显示身份代替群成员身份。主动退出和被移出使用同一平台退出事件。
+授权模块的 `observe(event)` 已实现 `GROUP_MEMBER_ADD/REMOVE` 的状态处理，使用群原生 `group_openid + member_openid`。当前缺少独立于插件、先于查询调度的可靠框架观察接口，尚未完成生产接线；下述行为由模拟事件源验证，不能作为实际安装后的自动撤权承诺。退出事件不使用可能为空的用户 OpenID 或 union 显示身份代替群成员身份。
 
 有可靠时间顺序的退出使成员变为 `left`，撤销此 Bot／此群／此成员的所有功能及资源来源，保存无账密的撤销历史；其他群和其他 Bot 独立，拒绝记录保留。再次加入创建新周期，状态为 `unverified`，不授权、不私聊、不邀请绑定。主人须重新授予当前选定范围，原绑定可以保留，但旧来源和个人按钮不恢复。主人也可在已核对当前在群后显式授权，新授权进入新的周期，不顺带恢复待核验的旧来源。
 

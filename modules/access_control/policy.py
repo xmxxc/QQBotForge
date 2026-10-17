@@ -9,7 +9,7 @@ import time
 from uuid import uuid4
 
 from core.base.logger import EXTENSION, get_logger
-from core.storage.extension import ExtensionStore
+from modules.access_control.storage import ExtensionStore
 
 log = get_logger(EXTENSION, '黑白名单授权')
 
@@ -38,9 +38,10 @@ class AccessControl:
     Mutations invalidate versions before persistence; storage failure fails closed.
     """
 
-    def __init__(self, path, *, clock=time.time):
+    def __init__(self, path, *, clock=time.time, lifecycle_available=False):
         self.store = ExtensionStore(path)
         self.clock = clock
+        self.lifecycle_available = lifecycle_available
         self.states = {}
         self.locks = {}
         self.active = True
@@ -88,7 +89,9 @@ class AccessControl:
         return state
 
     async def snapshot(self, bot):
-        return copy.deepcopy(await self._state(bot))
+        state = copy.deepcopy(await self._state(bot))
+        state['capabilities'] = {'lifecycle_events': self.lifecycle_available}
+        return state
 
     async def _save(self, bot, state):
         try:
@@ -426,6 +429,8 @@ class AccessControl:
             result['reason'] = 'denied'
         elif not state['whitelist'].get(identity_key(group, function), False):
             result['reason'] = 'group_not_allowed'
+        elif not self.lifecycle_available:
+            result['reason'] = 'event_integration_unavailable'
         elif membership.get('status') == 'left':
             result['reason'] = 'left_group'
         elif membership.get('status') != 'present':
@@ -462,6 +467,7 @@ class AccessControl:
         return bool(
             self.active
             and self.healthy
+            and self.lifecycle_available
             and state
             and decision['allowed']
             and decision.get('bot') == bot

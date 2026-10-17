@@ -30,7 +30,6 @@ from core.message.event import (
 )
 from core.message.parsers import IdentityHelper
 from core.message.parsers.base import MessageUtils
-from core.module.hook import get_hook_manager
 
 log = get_logger(FRAMEWORK, '事件处理')
 
@@ -296,9 +295,6 @@ class EventHandlerMixin:
             dedup = self._dedup.setdefault(appid, _EventDedup())
             if dedup.is_dup(event.message_id, event.event_id):
                 return
-
-        # Module observers see native identities before display-ID conversion or plugin filters.
-        await get_hook_manager().emit('qq_event', event)
 
         # union_id 交换
         if event.user_id and event.union_openid:
