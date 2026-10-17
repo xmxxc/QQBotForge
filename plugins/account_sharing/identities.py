@@ -1,5 +1,6 @@
 """Owner-confirmed mapping of observed C2C identities to native group subjects."""
 
+import asyncio
 import time
 from uuid import uuid4
 
@@ -12,6 +13,42 @@ class IdentityBindings:
     def __init__(self, store, access):
         self.store = store
         self.access = access
+        self.private_cache = {}
+        self.private_locks = {}
+        self.identity_healthy = True
+
+    async def private_identity(self, bot, private_id):
+        key = (bot, private_id)
+        if key not in self.private_cache:
+            stored = await self.store.get(bot, 'private_identities', private_id)
+            self.private_cache.setdefault(key, stored or {})
+        return self.private_cache[key]
+
+    async def observe_private(self, event):
+        if event.event_type != 'C2C_MESSAGE_CREATE':
+            return
+        private_id = identifier(event.raw_user_id)
+        old = await self.private_identity(event.appid, private_id)
+        record = {**old, 'private_id': private_id, 'identity_observed': True, 'source': 'observed_c2c'}
+        aliases = list(old.get('union_ids', []))
+        union_id = event.get('d/author/union_openid')
+        if isinstance(union_id, str) and 0 < len(union_id) <= 256 and union_id != private_id:
+            if union_id not in aliases:
+                aliases.append(union_id)
+            record['current_union_id'] = union_id
+        else:
+            record['current_union_id'] = private_id
+        record['union_ids'] = aliases
+        if record == old:
+            return
+        key = (event.appid, private_id)
+        self.private_cache[key] = record  # Known identity changes affect checks before asynchronous persistence.
+        async with self.private_locks.setdefault(key, asyncio.Lock()):
+            try:
+                await self.store.put(event.appid, 'private_identities', private_id, self.private_cache[key])
+            except Exception:
+                self.identity_healthy = False
+                raise
 
     async def request(self, bot, private_id, group, member):
         for value in (private_id, group, member):

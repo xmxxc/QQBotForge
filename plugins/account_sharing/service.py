@@ -14,6 +14,7 @@ from core.plugin._blacklist import get_blacklist_map
 from core.storage.extension import ExtensionStore
 
 from .identities import IdentityBindings
+from .menus import MenuSessions
 
 log = get_logger(PLUGIN, '账户共享')
 PREFIX = '/api/ext/account-sharing/'
@@ -45,7 +46,7 @@ def validate_account(data, *, create=False):
 
 
 class AccountSharing:
-    def __init__(self, path, *, access_provider=None, sender_provider=None, qa_provider=None):
+    def __init__(self, path, *, access_provider=None, sender_provider=None, qa_provider=None, clock=time.time):
         self.store = ExtensionStore(path)
         self.lock = asyncio.Lock()
         self.active = True
@@ -54,6 +55,8 @@ class AccountSharing:
         self.sender_provider = sender_provider or self._bot_sender
         self.identities = IdentityBindings(self.store, self.access)
         self.qa_provider = qa_provider or self._qa_module
+        self.clock = clock
+        self.menus = MenuSessions(self.store, lambda: self.clock())
 
     @staticmethod
     def _access_module():
@@ -96,11 +99,12 @@ class AccountSharing:
         except ValueError as error:
             raise BusinessError(str(error)) from error
 
-    async def keyword_query(self, event):
+    async def keyword_query(self, event, *, text=None, page=0):
         module = self.qa_provider()
         if module is None or not module.active:
             return
-        matches = await module.match(event.appid, FUNCTION, event.content or '')
+        match_text = event.content or '' if text is None else text
+        matches = await module.match(event.appid, FUNCTION, match_text)
         qa_guard = (module, module.version(event.appid, FUNCTION))
         if not matches:
             return
@@ -142,10 +146,11 @@ class AccountSharing:
                 event, match['target'] if match['kind'] == 'resource' else '', rule_id=match['rule_id'] if match['kind'] == 'text' else None, qa_guard=qa_guard
             )
         else:
-            await event.reply(
-                '请选择有权候选：\n'
-                + '\n'.join(f'{m["name"]} — ' + (f'账户查询 {m["target"]}' if m['kind'] == 'resource' else f'账户答复 {m["rule_id"]}') for m in candidates)
-            )
+            items = [
+                (m['name'], {'kind': 'query', 'resource': m['target']}) if m['kind'] == 'resource' else (m['name'], {'kind': 'reply', 'rule': m['rule_id']})
+                for m in candidates
+            ]
+            await self.present_menu(event, {**context, 'menu': 'candidates', 'keyword': match_text}, items, page=page, title='请选择有权候选')
 
     async def query_content(self, bot, resource, rule_id):
         if rule_id:
@@ -183,12 +188,7 @@ class AccountSharing:
         owner = await self.store.get(bot, 'owners', 'observed_c2c')
         sender = self.sender_provider(bot)
         owner_ids = (cfg.get_bot_config(bot) or {}).get('owner_ids', [])
-        if (
-            not owner
-            or sender is None
-            or owner.get('authenticated_id') not in owner_ids
-            or not self.framework_subject_allowed(bot, '', owner.get('authenticated_id', ''), owner['private_id'])
-        ):
+        if not owner or sender is None or owner.get('authenticated_id') not in owner_ids or not await self.framework_private_allowed(bot, owner['private_id']):
             result['notification'] = 'unavailable'
         else:
             try:
@@ -242,17 +242,13 @@ class AccountSharing:
         return binding
 
     async def resolve_context(self, event, *, select=''):
-        if not self.framework_allowed(event):
+        if not await self.framework_event_allowed(event):
             return None
         if event.is_group:
             return {'group': event.group_id, 'member': event.raw_user_id}
         if not event.is_direct or event.is_channel:
             return None
-        bindings = [
-            b
-            for b in await self.identities.contexts(event.appid, event.raw_user_id)
-            if await self.framework_context_allowed(event.appid, b['group'], b['member'])
-        ]
+        bindings = await self.private_contexts(event)
         if select:
             chosen = next((b for b in bindings if b['group'] == select), None)
             if chosen:
@@ -265,9 +261,127 @@ class AccountSharing:
         if chosen:
             return chosen
         if bindings:
-            await event.reply('请选择授权群：\n' + '\n'.join('账户群 ' + b['group'] for b in bindings))
+            await self.show_groups(event)
             return {'selection_required': True}
         return None
+
+    async def private_contexts(self, event):
+        return [
+            b
+            for b in await self.identities.contexts(event.appid, event.raw_user_id)
+            if await self.framework_context_allowed(event.appid, b['group'], b['member'])
+        ]
+
+    async def show_groups(self, event, page=0):
+        if not event.is_direct or event.is_channel or not await self.framework_event_allowed(event):
+            await self.deny(event)
+            return
+        items = []
+        for binding in await self.private_contexts(event):
+            identity = await self.access().subject_identity(event.appid, binding['group'], binding['member'])
+            items.append((binding['group'], {'kind': 'group', 'group': binding['group'], 'member': binding['member'], 'cycle': identity.get('cycle')}))
+        if not items:
+            await self.deny(event)
+            return
+        await self.present_menu(event, {'menu': 'groups'}, items, page=page, title='请选择授权群')
+
+    async def present_menu(self, event, context, items, *, page=0, title='账户列表'):
+        size = 6
+        last = max((len(items) - 1) // size, 0)
+        page = max(0, min(page, last))
+        selected = list(items[page * size : (page + 1) * size])
+        lines = []
+        for label, action in selected:
+            command = {
+                'query': '账户查询 ' + action.get('resource', ''),
+                'reply': '账户答复 ' + action.get('rule', ''),
+                'group': '账户群 ' + action.get('group', ''),
+            }.get(action['kind'], '')
+            lines.append(label + ' — ' + command)
+        if page > 0:
+            selected.append(('上一页', {'kind': 'page', 'page': page - 1}))
+        if page < last:
+            selected.append(('下一页', {'kind': 'page', 'page': page + 1}))
+        if context.get('group'):
+            identity = await self.access().subject_identity(event.appid, context['group'], context['member'])
+            context = {**context, 'cycle': identity.get('cycle')}
+        text = title + f'（{page + 1}/{last + 1}）\n' + '\n'.join(lines)
+        if context['menu'] == 'accounts':
+            text += f'\n文字翻页：账户列表 {page + 2}' if page < last else '\n发送“账户列表”刷新当前资格'
+        rows = await self.menus.issue(event, context, selected)
+        for row in rows:
+            for button in row:
+                if button['text'] in {'上一页', '下一页'}:
+                    text += f'\n{button["text"]}：账户翻页 {button["data"]}'
+        try:
+            if not cfg.get_bot_setting(event.appid, 'message.use_markdown', True):
+                raise RuntimeError('Markdown disabled')
+            response = await event.reply(text, buttons=rows)
+            if not response or not response[0]:
+                raise RuntimeError('Buttons rejected')
+        except Exception:
+            await event.reply(text + '\n按钮暂不可用，请使用以上文字命令。')
+
+    async def on_interaction(self, event):
+        payload = event.content or ''
+        if event.event_type != 'INTERACTION_CREATE' or not payload.startswith('as:'):
+            return False
+        raw = event.interaction_data or {}
+        if raw.get('type') not in {11, 12}:
+            return False
+        event.set_callback_code(0)  # Receipt only. The transport sends ACK independently from business messages.
+        valid_scene = (raw.get('scene') == 'group' and raw.get('chat_type', 1) == 1 and event.group_id and event.raw_user_id) or (
+            raw.get('scene') == 'c2c' and raw.get('chat_type', 2) == 2 and not event.group_id and event.raw_user_id
+        )
+        if not valid_scene or event.channel_id or raw.get('application_id', event.appid) != event.appid or not await self.framework_event_allowed(event):
+            await self.deny(event)
+            return True
+        return await self.activate_menu(event, payload)
+
+    async def activate_menu(self, event, payload):
+        if not await self.framework_event_allowed(event) or event.is_channel or not (event.is_group or event.is_direct):
+            await self.deny(event)
+            return True
+        try:
+            if payload == 'as:list':
+                await self.directory(event)
+                return True
+            context, action = await self.menus.resolve(event, payload)
+            if context.get('group'):
+                identity = await self.access().subject_identity(event.appid, context['group'], context['member'])
+                if identity.get('cycle') != context.get('cycle'):
+                    raise ValueError('成员周期已变化，请重新发送：账户列表')
+                if event.is_group:
+                    if context['group'] != event.group_id or context['member'] != event.raw_user_id:
+                        raise PermissionError('群上下文不匹配')
+                else:
+                    selected = await self.resolve_context(event, select=context['group'])
+                    if not selected or selected['member'] != context['member']:
+                        raise PermissionError('私聊上下文不匹配')
+            if action['kind'] == 'query':
+                await self.query(event, action['resource'])
+            elif action['kind'] == 'reply':
+                await self.query(event, '', rule_id=action['rule'])
+            elif action['kind'] == 'group':
+                selected = await self.resolve_context(event, select=action['group'])
+                identity = await self.access().subject_identity(event.appid, action['group'], action['member'])
+                if not selected or selected['member'] != action['member'] or identity.get('cycle') != action.get('cycle'):
+                    raise PermissionError('授权群上下文不匹配')
+                await self.directory(event)
+            elif action['kind'] == 'page':
+                if context['menu'] == 'groups':
+                    await self.show_groups(event, action['page'])
+                elif context['menu'] == 'candidates':
+                    await self.keyword_query(event, text=context['keyword'], page=action['page'])
+                else:
+                    await self.directory(event, page=action['page'])
+        except PermissionError:
+            await self.deny(event)
+        except (BusinessError, RuntimeError, sqlite3.Error, OSError):
+            await self.deny(event)
+        except ValueError as error:
+            await event.reply(str(error))
+        return True
 
     async def query_decision(self, event, context, resource, rule_id=None):
         return await self.access().decide(
@@ -277,7 +391,8 @@ class AccountSharing:
             context['member'],
             resource,
             action='invoke' if rule_id else 'view',
-            framework_allowed=self.framework_allowed(event) and await self.framework_context_allowed(event.appid, context['group'], context['member']),
+            framework_allowed=await self.framework_event_allowed(event)
+            and await self.framework_context_allowed(event.appid, context['group'], context['member']),
         )
 
     def current_rules(self, bot, guard):
@@ -310,12 +425,19 @@ class AccountSharing:
             await event.reply(f'私发未完成：尚未绑定。请私聊本 Bot：账户绑定 {group} {member}，由主人核对确认。')
             return
         current = await self.query_decision(event, context, resource, rule_id)
-        if not current['allowed'] or not self.current_rules(bot, qa_guard):
+        if not current['allowed'] or not self.current_rules(bot, qa_guard) or not await self.framework_private_allowed(bot, binding['private_id']):
             await self.deny(event)
             return
         content = await self.query_content(bot, resource, rule_id)
         final = await self.query_decision(event, context, resource, rule_id)
-        if not final['allowed'] or final['version'] != current['version'] or content is None or not self.active or not self.current_rules(bot, qa_guard):
+        if (
+            not final['allowed']
+            or final['version'] != current['version']
+            or content is None
+            or not self.active
+            or not self.current_rules(bot, qa_guard)
+            or not await self.framework_private_allowed(bot, binding['private_id'])
+        ):
             await self.deny(event)
             return
         try:
@@ -329,6 +451,26 @@ class AccountSharing:
             await event.reply(f'私发失败（{code}），请检查好友关系、接收许可或重新提交账户绑定申请；账密未公开。')
         elif event.is_group:
             await event.reply('账户信息已私发。')
+
+    async def framework_private_allowed(self, bot, private_id):
+        if not self.identities.identity_healthy:
+            return False
+        identity = await self.identities.private_identity(bot, private_id)
+        users = get_blacklist_map(bot, 'user')
+        union_enabled = cfg.get_bot_setting(bot, 'identity.use_union_id_for_group', False)
+        if union_enabled and users and not identity.get('identity_observed'):
+            return False
+        if any(alias in users for alias in identity.get('union_ids', [])):
+            return False
+        display = identity.get('current_union_id', private_id) if union_enabled else private_id
+        return self.framework_subject_allowed(bot, '', display, private_id)
+
+    async def framework_event_allowed(self, event):
+        if not self.framework_allowed(event):
+            return False
+        if event.is_direct and not event.is_channel:
+            return await self.framework_private_allowed(event.appid, event.raw_user_id)
+        return True
 
     async def framework_context_allowed(self, bot, group, member):
         subject = await self.access().subject_identity(bot, group, member)
@@ -375,7 +517,7 @@ class AccountSharing:
         except (TypeError, ValueError) as error:
             raise BusinessError(str(error) if isinstance(error, ValueError) else '授权参数不完整') from error
 
-    async def directory(self, event):
+    async def directory(self, event, *, page=0):
         context = await self.resolve_context(event)
         if not context:
             await self.deny(event)
@@ -411,8 +553,11 @@ class AccountSharing:
                     framework_allowed=await self.framework_context_allowed(event.appid, context['group'], context['member']),
                 )
             )['allowed']:
-                visible.append(f'{account["name"]} — 账户查询 {account["id"]}')
-        await event.reply('\n'.join(visible) if visible else DENIED)
+                visible.append((account['name'], {'kind': 'query', 'resource': account['id']}))
+        if not visible:
+            await self.deny(event)
+            return
+        await self.present_menu(event, {**context, 'menu': 'accounts'}, visible, page=page)
 
     async def initialize(self):
         await self.store.ready()
@@ -510,12 +655,32 @@ class AccountSharing:
 
     async def on_event(self, event):
         content = (event.content or '').strip()
-        if content == '账户列表' or content.startswith(('账户查询 ', '账户群 ', '账户绑定 ', '账户答复 ')):
+        try:
+            await self.identities.observe_private(event)
+        except (ValueError, RuntimeError, sqlite3.Error, OSError):
+            self.identities.identity_healthy = False
+            entry = content == '账户列表' or content.startswith(('账户管理', '账户列表 ', '账户查询 ', '账户群 ', '账户绑定 ', '账户答复 ', '账户翻页 '))
+            if not entry:
+                module = self.qa_provider()
+                try:
+                    entry = bool(module and module.active and await module.match(event.appid, FUNCTION, content))
+                except (RuntimeError, ValueError, sqlite3.Error, OSError):
+                    return
+            if entry:
+                if event.user_id in (cfg.get_bot_config(event.appid) or {}).get('owner_ids', []):
+                    await event.reply(UNAVAILABLE)
+                else:
+                    await self.deny(event)
+            return
+        if content == '账户列表' or content.startswith(('账户列表 ', '账户查询 ', '账户群 ', '账户绑定 ', '账户答复 ', '账户翻页 ')):
             try:
-                if content == '账户列表':
-                    await self.directory(event)
+                if content == '账户列表' or content.startswith('账户列表 '):
+                    page = int(content.split()[1]) - 1 if len(content.split()) > 1 else 0
+                    await self.directory(event, page=page)
                 elif content.startswith('账户查询 '):
                     await self.query(event, content.split(maxsplit=1)[1])
+                elif content.startswith('账户翻页 '):
+                    await self.activate_menu(event, content.split(maxsplit=1)[1])
                 elif content.startswith('账户答复 '):
                     await self.query(event, '', rule_id=content.split(maxsplit=1)[1])
                 elif content.startswith('账户群 '):
@@ -524,7 +689,7 @@ class AccountSharing:
                     else:
                         await self.deny(event)
                 else:
-                    if not event.is_direct or event.is_channel or not self.framework_allowed(event):
+                    if not event.is_direct or event.is_channel or not await self.framework_event_allowed(event):
                         await self.deny(event)
                         return
                     words = content.split()
@@ -549,7 +714,7 @@ class AccountSharing:
                 await self.deny(event)
             return
         bot = event.appid
-        if not self.framework_allowed(event) or event.user_id not in (cfg.get_bot_config(bot) or {}).get('owner_ids', []):
+        if not await self.framework_event_allowed(event) or event.user_id not in (cfg.get_bot_config(bot) or {}).get('owner_ids', []):
             await self.deny(event)
             return
         try:

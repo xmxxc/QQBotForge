@@ -16,8 +16,16 @@ class Platform:
         self.fail_private = False
         self.private_error = 'not_friends'
         self.after_reply = None
+        self.reject_buttons = False
+        self.acks = []
 
     async def reply(self, event, content=None, **kwargs):
+        if kwargs.get('buttons'):
+            from core.message.keyboard import build_keyboard
+
+            if self.reject_buttons:
+                return False, {'code': 'button_not_allowed'}
+            kwargs['keyboard'] = build_keyboard(kwargs['buttons'], event.appid)
         target = event.group_id if event.is_group else event.raw_user_id
         result = await self.send('group' if event.is_group else 'private', target, content, **kwargs)
         if self.after_reply:
@@ -122,6 +130,32 @@ async def host(tmp_path, monkeypatch):
 
         async def lifecycle(self, kind, *, bot='bot-a', group='group-a', member='new-member'):
             return await self.dispatch(Event.from_websocket(bot, {'t': kind, 'd': {'id': 'fake-event', 'group_openid': group, 'member_openid': member}}))
+
+        async def click(self, data, *, bot='bot-a', user='private-a', group=''):
+            event = Event.from_websocket(
+                bot,
+                {
+                    't': 'INTERACTION_CREATE',
+                    'd': {
+                        'id': 'fake-interaction',
+                        'type': 11,
+                        'application_id': bot,
+                        'chat_type': 1 if group else 2,
+                        'scene': 'group' if group else 'c2c',
+                        'group_openid': group,
+                        'group_member_openid': user if group else '',
+                        'user_openid': user if not group else '',
+                        'data': {'type': 11, 'resolved': {'button_data': data}},
+                    },
+                },
+            )
+            event._sender = platform
+            event.start_ack_countdown()
+            await hooks.emit('qq_event', event)
+            await plugin.account_interaction(event, None)
+            event.finish_dispatch()
+            platform.acks.append((event.message_id, await event.wait_ack_code()))
+            return event
 
         async def create(self, name='测试账户', bot='bot-a', **kwargs):
             response = await self.api('POST', 'accounts', {'name': name, 'login': 'fake-login', 'password': 'fake-secret', **kwargs}, bot=bot)
