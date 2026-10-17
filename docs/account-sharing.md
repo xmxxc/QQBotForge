@@ -31,3 +31,24 @@ QQ 管理命令使用当前 Bot 的 `owner_ids`：
 新增请求会生成新 ID，不能无条件重试；修改为设置目标值，可重试；删除不存在账户返回 404。
 
 测试使用临时 SQLite、假身份、假账密和平台替身。未进行真实 QQ、浏览器或 Bot 部署核查。
+
+## 指定群成员授权与目录
+
+先在现有模块管理中启用“黑白名单授权”（`access_control`），再配置白名单并授予成员调用及单账户资源资格。模块未启用或存储异常时成员查询停止。群白名单仅允许此功能在该群使用，不会自动授权成员；新成员和普通聊天不会触发主动联系。
+
+```text
+账户管理 白名单 {"group":"fake-group","enabled":true}
+账户管理 授权 {"group":"fake-group","member":"fake-native-member","identity_type":"group_member_openid","confirmed":true,"resources":["账户ID"]}
+账户管理 撤权 {"group":"fake-group","member":"fake-native-member"}
+账户管理 拉黑 {"group":"fake-group","member":"fake-native-member","scope":"member"}
+账户管理 解除拉黑 {"group":"fake-group","member":"fake-native-member","scope":"member"}
+账户管理 解释 {"group":"fake-group","member":"fake-native-member","resource":"账户ID"}
+```
+
+主人在群内授权可 @单个目标，JSON 中省略 `member` 和 `identity_type`；须保留 `confirmed:true`，表示主人已核对成员当前在群。私聊及 Web 使用明确的群原生 OpenID，不能把数字 QQ 号或 union 显示身份当作原生身份。Web 可从模块观察到的成员选择；该列表仅用于选人，不代表完整名册。拒绝可以选择整个群或指定成员，优先于授权。撤权只影响当前群、当前功能。
+
+成员发送 `账户列表` 仅列出本群当前有权使用的启用账户，不显示账号或密码。未授权命中入口时使用统一简短提示，同一 Bot/群/用户十秒限频，普通聊天不回应。
+
+`GET /api/ext/account-sharing/access?bot=<AppID>` 返回主人可见的准入、成员、授权及拒绝状态；`POST` 接受与上面命令同形的 JSON，另加 `operation`（`whitelist/grant/revoke/deny/allow/explain`）。此接口同样要求现有面板会话。授权新增来源不能无条件重试；白名单、撤销和拒绝设置是目标状态操作。
+
+授权模块的公共消费接口是 `execute(bot, operation, function=..., group=..., member=..., ...)` 和 `decide(bot, function, group, member, resource, action='view', framework_allowed=True)`。消费方必须传入框架拒绝结果，不得用模块放行覆盖框架拒绝；返回允许状态、原因、来源、成员核验状态和版本，不保存或发送账户密码。`qq_event` 通用观察 Hook 位于 Bot 事件入口，在 union 显示身份转换和插件过滤前执行。

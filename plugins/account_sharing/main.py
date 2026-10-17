@@ -48,7 +48,7 @@ async def unload():
         _instance = None
 
 
-@handler(r'^账户管理(?:\s|$)', name='账户管理', priority=20)
+@handler(r'^(?:账户管理(?:\s|$)|账户列表$)', name='账户管理', priority=20)
 async def account_management(event, _match):
     if _instance is None:
         await event.reply('账户共享未加载，请联系主人')

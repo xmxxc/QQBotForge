@@ -32,12 +32,18 @@ class Platform:
         return await self.send('group', target, content, **kwargs)
 
 
-def message(text, *, bot='bot-a', user='owner-a', group='', union=''):
+def message(text, *, bot='bot-a', user='owner-a', group='', union='', mentions=None):
     return Event.from_websocket(
         bot,
         {
             't': 'GROUP_AT_MESSAGE_CREATE' if group else 'C2C_MESSAGE_CREATE',
-            'd': {'id': 'fake-msg', 'content': text, 'author': {'id': user, 'member_openid': user, 'union_openid': union}, 'group_openid': group},
+            'd': {
+                'id': 'fake-msg',
+                'content': text,
+                'author': {'id': user, 'member_openid': user, 'union_openid': union},
+                'group_openid': group,
+                'mentions': mentions or [],
+            },
         },
     )
 
@@ -62,6 +68,13 @@ async def host(tmp_path, monkeypatch):
     plugin = importlib.import_module('plugins.account_sharing.main')
     plugin = importlib.reload(plugin)
     await plugin.load()
+    from core.module.hook import HookManager
+    from core.module.manager import ModuleContext
+    from modules.access_control import main as access_module
+
+    hooks = HookManager()
+    acl = await access_module.setup(ModuleContext('access_control', str(tmp_path / 'access'), hooks))
+    plugin._instance.access_provider = lambda: acl
     monkeypatch.setattr(auth, 'valid_sessions', {'test-session': {'expires': datetime.now() + timedelta(days=1), 'created': datetime.now()}})
     app = web.Application()
     app.router.add_route('*', '/api/ext/{tail:.*}', handle_ext_route)
@@ -86,11 +99,17 @@ async def host(tmp_path, monkeypatch):
                 headers={'Cookie': f'{auth.SESSION_COOKIE}=test-session'} if authenticated else {},
             )
 
-        async def event(self, text, **kwargs):
-            event = message(text, **kwargs)
+        async def dispatch(self, event):
             event._sender = platform
+            await hooks.emit('qq_event', event)
             await plugin.account_management(event, None)
             return event
+
+        async def event(self, text, **kwargs):
+            return await self.dispatch(message(text, **kwargs))
+
+        async def lifecycle(self, kind, *, bot='bot-a', group='group-a', member='new-member'):
+            return await self.dispatch(Event.from_websocket(bot, {'t': kind, 'd': {'id': 'fake-event', 'group_openid': group, 'member_openid': member}}))
 
         async def create(self, name='测试账户', bot='bot-a', **kwargs):
             response = await self.api('POST', 'accounts', {'name': name, 'login': 'fake-login', 'password': 'fake-secret', **kwargs}, bot=bot)
@@ -99,4 +118,5 @@ async def host(tmp_path, monkeypatch):
 
     yield Host()
     await plugin.unload()
+    await access_module.teardown()
     await client.close()
