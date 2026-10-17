@@ -154,8 +154,6 @@ async def test_text_fallback_can_page_when_platform_rejects_every_button(host):
 
 
 async def test_private_callback_preserves_distinct_c2c_union_framework_blacklist(host):
-    from conftest import message
-
     from core.base.config import cfg
 
     account = await host.create()
@@ -163,9 +161,7 @@ async def test_private_callback_preserves_distinct_c2c_union_framework_blacklist
     await host.event('普通聊天', user='member-a', group='group-a', union='group-union')
     await bind(host)
     cfg.set_bot_setting('bot-a', 'identity.use_union_id_for_group', True)
-    event = message('账户列表', user='private-a', union='private-union')
-    event.user_id = 'private-union'
-    await host.dispatch(event)
+    await host.event('账户列表', user='private-a', union='private-union')
     data = callback(host.sender.messages[-1], '测试账户')
     cfg.set_bot_setting('bot-a', 'blacklist.user_list', {'private-union': 'private framework identity'})
     host.sender.messages.clear()

@@ -116,3 +116,21 @@ Bot 从实际 C2C 事件记录本次私聊身份，只创建待审申请。主�
 
 
 C2C 普通消息实际提供的原生私聊 ID 与私聊 union 显示身份也分别保存，供缺少 union 字段的按钮回调核对框架黑名单；它与群内的 union 关联是不同记录。未知显示关系且存在相应框架用户拒绝配置时，回调保守暂停，先取得可靠的普通私聊身份事件。发送前会检查查询主体和私聊目标当前适用的拒绝规则。
+
+## 分组与一次／持续批量授权
+
+账户可设置 `groups:["演示组"]`；账户分组与功能授权组独立。页面有不同选择控件：功能范围选择单功能、主人定义的功能授权组或全部已注册功能；账户范围选择当前勾选账户、账户分组或全部账户。`snapshot`（一次）固定保存当前功能和账户 ID，后续新增不继承；`continuous`（持续）重新计算当前及未来符合选择的功能／账户。停用账户立即不可查，删除 ID 后相关单账户来源清理，同名新账户不会继承旧 ID 的授权。持续账户组成员移出后立即失去该来源，一次来源仍保留当时选中的 ID。
+
+```text
+账户管理 修改 <账户ID> {"groups":["演示组"]}
+账户管理 功能组 {"id":"常用功能","functions":["account_sharing"]}
+账户管理 批量授权 {"group":"fake-group","members":[{"member":"fake-member","identity_type":"group_member_openid","confirmed":true}],"function_scope":{"kind":"group","id":"常用功能"},"resource_scope":{"kind":"group","id":"演示组"},"mode":"continuous"}
+账户管理 批量撤权 {"group":"fake-group","members":[{"member":"fake-member"}],"source":"来源ID"}
+账户管理 批量账户 {"operation":"update","ids":["账户ID"],"data":{"enabled":false}}
+```
+
+相应授权 API 的 `operation` 为 `function_group/bulk_grant/bulk_revoke`。单人 `grant` 也接受 `function_scope`、`resource_scope` 与 `mode`；默认保持单功能、指定账户和一次授权。功能范围格式分别为 `{kind:"function",id}`、`{kind:"group",id}`、`{kind:"all"}`；资源范围格式为 `{kind:"resources",ids:[...]}`、`{kind:"group",id}`、`{kind:"all"}`。不能混用旧 `resources` 和 `resource_scope`。每个授权有独立来源 ID，撤权指定 `source` 只移除此来源，不提供时撤销该管理功能在本群为该成员创建的所有来源；其他来源继续生效，明确拒绝仍优先。
+
+批量成员操作最多 500 项，返回逐项 `saved/failed` 和成功／失败计数；部分失败须逐项处理，不能假定全部成功。`POST /api/ext/account-sharing/account-batches` 接受 `{operation:"update",ids:[...],data:{...}}` 或 `{operation:"delete",ids:[...]}`，同样返回逐项结果。新增账户及新增授权来源会生成新 ID，重试前先核对已保存项。
+
+通用模块消费方通过 `register_function(bot,function)` 注册功能，以 `register_resources(bot,namespace,[{id,groups,enabled}])` 发布该命名空间的完整资源清单。`decide(...,resource_namespace=...)` 可显式共享同一资源清单，默认命名空间为自身功能；调用资格、群白名单和成员核验始终单独检查。账户共享管理入口固定使用自身账户命名空间。旧单功能／单资源授权按一次来源兼容读取，不扩展为未来范围。

@@ -21,8 +21,18 @@ PREFIX = '/api/ext/account-sharing/'
 UNAVAILABLE = '账户共享存储暂不可用，请联系主人检查后台日志'
 DENIED = '你暂无此功能的使用权限，请联系主人'
 FUNCTION = 'account_sharing'
-ACCESS_COMMANDS = {'白名单': 'whitelist', '授权': 'grant', '撤权': 'revoke', '拉黑': 'deny', '解除拉黑': 'allow', '解释': 'explain'}
-ACCOUNT_FIELDS = {'name', 'login', 'password', 'enabled', 'description', 'url'}
+ACCESS_COMMANDS = {
+    '白名单': 'whitelist',
+    '授权': 'grant',
+    '撤权': 'revoke',
+    '拉黑': 'deny',
+    '解除拉黑': 'allow',
+    '解释': 'explain',
+    '功能组': 'function_group',
+    '批量授权': 'bulk_grant',
+    '批量撤权': 'bulk_revoke',
+}
+ACCOUNT_FIELDS = {'name', 'login', 'password', 'enabled', 'description', 'url', 'groups'}
 
 
 class BusinessError(ValueError):
@@ -37,7 +47,10 @@ def validate_account(data, *, create=False):
     if create and not {'name', 'login', 'password'} <= data.keys():
         raise BusinessError('请填写名称、账号和密码')
     for key, value in data.items():
-        if key == 'enabled':
+        if key == 'groups':
+            if not isinstance(value, list) or len(value) > 50 or any(not isinstance(g, str) or not g.strip() or len(g) > 100 for g in value):
+                raise BusinessError('账户分组须为最多 50 个非空名称，名称最多 100 字符')
+        elif key == 'enabled':
             if not isinstance(value, bool):
                 raise BusinessError('启用状态须为布尔值')
         elif not isinstance(value, str) or len(value) > 4000 or (key in {'name', 'login', 'password'} and not value.strip()):
@@ -108,6 +121,7 @@ class AccountSharing:
         qa_guard = (module, module.version(event.appid, FUNCTION))
         if not matches:
             return
+        await self.sync_access_resources(event.appid)
         context = await self.resolve_context(event)
         if not context:
             await self.deny(event)
@@ -402,6 +416,7 @@ class AccountSharing:
         return self.qa_provider() is module and module.active and module.version(bot, FUNCTION) == version
 
     async def query(self, event, resource, *, rule_id=None, qa_guard=None):
+        await self.sync_access_resources(event.appid)
         context = await self.resolve_context(event)
         if context is None:
             await self.deny(event)
@@ -495,6 +510,71 @@ class AccountSharing:
             await event.reply(DENIED)
         log.info(f'[{event.appid}] 查询拒绝 group={event.group_id} member={event.raw_user_id}')
 
+    async def sync_access_resources(self, bot):
+        async with self.lock:
+            await self._sync_access_resources_locked(bot)
+
+    async def _sync_access_resources_locked(self, bot):
+        module = self.access_provider()
+        if module is None or not module.active:
+            return
+        await module.register_function(bot, FUNCTION)
+        inventory = [{'id': a['id'], 'groups': a.get('groups', []), 'enabled': a['enabled']} for a in await self.accounts(bot)]
+        await module.register_resources(bot, FUNCTION, inventory)
+
+    async def account_batches(self, bot, data):
+        if not isinstance(data, dict) or set(data) - {'operation', 'ids', 'data'} or data.get('operation') not in {'update', 'delete'}:
+            raise BusinessError('账户批量操作须选择 update/delete、ids 及修改字段 data')
+        ids = data.get('ids')
+        if not isinstance(ids, list) or not 1 <= len(ids) <= 500 or any(not isinstance(key, str) or not key for key in ids):
+            raise BusinessError('请选择 1 至 500 个账户 ID')
+        if data['operation'] == 'update':
+            validate_account(data.get('data'))
+        items = []
+        for key in dict.fromkeys(ids):
+            try:
+                await self.manage(bot, data['operation'], data.get('data'), key)
+                items.append({'id': key, 'status': 'saved'})
+            except BusinessError as error:
+                items.append({'id': key, 'status': 'failed', 'error': str(error)})
+        success = sum(i['status'] == 'saved' for i in items)
+        return {'items': items, 'summary': {'success': success, 'failed': len(items) - success}}
+
+    async def bulk_result(self, bot, operation, group, result):
+        pending = False
+        for item in result['items']:
+            if item['status'] == 'saved' and operation == 'bulk_grant':
+                binding = await self.identities.lookup(bot, group, item['member'])
+                item['binding'] = 'verified' if binding else 'pending'
+                item['delivery'] = 'not_requested'
+                pending |= not binding
+        summary = result['summary']
+        status = 'saved' if not summary['failed'] else 'partial' if summary['success'] else 'failed'
+        record = await self.operation(
+            bot,
+            operation,
+            group=group,
+            authorization=status,
+            binding='pending' if pending else 'not_requested',
+            notification='pending',
+            delivery='not_requested',
+            items=result['items'],
+            summary=summary,
+        )
+        if pending:
+            sender = self.sender_provider(bot)
+            try:
+                response = (
+                    await sender.send_to_group(group, '批量授权已处理。需绑定的成员请私聊本 Bot：账户绑定 <群原生ID> <成员原生OpenID>，再由主人核对确认。')
+                    if sender
+                    else (False, {})
+                )
+                record['guidance'] = 'sent' if response[0] else 'unavailable'
+            except Exception:
+                record['guidance'] = 'failed'
+        result['operation_result'] = await self.notify_result(bot, record)
+        return result
+
     async def access_management(self, bot, data):
         if not isinstance(data, dict):
             raise BusinessError('授权请求须为对象')
@@ -502,15 +582,28 @@ class AccountSharing:
         operation = values.pop('operation', '')
         values.setdefault('function', FUNCTION)
         try:
+            await self.sync_access_resources(bot)
+            if operation in {'grant', 'bulk_grant'}:
+                if values.get('resource_namespace', FUNCTION) != FUNCTION:
+                    raise BusinessError('账户共享管理仅接受当前 Bot 的账户资源范围')
+                values['resource_namespace'] = FUNCTION
             if operation == 'explain':
                 values['framework_allowed'] = await self.framework_context_allowed(bot, values.get('group', ''), values.get('member', ''))
-            if operation == 'grant':
-                for resource in values.get('resources', []):
-                    if not await self.store.get(bot, 'accounts', resource):
+            if operation in {'grant', 'bulk_grant'}:
+                resources = values.get('resources', [])
+                scope = values.get('resource_scope')
+                if isinstance(scope, dict) and scope.get('kind') == 'resources':
+                    resources = scope.get('ids')
+                if not isinstance(resources, list) or len(resources) > 500:
+                    raise BusinessError('资源标识须为列表，最多 500 个')
+                for resource in resources:
+                    if not isinstance(resource, str) or not await self.store.get(bot, 'accounts', resource):
                         raise BusinessError('账户不存在', 404)
             result = await self.access().execute(bot, operation, **values)
             if operation == 'grant':
                 result['operation_result'] = await self.grant_result(bot, result)
+            elif operation in {'bulk_grant', 'bulk_revoke'}:
+                await self.bulk_result(bot, operation, values.get('group', ''), result)
             return result
         except BusinessError:
             raise
@@ -518,6 +611,7 @@ class AccountSharing:
             raise BusinessError(str(error) if isinstance(error, ValueError) else '授权参数不完整') from error
 
     async def directory(self, event, *, page=0):
+        await self.sync_access_resources(event.appid)
         context = await self.resolve_context(event)
         if not context:
             await self.deny(event)
@@ -584,14 +678,16 @@ class AccountSharing:
                 return old
             if operation == 'delete':
                 await self.store.delete(bot, 'accounts', key)
+                await self._sync_access_resources_locked(bot)
                 log.info(f'[{bot}] 删除账户 {key}')
                 return {'id': key}
             if operation not in {'create', 'update'}:
                 raise BusinessError('未知账户操作')
             validate_account(data, create=operation == 'create')
-            account = old or {'id': uuid4().hex, 'enabled': True, 'description': '', 'url': ''}
+            account = old or {'id': uuid4().hex, 'enabled': True, 'description': '', 'url': '', 'groups': []}
             account.update(data)
             await self.store.put(bot, 'accounts', account['id'], account)
+            await self._sync_access_resources_locked(bot)
             log.info(f'[{bot}] 保存账户 {account["id"]}')
             return account
 
@@ -607,6 +703,8 @@ class AccountSharing:
             return web.json_response({'success': False, 'error': '请选择有效 Bot'}, status=404)
         parts = request.path[len(PREFIX) :].strip('/').split('/')
         try:
+            if parts == ['account-batches'] and request.method == 'POST':
+                return web.json_response({'success': True, 'data': await self.account_batches(bot, await request.json())})
             if parts[0] == 'rules' and len(parts) <= 2:
                 key = parts[1] if len(parts) == 2 else ''
                 operation = {'GET': 'list', 'POST': 'create', 'PATCH': 'update', 'DELETE': 'delete'}.get(request.method)
@@ -627,6 +725,7 @@ class AccountSharing:
                 return web.json_response({'success': True, 'data': result})
             if parts == ['access']:
                 if request.method == 'GET':
+                    await self.sync_access_resources(bot)
                     result = await self.access().snapshot(bot)
                 elif request.method == 'POST':
                     result = await self.access_management(bot, await request.json())
@@ -725,6 +824,10 @@ class AccountSharing:
             words = event.content.split(maxsplit=2)
             action = words[1] if len(words) > 1 else '帮助'
             args = words[2] if len(words) > 2 else ''
+            if action == '批量账户':
+                result = await self.account_batches(bot, json.loads(args))
+                await event.reply(json.dumps(result, ensure_ascii=False) if event.is_direct else '账户批量操作已处理，详情请在主人私聊或后台查看')
+                return
             if action in {'规则新增', '规则修改', '规则删除', '规则列表'}:
                 if action == '规则新增':
                     result = await self.rule_management(bot, 'create', json.loads(args))
