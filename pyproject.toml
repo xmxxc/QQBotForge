@@ -1,7 +1,7 @@
 [project]
 name = "elainabot"
 version = "2.0.0"
-description = "ElainaBot - QQ Official Bot Framework"
+description = "QQBotForge - Async QQ bot framework based on ElainaBot v2"
 requires-python = ">=3.11"
 readme = "README.md"
 license = "MIT"

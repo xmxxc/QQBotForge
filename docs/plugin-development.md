@@ -1,4 +1,4 @@
-﻿# ElainaBot v2 插件开发文档
+﻿# QQBotForge 插件开发文档
 
 本文档说明插件结构、配置、事件处理、消息 API、群管理 API、Web 面板扩展和模块接入。
 

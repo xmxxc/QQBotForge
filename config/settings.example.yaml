@@ -16,7 +16,7 @@ server:
 web:
   admin_password: "admin"                       # 管理员密码 (首次登录成功后自动加密存储)
   trust_forwarded_headers: false                # 是否信任 X-Forwarded-For/X-Real-IP (仅在可信反向代理后开启; 直连时开启会导致封禁被伪造头绕过)
-  framework_name: "Elaina"                 # 框架名称
+  framework_name: "QQBotForge"             # 框架展示名称
   favicon_url: ""                          # 网页图标 URL
   pc_title_suffix: "仪表盘"
   login_title_suffix: "面板"
@@ -28,11 +28,11 @@ statistics:
   schedule_hour: 4                           # 每日聚合时间 - 小时(默认凌晨4点)
   schedule_minute: 0                         # 每日聚合时间 - 分钟
 
-# 框架自动更新（默认关闭）
+# 框架自动更新（默认开启，更新源为 ElainaCore/ElainaBot_v2）
 # 开启后每 10 分钟检查一次；更新前自动备份，更新成功后自动重启。
 # 更新内容、更新结果和重启完成通知会主动私聊第一个机器人的第一个主人。
 auto_update:
-  enabled: false
+  enabled: true
   interval_seconds: 600
 
 logging:
