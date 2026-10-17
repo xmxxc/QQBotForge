@@ -1,6 +1,7 @@
 """Account ownership and shared business entry points for QQ and the extension page."""
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 import time
@@ -13,6 +14,7 @@ from core.base.logger import PLUGIN, get_logger
 from core.plugin._blacklist import get_blacklist_map
 from modules.access_control.storage import ExtensionStore
 
+from .group_delivery import GroupDelivery
 from .identities import IdentityBindings
 from .menus import MenuSessions
 
@@ -34,6 +36,10 @@ ACCESS_COMMANDS = {
     '期限': 'set_expiry',
     '批量期限': 'bulk_expiry',
     '成员': 'members',
+    '核验': 'verify',
+    '批量核验': 'bulk_verify',
+    '自动核验': 'verify_auto',
+    '同步名册': 'roster_sync',
 }
 ACCOUNT_FIELDS = {'name', 'login', 'password', 'enabled', 'description', 'url', 'groups'}
 
@@ -68,11 +74,13 @@ class AccountSharing:
         self.active = True
         self.access_provider = access_provider or self._access_module
         self.denial_times = {}
+        self.notification_locks = {}
         self.sender_provider = sender_provider or self._bot_sender
         self.identities = IdentityBindings(self.store, self.access)
         self.qa_provider = qa_provider or self._qa_module
         self.clock = clock
         self.menus = MenuSessions(self.store, lambda: self.clock())
+        self.group_delivery = GroupDelivery(self)
 
     @staticmethod
     def _access_module():
@@ -195,6 +203,17 @@ class AccountSharing:
     def framework_allowed(cls, event):
         return cls.framework_subject_allowed(event.appid, event.group_id, event.user_id, event.raw_user_id)
 
+    @staticmethod
+    def framework_guard(bot):
+        restrictions = {
+            'users': get_blacklist_map(bot, 'user'),
+            'groups': get_blacklist_map(bot, 'group'),
+            'maintenance': cfg.get_bot_setting(bot, 'maintenance.enabled', False),
+            'union': cfg.get_bot_setting(bot, 'identity.use_union_id_for_group', False),
+            'owners': (cfg.get_bot_config(bot) or {}).get('owner_ids', []),
+        }
+        return hashlib.sha256(json.dumps(restrictions, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
     async def operation(self, bot, kind, **status):
         result = {'id': uuid4().hex, 'kind': kind, 'created_at': time.time(), **status}
         await self.store.put(bot, 'operations', result['id'], result)
@@ -202,6 +221,13 @@ class AccountSharing:
         return result
 
     async def notify_result(self, bot, result):
+        async with self.notification_locks.setdefault((bot, result['id']), asyncio.Lock()):
+            saved = await self.store.get(bot, 'operations', result['id'])
+            if saved and saved.get('notification') == 'sent':
+                return saved
+            return await self._notify_result(bot, result)
+
+    async def _notify_result(self, bot, result):
         owner = await self.store.get(bot, 'owners', 'observed_c2c')
         sender = self.sender_provider(bot)
         owner_ids = (cfg.get_bot_config(bot) or {}).get('owner_ids', [])
@@ -211,13 +237,55 @@ class AccountSharing:
             try:
                 response = await sender.send_to_user(
                     owner['private_id'],
-                    f'账户共享操作 {result["id"]}：{result["kind"]}；授权={result.get("authorization", "未变更")}，绑定={result.get("binding", "未变更")}，发送={result.get("delivery", "未请求")}；详情请在后台查看',
+                    f'账户共享操作 {result["id"]}：{result["kind"]}；授权={result.get("authorization", "未变更")}，绑定={result.get("binding", "未变更")}，核验={result.get("verification", "未变更")}，模式={result.get("mode", "未变更")}，发送={result.get("delivery", "未请求")}；详情请在后台查看',
                 )
                 result['notification'] = 'sent' if response[0] else 'failed'
             except Exception:
                 result['notification'] = 'failed'
         await self.store.put(bot, 'operations', result['id'], result)
         return result
+
+    async def tasks(self, bot, filters=None):
+        filters = filters or {}
+        if (
+            not isinstance(filters, dict)
+            or set(filters) - {'group', 'member', 'resource'}
+            or any(not isinstance(v, str) or len(v) > 256 for v in filters.values())
+        ):
+            raise BusinessError('待办筛选只接受 group、member、resource 文字')
+        tasks = []
+        acl = self.access()
+        await self.sync_access_resources(bot)
+        for subject in await acl.subjects(bot, FUNCTION):
+            key = (subject['group'], subject['member'])
+            identity = await acl.subject_identity(bot, *key)
+            base = subject
+            if not await self.identities.lookup(bot, *key):
+                tasks.append({**base, 'type': 'binding', 'action': '核对两侧身份并确认绑定申请'})
+            if identity.get('status') != 'present':
+                tasks.append({**base, 'type': 'verification', 'reason': identity.get('verification_reason', 'pending'), 'action': '核验当前成员及入群周期'})
+        for request in await self.store.all(bot, 'binding_requests'):
+            if request['status'] == 'pending':
+                tasks.append({**request, 'type': 'binding_request', 'action': '确认绑定'})
+        for mode in await self.group_delivery.list(bot):
+            if mode['desired'] == 'group' and mode['actual'] != 'group':
+                tasks.append({**mode, 'type': 'group_delivery', 'action': '查看逐人原因并重新检查'})
+        for result in await self.store.all(bot, 'operations'):
+            if result.get('notification') in {'failed', 'unavailable', 'pending'}:
+                tasks.append({**result, 'type': 'notification', 'operation_id': result['id'], 'action': '重试主人通知'})
+        return [
+            t
+            for t in tasks
+            if all(not value or t.get(key) == value or (key == 'resource' and value in t.get('resources', [])) for key, value in filters.items())
+        ]
+
+    async def task_action(self, bot, data):
+        if not isinstance(data, dict) or set(data) != {'operation', 'id'} or data['operation'] != 'retry_notification' or not isinstance(data['id'], str):
+            raise BusinessError('请提供 retry_notification 和操作 id')
+        result = await self.store.get(bot, 'operations', data['id'])
+        if not result:
+            raise BusinessError('操作不存在', 404)
+        return await self.notify_result(bot, result)
 
     async def grant_result(self, bot, source):
         binding = await self.identities.lookup(bot, source['group'], source['member'])
@@ -227,6 +295,7 @@ class AccountSharing:
             group=source['group'],
             member=source['member'],
             source=source['id'],
+            resources=source['resources'],
             authorization='saved',
             binding='verified' if binding else 'pending',
             notification='pending',
@@ -460,6 +529,8 @@ class AccountSharing:
         if not decision['allowed'] or not self.current_rules(bot, qa_guard):
             await self.deny(event)
             return
+        if event.is_group and resource and await self.group_delivery.try_send(event, context, resource, qa_guard):
+            return
         content = await self.query_content(bot, resource, rule_id)
         if content is None:
             await self.deny(event)
@@ -588,7 +659,8 @@ class AccountSharing:
             bot,
             operation,
             group=group,
-            authorization=status,
+            authorization='not_changed' if operation == 'bulk_verify' else status,
+            verification=status if operation == 'bulk_verify' else 'not_changed',
             binding='pending' if pending else 'not_requested',
             notification='pending',
             delivery='not_requested',
@@ -611,11 +683,13 @@ class AccountSharing:
         result['operation_result'] = await self.notify_result(bot, record)
         return result
 
-    async def access_management(self, bot, data):
+    async def access_management(self, bot, data, *, actor='panel_admin'):
         if not isinstance(data, dict):
             raise BusinessError('授权请求须为对象')
         values = dict(data)
         operation = values.pop('operation', '')
+        if operation in {'verify', 'bulk_verify'}:
+            values['actor'] = actor
         private_explanation = operation == 'explain' and values.get('action') == 'private'
         if private_explanation:
             values['action'] = 'view'
@@ -649,8 +723,30 @@ class AccountSharing:
                     result.update(allowed=False, reason='framework_denied')
             if operation == 'grant':
                 result['operation_result'] = await self.grant_result(bot, result)
-            elif operation in {'bulk_grant', 'bulk_revoke', 'bulk_expiry'}:
+            elif operation in {'bulk_grant', 'bulk_revoke', 'bulk_expiry', 'bulk_verify'}:
                 await self.bulk_result(bot, operation, values.get('group', ''), result)
+            elif operation == 'verify':
+                record = await self.operation(
+                    bot,
+                    'verification',
+                    group=values.get('group'),
+                    member=values.get('member'),
+                    verification=result['state'],
+                    delivery='not_requested',
+                    notification='pending',
+                )
+                result['operation_result'] = await self.notify_result(bot, record)
+            elif operation in {'verify_auto', 'roster_sync'}:
+                record = await self.operation(
+                    bot,
+                    operation,
+                    group=values.get('group'),
+                    member=values.get('member', ''),
+                    verification=result.get('state', 'complete' if result.get('complete') else 'incomplete'),
+                    delivery='not_requested',
+                    notification='pending',
+                )
+                result['operation_result'] = await self.notify_result(bot, record)
             return result
         except BusinessError:
             raise
@@ -750,6 +846,25 @@ class AccountSharing:
             return web.json_response({'success': False, 'error': '请选择有效 Bot'}, status=404)
         parts = request.path[len(PREFIX) :].strip('/').split('/')
         try:
+            if parts == ['tasks']:
+                if request.method == 'GET':
+                    result = await self.tasks(bot, {k: request.query[k] for k in ('group', 'member', 'resource') if k in request.query})
+                elif request.method == 'POST':
+                    result = await self.task_action(bot, await request.json())
+                else:
+                    raise BusinessError('方法不适用', 405)
+                return web.json_response({'success': True, 'data': result})
+            if parts == ['group-delivery']:
+                if request.method == 'GET':
+                    result = await self.group_delivery.list(bot)
+                elif request.method == 'POST':
+                    try:
+                        result = await self.group_delivery.configure(bot, await request.json())
+                    except ValueError as error:
+                        raise BusinessError(str(error)) from error
+                else:
+                    raise BusinessError('方法不适用', 405)
+                return web.json_response({'success': True, 'data': result})
             if parts == ['account-batches'] and request.method == 'POST':
                 return web.json_response({'success': True, 'data': await self.account_batches(bot, await request.json())})
             if parts[0] == 'rules' and len(parts) <= 2:
@@ -871,6 +986,18 @@ class AccountSharing:
             words = event.content.split(maxsplit=2)
             action = words[1] if len(words) > 1 else '帮助'
             args = words[2] if len(words) > 2 else ''
+            if action in {'待办', '重试通知'}:
+                result = (
+                    await self.tasks(bot, json.loads(args) if args else {})
+                    if action == '待办'
+                    else await self.task_action(bot, {'operation': 'retry_notification', 'id': args})
+                )
+                await event.reply(json.dumps(result, ensure_ascii=False) if event.is_direct else '请在主人私聊或后台查看待办和通知详情')
+                return
+            if action == '群发':
+                result = await self.group_delivery.configure(bot, json.loads(args))
+                await event.reply(json.dumps(result, ensure_ascii=False) if event.is_direct else '群发检查已处理，逐人原因请在主人私聊或后台查看')
+                return
             if action == '批量账户':
                 result = await self.account_batches(bot, json.loads(args))
                 await event.reply(json.dumps(result, ensure_ascii=False) if event.is_direct else '账户批量操作已处理，详情请在主人私聊或后台查看')
@@ -912,7 +1039,7 @@ class AccountSharing:
                     if len(targets) == 1:
                         data['member'] = targets[0]['id']
                         data['identity_type'] = 'group_member_openid'
-                result = await self.access_management(bot, data)
+                result = await self.access_management(bot, data, actor=event.raw_user_id)
                 await event.reply(json.dumps(result, ensure_ascii=False) if event.is_direct else '授权操作已保存，详情请在主人私聊或后台查看')
                 return
             if action == '预览':

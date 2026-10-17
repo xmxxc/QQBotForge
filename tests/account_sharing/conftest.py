@@ -22,6 +22,15 @@ class Platform:
         self.after_reply = None
         self.reject_buttons = False
         self.acks = []
+        self.query_results = {}
+        self.after_get = None
+
+    async def get_json(self, path, **kwargs):
+        cursor = (kwargs.get('params') or {}).get('cursor', '')
+        result = self.query_results.get((path, cursor), (False, {'code': '11253'}))
+        if self.after_get:
+            await self.after_get(path, cursor)
+        return result
 
     async def reply(self, event, content=None, **kwargs):
         if kwargs.get('buttons'):
@@ -93,6 +102,7 @@ async def host(tmp_path, monkeypatch):
 
     hooks = HookManager()
     acl = await access_module.setup(ModuleContext('access_control', str(tmp_path / 'access'), hooks))
+    acl.reader.sender_provider = lambda bot: platform
     # A simulated platform source exercises policy algorithms, not production wiring.
     acl.lifecycle_available = True
     hooks.register('qq_event', acl.observe, owner='simulated-platform', priority=0)
@@ -116,6 +126,15 @@ async def host(tmp_path, monkeypatch):
         entry = plugin
         sender = platform
         http = client
+
+        async def restart_access(self):
+            nonlocal acl
+            hooks.unregister_owner('simulated-platform')
+            await access_module.teardown()
+            acl = await access_module.setup(ModuleContext('access_control', str(tmp_path / 'access'), hooks))
+            acl.reader.sender_provider = lambda bot: platform
+            acl.lifecycle_available = True
+            hooks.register('qq_event', acl.observe, owner='simulated-platform', priority=0)
 
         async def api(self, method, path='', body=None, bot='bot-a', authenticated=True):
             return await client.request(

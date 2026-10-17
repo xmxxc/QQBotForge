@@ -38,10 +38,12 @@ class AccessControl:
     Mutations invalidate versions before persistence; storage failure fails closed.
     """
 
-    def __init__(self, path, *, clock=time.time, lifecycle_available=False):
+    def __init__(self, path, *, clock=time.time, lifecycle_available=False, reader=None):
         self.store = ExtensionStore(path)
         self.clock = clock
         self.lifecycle_available = lifecycle_available
+        self.reader = reader
+        self.roster_locks = {}
         self.states = {}
         self.locks = {}
         self.active = True
@@ -61,22 +63,39 @@ class AccessControl:
         if bot not in self.states:
             async with self.locks.setdefault(bot, asyncio.Lock()):
                 if bot not in self.states:
-                    self.states[bot] = await self.store.get(bot, 'access', 'state') or {
+                    persisted = await self.store.get(bot, 'access', 'state')
+                    state = persisted or {
                         'version': 0,
                         'whitelist': {},
                         'members': {},
                         'grants': [],
                         'denies': [],
                     }
+                    if state.get('schema_version', 1) > 5:
+                        raise RuntimeError('授权数据版本高于当前模块')
+                    if persisted:
+                        for membership in state['members'].values():
+                            if membership.get('status') == 'present':
+                                membership.update(status='pending', verification_reason='process_restart')
+                        for roster in state.get('rosters', {}).values():
+                            roster.update(complete=False, reason='process_restart')
+                        state['version'] += 1
+                        await self._save(bot, state)
+                    self.states[bot] = state
         state = self.states[bot]
-        if state.get('schema_version', 1) > 4:
+        if state.get('schema_version', 1) > 5:
             raise RuntimeError('授权数据版本高于当前模块')
-        state['schema_version'] = 4
+        state['schema_version'] = 5
         state.setdefault('functions', {})
         state.setdefault('function_groups', {})
         state.setdefault('resources', {})
         state.setdefault('revocations', [])
         state.setdefault('group_versions', {})
+        state.setdefault('qualification_version', state['version'])
+        state.setdefault('qualification_groups', {})
+        state.setdefault('groups', {})
+        state.setdefault('rosters', {})
+        state.setdefault('verifications', [])
         for deny in state['denies']:
             deny.setdefault('id', uuid4().hex)
             deny.setdefault('function_scope', {'kind': 'function', 'id': deny['function']})
@@ -91,9 +110,17 @@ class AccessControl:
     async def snapshot(self, bot):
         state = copy.deepcopy(await self._state(bot))
         state['capabilities'] = {'lifecycle_events': self.lifecycle_available}
+        for roster in state['rosters'].values():
+            if roster.get('version') != state['version']:
+                roster.update(complete=False, reason='state_changed')
         return state
 
-    async def _save(self, bot, state):
+    async def _save(self, bot, state, *, qualification_change=True, qualification_group=None):
+        if qualification_change:
+            if qualification_group:
+                state.setdefault('qualification_groups', {})[qualification_group] = state['version']
+            else:
+                state['qualification_version'] = state['version']
         try:
             await self.store.put(bot, 'access', 'state', state)
         except Exception:
@@ -207,12 +234,14 @@ class AccessControl:
                     raise ValueError('批量目标须使用 group_member_openid 类型')
                 native = identifier(target.get('member'))
                 values = {**common, **{k: v for k, v in target.items() if k != 'member'}}
-                if operation != 'bulk_grant':
+                if operation == 'bulk_verify':
+                    values.setdefault('identity_type', 'group_member_openid')
+                if operation not in {'bulk_grant', 'bulk_verify'}:
                     values.pop('identity_type', None)
                     values.pop('confirmed', None)
                 result = await self.execute(
                     bot,
-                    {'bulk_grant': 'grant', 'bulk_revoke': 'revoke', 'bulk_expiry': 'set_expiry'}[operation],
+                    {'bulk_grant': 'grant', 'bulk_revoke': 'revoke', 'bulk_expiry': 'set_expiry', 'bulk_verify': 'verify'}[operation],
                     function=function,
                     group=group,
                     member=native,
@@ -225,12 +254,18 @@ class AccessControl:
         return {'items': results, 'summary': {'success': success, 'failed': len(results) - success}}
 
     async def execute(self, bot, operation, *, function, group='', member='', **data):
-        if operation in {'bulk_grant', 'bulk_revoke', 'bulk_expiry'}:
+        if operation in {'verify_auto', 'roster_sync'}:
+            if data:
+                raise ValueError('自动核验不接受手工结论或额外字段')
+            identifier(group)
+            return await self.revalidate_member(bot, group, identifier(member)) if operation == 'verify_auto' else await self.sync_roster(bot, group)
+        if operation in {'bulk_grant', 'bulk_revoke', 'bulk_expiry', 'bulk_verify'}:
             return await self._bulk(bot, operation, function, identifier(group), data)
         allowed_fields = {
             'whitelist': {'enabled'},
             'function_group': {'id', 'functions'},
             'members': set(),
+            'verify': {'identity_type', 'confirmed', 'state', 'evidence', 'actor'},
             'grant': {'resources', 'identity_type', 'confirmed', 'invoke', 'function_scope', 'resource_scope', 'resource_namespace', 'mode', 'expires_at'},
             'revoke': {'source'},
             'set_expiry': {'source', 'expires_at'},
@@ -265,7 +300,7 @@ class AccessControl:
             )
         expected_version = state['version']
         async with self.locks.setdefault(bot, asyncio.Lock()):
-            if operation == 'grant' and state['version'] != expected_version:
+            if operation in {'grant', 'verify'} and state['version'] != expected_version:
                 raise ValueError('成员或授权状态已变化，请重新核对后授权')
             source = None
             candidate_functions = {**state['functions'], function: {'id': function}}
@@ -302,6 +337,7 @@ class AccessControl:
                 key = identity_key(group, member)
                 membership = state['members'].setdefault(key, {'group': group, 'member': member, 'cycle': uuid4().hex, 'status': 'unverified'})
                 if membership.get('status') in {'left', 'pending'}:
+                    membership.pop('platform_joined_at', None)
                     self._retire_sources(state, group, member, 'owner_new_cycle')
                     membership['cycle'] = uuid4().hex
                 membership.update(status='present', verified_by='owner', verified_at=self.clock(), verification_reason='owner_confirmed')
@@ -326,6 +362,35 @@ class AccessControl:
                     else 'snapshot',
                 }
                 state['grants'].append(source)
+            elif operation == 'verify':
+                identifier(member)
+                if data.get('identity_type') != 'group_member_openid' or data.get('confirmed') is not True or data.get('state') not in {'present', 'absent'}:
+                    raise ValueError('核验须明确群原生身份、confirmed:true 及 present/absent 结果')
+                evidence = data.get('evidence')
+                if not isinstance(evidence, str) or not evidence.strip() or len(evidence) > 1000:
+                    raise ValueError('请记录核验依据，确认同一入群周期（最多 1000 字）')
+                actor = identifier(data.get('actor'))
+                membership = state['members'].get(identity_key(group, member))
+                if not membership:
+                    raise ValueError('没有可核验的成员记录；新成员请先明确授权')
+                if data['state'] == 'present':
+                    if membership.get('status') in {'left', 'unverified'}:
+                        raise ValueError('旧周期已结束或尚未授权，请明确重新授权')
+                    membership.update(status='present', verified_by=actor, verified_at=self.clock(), verification_reason='owner_verified')
+                else:
+                    self._retire_sources(state, group, member, 'verified_absent')
+                    membership.update(status='left', verification_reason='verified_absent', left_at=self.clock())
+                source = {
+                    'id': uuid4().hex,
+                    'group': group,
+                    'member': member,
+                    'actor': actor,
+                    'at': self.clock(),
+                    'state': data['state'],
+                    'evidence': evidence,
+                    'cycle': membership['cycle'],
+                }
+                state['verifications'].append(source)
             elif operation == 'set_expiry':
                 identifier(member)
                 if 'expires_at' not in data:
@@ -387,9 +452,61 @@ class AccessControl:
                     state['denies'] = [d for d in state['denies'] if d not in matching]
             state['functions'].setdefault(function, {'id': function})
             state['version'] += 1
-            await self._save(bot, state)
+            await self._save(bot, state, qualification_group=None if operation == 'function_group' else group)
             log.info(f'[{bot}] {operation} group={group} member={member} version={state["version"]}')
             return copy.deepcopy(source) if source else {'version': state['version']}
+
+    async def revalidate_member(self, bot, group, member):
+        state = await self._state(bot)
+        membership = state['members'].get(identity_key(group, member))
+        if not membership:
+            raise ValueError('没有可核验的成员记录')
+        version, cycle = state['version'], membership['cycle']
+        result = await self.reader.member(bot, group, member) if self.reader else {'state': 'unknown', 'reason': 'unavailable'}
+        async with self.locks.setdefault(bot, asyncio.Lock()):
+            if state['version'] != version or membership['cycle'] != cycle:
+                return {'state': 'unknown', 'reason': 'state_changed'}
+            if result['state'] == 'present':
+                joined = result['joined_at']
+                anchor = membership.get('platform_joined_at')
+                same_cycle = joined == anchor if anchor is not None else joined <= membership.get('verified_at', 0)
+                if membership.get('status') in {'left', 'unverified'} or not same_cycle:
+                    self._retire_sources(state, group, member, 'new_membership_cycle')
+                    membership.update(status='unverified', cycle=uuid4().hex, verification_reason='new_membership_cycle')
+                    membership['platform_joined_at'] = joined
+                    result.update(state='new_cycle', reason='new_membership_cycle')
+                else:
+                    membership.update(
+                        status='present',
+                        verification_reason='platform_verified',
+                        platform_joined_at=joined,
+                        name=result.get('name', ''),
+                        verified_by='platform',
+                    )
+            elif membership.get('status') != 'left':
+                membership.update(status='pending', verification_reason=result['reason'])
+            record = {'id': uuid4().hex, 'group': group, 'member': member, 'actor': 'platform', 'at': self.clock(), **result}
+            state['verifications'].append(record)
+            state['version'] += 1
+            await self._save(bot, state, qualification_group=group)
+            return copy.deepcopy(record)
+
+    async def sync_roster(self, bot, group):
+        async with self.roster_locks.setdefault((bot, group), asyncio.Lock()):
+            state = await self._state(bot)
+            version = state['version']
+            result = await self.reader.roster(bot, group) if self.reader else {'complete': False, 'members': [], 'reason': 'unavailable'}
+            async with self.locks.setdefault(bot, asyncio.Lock()):
+                if state['version'] != version:
+                    result.update(complete=False, reason='state_changed')
+                observed = {m['member'] for m in state['members'].values() if m['group'] == group and m.get('status') != 'left'}
+                returned = {m['member'] for m in result['members']}
+                if result['complete'] and observed - returned:
+                    result.update(complete=False, reason='known_member_missing', missing_known_members=sorted(observed - returned))
+                result.update(id=uuid4().hex, group=group, checked_at=self.clock(), version=state['version'])
+                state['rosters'][group] = copy.deepcopy(result)
+                await self._save(bot, state, qualification_change=False)
+                return result
 
     async def decide(self, bot, function, group, member, resource='', *, action='view', framework_allowed=True, resource_namespace=None):
         if action not in {'view', 'invoke'}:
@@ -431,6 +548,8 @@ class AccessControl:
             result['reason'] = 'group_not_allowed'
         elif not self.lifecycle_available:
             result['reason'] = 'event_integration_unavailable'
+        elif state['groups'].get(group, {}).get('bot_present') is False:
+            result['reason'] = 'bot_not_in_group'
         elif membership.get('status') == 'left':
             result['reason'] = 'left_group'
         elif membership.get('status') != 'present':
@@ -475,9 +594,53 @@ class AccessControl:
             and (decision.get('valid_until') is None or self.clock() < decision['valid_until'])
         )
 
+    def roster_current(self, bot, group, version, roster_id):
+        """A sync round is usable only in the same known authorization state."""
+        state = self.states.get(bot, {})
+        roster = state.get('rosters', {}).get(group, {})
+        return bool(
+            self.active
+            and self.healthy
+            and self.lifecycle_available
+            and state.get('version') == version
+            and roster.get('complete')
+            and roster.get('id') == roster_id
+            and roster.get('version') == version
+        )
+
+    def qualification_revision(self, bot, group):
+        """Mode continuity marker; it never authorizes sending without fresh decisions."""
+        state = self.states.get(bot)
+        return (
+            [state.get('qualification_version'), state.get('qualification_groups', {}).get(group, 0)]
+            if self.active and self.healthy and self.lifecycle_available and state
+            else None
+        )
+
     async def subject_identity(self, bot, group, member):
         state = await self._state(bot)
         return copy.deepcopy(state['members'].get(identity_key(group, member), {}))
+
+    async def subjects(self, bot, function, *, resource_namespace=None):
+        """Current scoped inventory for management, including continuous future resources."""
+        state = await self._state(bot)
+        namespace = resource_namespace or function
+        subjects = {}
+        for source in state['grants']:
+            membership = state['members'].get(identity_key(source['group'], source['member']), {})
+            if (
+                source['cycle'] != membership.get('cycle')
+                or not self._source_matches_function(state, source, function)
+                or source.get('resource_namespace', source['function']) != namespace
+                or (source.get('expires_at') is not None and self.clock() >= source['expires_at'])
+            ):
+                continue
+            key = identity_key(source['group'], source['member'])
+            subject = subjects.setdefault(key, {'group': source['group'], 'member': source['member'], 'resources': []})
+            for resource in state['resources'].get(namespace, {}):
+                if resource not in subject['resources'] and self._source_matches_resource(state, source, namespace, resource):
+                    subject['resources'].append(resource)
+        return list(subjects.values())
 
     def _retire_sources(self, state, group, member, reason):
         removed = [g for g in state['grants'] if g['group'] == group and g['member'] == member]
@@ -525,15 +688,61 @@ class AccessControl:
                 if event.event_type == 'GROUP_MEMBER_REMOVE':
                     membership.update(status='left', verification_reason='member_left', left_at=timestamp)
                 else:
+                    membership.pop('platform_joined_at', None)
                     membership.update(cycle=uuid4().hex, status='unverified', verification_reason='new_membership_cycle', joined_at=timestamp)
         # All in-memory eligibility changes happen without a durable await, even if
         # another owner mutation currently holds the persistence lock.
         state['version'] += 1
         state['group_versions'][group] = state['group_versions'].get(group, 0) + 1
+        state['qualification_groups'][group] = state['version']
         async with self.locks.setdefault(event.appid, asyncio.Lock()):
-            await self._save(event.appid, state)
+            await self._save(event.appid, state, qualification_group=group)
+
+    async def suspend(self, bot, *, reason, group=''):
+        """Trusted adapter entry point; reconnection alone cannot undo suspension."""
+        identifier(reason)
+        if group:
+            identifier(group)
+        state = await self._state(bot)
+        for membership in state['members'].values():
+            if (not group or membership['group'] == group) and membership.get('status') != 'left':
+                membership.update(status='pending', verification_reason=reason)
+        for key, roster in state['rosters'].items():
+            if not group or key == group:
+                roster.update(complete=False, reason=reason)
+        state['version'] += 1
+        if group:
+            state['qualification_groups'][group] = state['version']
+        else:
+            state['qualification_version'] = state['version']
+        async with self.locks.setdefault(bot, asyncio.Lock()):
+            await self._save(bot, state, qualification_group=group)
+
+    async def _observe_bot_membership(self, event):
+        group = event.get('d/group_openid')
+        if not isinstance(group, str) or not group:
+            await self.suspend(event.appid, reason='bot_group_identity_unknown')
+            return
+        state = await self._state(event.appid)
+        status = state['groups'].setdefault(group, {'events': []})
+        event_id = event.event_id or event.message_id
+        record = {'id': event_id, 'kind': event.event_type, 'time': event.get('d/timestamp')}
+        if event_id and record in status['events']:
+            return
+        status['events'].append(record)
+        del status['events'][:-128]
+        removed = event.event_type == 'GROUP_DEL_ROBOT'
+        reason = 'bot_removed' if removed else 'bot_rejoined_requires_new_grants'
+        status.update(bot_present=not removed, reason=reason)
+        for membership in state['members'].values():
+            if membership['group'] == group:
+                self._retire_sources(state, group, membership['member'], reason)
+        await self.suspend(event.appid, group=group, reason=reason)
 
     async def observe(self, event):
+        if event.event_type in {'GROUP_DEL_ROBOT', 'GROUP_ADD_ROBOT'}:
+            await self._observe_bot_membership(event)
+            return
         if event.event_type in {'GROUP_MEMBER_ADD', 'GROUP_MEMBER_REMOVE'}:
             await self._observe_membership(event)
             return
@@ -543,6 +752,7 @@ class AccessControl:
         async with self.locks.setdefault(event.appid, asyncio.Lock()):
             key = identity_key(event.group_id, event.raw_user_id)
             changed = key not in state['members']
+            qualification_changed = changed
             membership = state['members'].setdefault(
                 key, {'group': event.group_id, 'member': event.raw_user_id, 'name': event.username or '', 'cycle': uuid4().hex, 'status': 'unverified'}
             )
@@ -557,12 +767,15 @@ class AccessControl:
                     if union_id not in aliases:
                         aliases.append(union_id)
                         changed = True
+                        qualification_changed = True
                     if membership.get('current_union_id') != union_id:
                         membership['current_union_id'] = union_id
                         changed = True
+                        qualification_changed = True
                 elif membership.get('current_union_id') != event.raw_user_id:
+                    qualification_changed |= bool(membership.get('current_union_id'))
                     membership['current_union_id'] = event.raw_user_id
                     changed = True
             if changed:
                 state['version'] += 1
-                await self._save(event.appid, state)
+                await self._save(event.appid, state, qualification_change=qualification_changed, qualification_group=event.group_id)
