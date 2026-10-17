@@ -83,6 +83,10 @@ async def host(tmp_path, monkeypatch):
     acl = await access_module.setup(ModuleContext('access_control', str(tmp_path / 'access'), hooks))
     plugin._instance.access_provider = lambda: acl
     plugin._instance.sender_provider = lambda bot: platform
+    from modules.self_qa import main as qa_module
+
+    qa = await qa_module.setup(ModuleContext('self_qa', str(tmp_path / 'qa'), hooks))
+    plugin._instance.qa_provider = lambda: qa
     monkeypatch.setattr(auth, 'valid_sessions', {'test-session': {'expires': datetime.now() + timedelta(days=1), 'created': datetime.now()}})
     app = web.Application()
     app.router.add_route('*', '/api/ext/{tail:.*}', handle_ext_route)
@@ -127,4 +131,5 @@ async def host(tmp_path, monkeypatch):
     yield Host()
     await plugin.unload()
     await access_module.teardown()
+    await qa_module.teardown()
     await client.close()

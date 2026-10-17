@@ -45,7 +45,7 @@ def validate_account(data, *, create=False):
 
 
 class AccountSharing:
-    def __init__(self, path, *, access_provider=None, sender_provider=None):
+    def __init__(self, path, *, access_provider=None, sender_provider=None, qa_provider=None):
         self.store = ExtensionStore(path)
         self.lock = asyncio.Lock()
         self.active = True
@@ -53,6 +53,7 @@ class AccountSharing:
         self.denial_times = {}
         self.sender_provider = sender_provider or self._bot_sender
         self.identities = IdentityBindings(self.store, self.access)
+        self.qa_provider = qa_provider or self._qa_module
 
     @staticmethod
     def _access_module():
@@ -66,6 +67,92 @@ class AccountSharing:
         if module is None or not module.active:
             raise BusinessError('黑白名单授权模块未启用，查询暂停，请联系主人', 503)
         return module
+
+    @staticmethod
+    def _qa_module():
+        from core.application import get_app
+
+        app = get_app()
+        return app.module_manager.get('self_qa') if app else None
+
+    def qa(self):
+        module = self.qa_provider()
+        if module is None or not module.active:
+            raise BusinessError('自助问答模块未启用，关键词查询暂停', 503)
+        return module
+
+    async def rule_management(self, bot, operation, data=None, key=''):
+        try:
+            if operation in {'create', 'update'} and isinstance(data, dict):
+                old = await self.qa().manage(bot, FUNCTION, 'get', key=key) if key else None
+                merged = {**(old or {}), **data}
+                if merged.get('kind', 'resource') == 'resource' and not await self.store.get(bot, 'accounts', merged.get('target', '')):
+                    raise BusinessError('规则引用的账户不存在', 404)
+            return await self.qa().manage(bot, FUNCTION, operation, data, key)
+        except KeyError as error:
+            raise BusinessError('规则不存在', 404) from error
+        except BusinessError:
+            raise
+        except ValueError as error:
+            raise BusinessError(str(error)) from error
+
+    async def keyword_query(self, event):
+        module = self.qa_provider()
+        if module is None or not module.active:
+            return
+        matches = await module.match(event.appid, FUNCTION, event.content or '')
+        qa_guard = (module, module.version(event.appid, FUNCTION))
+        if not matches:
+            return
+        context = await self.resolve_context(event)
+        if not context:
+            await self.deny(event)
+            return
+        if context.get('selection_required'):
+            return
+        allowed = []
+        for match in matches:
+            resource = match['target'] if match['kind'] == 'resource' else ''
+            decision = await self.access().decide(
+                event.appid,
+                FUNCTION,
+                context['group'],
+                context['member'],
+                resource,
+                action='view' if match['kind'] == 'resource' else 'invoke',
+                framework_allowed=await self.framework_context_allowed(event.appid, context['group'], context['member']),
+            )
+            if not decision['allowed']:
+                continue
+            if match['kind'] == 'resource':
+                account = await self.store.get(event.appid, 'accounts', resource)
+                if not account or not account['enabled']:
+                    continue
+                match['name'] = account['name']
+            allowed.append(match)
+        selected = {}
+        for match in module.best(allowed):
+            selected.setdefault((match['kind'], match['target']), match)
+        candidates = list(selected.values())
+        if not candidates:
+            await self.deny(event)
+        elif len(candidates) == 1:
+            match = candidates[0]
+            await self.query(
+                event, match['target'] if match['kind'] == 'resource' else '', rule_id=match['rule_id'] if match['kind'] == 'text' else None, qa_guard=qa_guard
+            )
+        else:
+            await event.reply(
+                '请选择有权候选：\n'
+                + '\n'.join(f'{m["name"]} — ' + (f'账户查询 {m["target"]}' if m['kind'] == 'resource' else f'账户答复 {m["rule_id"]}') for m in candidates)
+            )
+
+    async def query_content(self, bot, resource, rule_id):
+        if rule_id:
+            rule = await self.qa().manage(bot, FUNCTION, 'get', key=rule_id)
+            return rule['target'] if rule and rule['enabled'] and rule['kind'] == 'text' else None
+        account = await self.store.get(bot, 'accounts', resource)
+        return self.credentials(account) if account and account['enabled'] else None
 
     @staticmethod
     def _bot_sender(bot):
@@ -182,7 +269,24 @@ class AccountSharing:
             return {'selection_required': True}
         return None
 
-    async def query(self, event, resource):
+    async def query_decision(self, event, context, resource, rule_id=None):
+        return await self.access().decide(
+            event.appid,
+            FUNCTION,
+            context['group'],
+            context['member'],
+            resource,
+            action='invoke' if rule_id else 'view',
+            framework_allowed=self.framework_allowed(event) and await self.framework_context_allowed(event.appid, context['group'], context['member']),
+        )
+
+    def current_rules(self, bot, guard):
+        if guard is None:
+            return True
+        module, version = guard
+        return self.qa_provider() is module and module.active and module.version(bot, FUNCTION) == version
+
+    async def query(self, event, resource, *, rule_id=None, qa_guard=None):
         context = await self.resolve_context(event)
         if context is None:
             await self.deny(event)
@@ -190,10 +294,12 @@ class AccountSharing:
         if context.get('selection_required'):
             return
         bot, group, member = event.appid, context['group'], context['member']
-        module = self.access()
-        decision = await module.decide(bot, FUNCTION, group, member, resource, framework_allowed=await self.framework_context_allowed(bot, group, member))
-        account = await self.store.get(bot, 'accounts', resource)
-        if not decision['allowed'] or not account or not account['enabled']:
+        decision = await self.query_decision(event, context, resource, rule_id)
+        if not decision['allowed'] or not self.current_rules(bot, qa_guard):
+            await self.deny(event)
+            return
+        content = await self.query_content(bot, resource, rule_id)
+        if content is None:
             await self.deny(event)
             return
         if event.is_group:
@@ -203,15 +309,17 @@ class AccountSharing:
             await self.operation(bot, 'delivery', group=group, member=member, resource=resource, delivery='pending_binding')
             await event.reply(f'私发未完成：尚未绑定。请私聊本 Bot：账户绑定 {group} {member}，由主人核对确认。')
             return
-        account = await self.store.get(bot, 'accounts', resource)
-        current = await module.decide(
-            bot, FUNCTION, group, member, resource, framework_allowed=self.framework_allowed(event) and await self.framework_context_allowed(bot, group, member)
-        )
-        if not current['allowed'] or not account or not account['enabled'] or not self.active:
+        current = await self.query_decision(event, context, resource, rule_id)
+        if not current['allowed'] or not self.current_rules(bot, qa_guard):
+            await self.deny(event)
+            return
+        content = await self.query_content(bot, resource, rule_id)
+        final = await self.query_decision(event, context, resource, rule_id)
+        if not final['allowed'] or final['version'] != current['version'] or content is None or not self.active or not self.current_rules(bot, qa_guard):
             await self.deny(event)
             return
         try:
-            response = await event._sender.send_to_user(binding['private_id'], self.credentials(account))
+            response = await event._sender.send_to_user(binding['private_id'], content)
             ok, data = response[:2]
             code = str(data.get('code', 'send_failed'))[:80] if isinstance(data, dict) else 'send_failed'
         except Exception:
@@ -354,6 +462,14 @@ class AccountSharing:
             return web.json_response({'success': False, 'error': '请选择有效 Bot'}, status=404)
         parts = request.path[len(PREFIX) :].strip('/').split('/')
         try:
+            if parts[0] == 'rules' and len(parts) <= 2:
+                key = parts[1] if len(parts) == 2 else ''
+                operation = {'GET': 'list', 'POST': 'create', 'PATCH': 'update', 'DELETE': 'delete'}.get(request.method)
+                if not operation or bool(key) != (operation in {'update', 'delete'}):
+                    raise BusinessError('方法不适用', 405)
+                data = await request.json() if operation in {'create', 'update'} else None
+                result = await self.rule_management(bot, operation, data, key)
+                return web.json_response({'success': True, 'data': result}, status=201 if operation == 'create' else 200)
             if parts == ['operations'] and request.method == 'GET':
                 return web.json_response({'success': True, 'data': await self.store.all(bot, 'operations')})
             if parts == ['bindings']:
@@ -394,12 +510,14 @@ class AccountSharing:
 
     async def on_event(self, event):
         content = (event.content or '').strip()
-        if content == '账户列表' or content.startswith(('账户查询 ', '账户群 ', '账户绑定 ')):
+        if content == '账户列表' or content.startswith(('账户查询 ', '账户群 ', '账户绑定 ', '账户答复 ')):
             try:
                 if content == '账户列表':
                     await self.directory(event)
                 elif content.startswith('账户查询 '):
                     await self.query(event, content.split(maxsplit=1)[1])
+                elif content.startswith('账户答复 '):
+                    await self.query(event, '', rule_id=content.split(maxsplit=1)[1])
                 elif content.startswith('账户群 '):
                     if await self.resolve_context(event, select=content.split(maxsplit=1)[1]):
                         await self.directory(event)
@@ -425,6 +543,10 @@ class AccountSharing:
                 await self.deny(event)
             return
         if not (event.content or '').startswith('账户管理'):
+            try:
+                await self.keyword_query(event)
+            except (BusinessError, RuntimeError, ValueError, sqlite3.Error, OSError):
+                await self.deny(event)
             return
         bot = event.appid
         if not self.framework_allowed(event) or event.user_id not in (cfg.get_bot_config(bot) or {}).get('owner_ids', []):
@@ -438,6 +560,18 @@ class AccountSharing:
             words = event.content.split(maxsplit=2)
             action = words[1] if len(words) > 1 else '帮助'
             args = words[2] if len(words) > 2 else ''
+            if action in {'规则新增', '规则修改', '规则删除', '规则列表'}:
+                if action == '规则新增':
+                    result = await self.rule_management(bot, 'create', json.loads(args))
+                elif action == '规则修改':
+                    key, payload = args.split(maxsplit=1)
+                    result = await self.rule_management(bot, 'update', json.loads(payload), key)
+                elif action == '规则删除':
+                    result = await self.rule_management(bot, 'delete', key=args)
+                else:
+                    result = await self.rule_management(bot, 'list')
+                await event.reply(json.dumps(result, ensure_ascii=False) if event.is_direct else '规则操作已完成，详情请在主人私聊或后台查看')
+                return
             if action == '确认绑定':
                 data = json.loads(args)
                 if isinstance(data, dict):

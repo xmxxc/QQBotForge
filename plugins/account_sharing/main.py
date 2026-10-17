@@ -50,7 +50,8 @@ async def unload():
         _instance = None
 
 
-@handler(r'^(?:账户管理(?:\s|$)|账户列表$|账户(?:查询|群|绑定)\s)', name='账户管理', priority=20)
+@handler(r'.+', name='账户关键词', priority=-10, fallback=True, event_types=['GROUP_AT_MESSAGE_CREATE', 'GROUP_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE'])
+@handler(r'^(?:账户管理(?:\s|$)|账户列表$|账户(?:查询|群|绑定|答复)\s)', name='账户管理', priority=20)
 async def account_management(event, _match):
     if _instance is None:
         await event.reply('账户共享未加载，请联系主人')
