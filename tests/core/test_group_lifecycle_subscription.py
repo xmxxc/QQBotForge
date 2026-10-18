@@ -1,4 +1,4 @@
-"""Real transport → application → module subscription integration."""
+"""真实传输入口、应用和模块订阅的接线测试。"""
 
 import asyncio
 import json
@@ -22,7 +22,7 @@ async def lifecycle_app(tmp_path, sample_config_dir):
     cfg._ready = False
     cfg.init(sample_config_dir)
     app = Application()
-    # Only platform/storage boundaries are replaced. No real QQ or user data.
+    # 仅替换平台与存储边界，使用独立临时数据。
     store = SimpleNamespace(
         add=AsyncMock(), add_sync=Mock(), db_queue=Mock(),
         db_fetch_one=AsyncMock(return_value=None), db_execute=AsyncMock(),
@@ -44,7 +44,7 @@ async def lifecycle_app(tmp_path, sample_config_dir):
     for worker in app._track_workers:
         worker.cancel()
     await asyncio.gather(*app._track_workers, return_exceptions=True)
-    # Let storage/background dispatch finish before the loop closes.
+    # 事件循环关闭前，让存储及后台分发结束。
     await asyncio.sleep(0)
     cfg._ready = False
 
@@ -126,7 +126,7 @@ async def test_missing_native_fields_are_explicit_and_not_inferred(lifecycle_app
     app, manager = lifecycle_app
     await context(app, manager)
     consumer = manager.get('consumer')
-    # Adapter aliases still reach legacy plugins but are not QQ native identity.
+    # 适配器别名仍可传给旧插件，但不能当作 QQ 原生身份。
     await webhook(app, {'op': 0, 't': 'GROUP_MEMBER_ADD', 'd': {'group_id': 'alias', 'user_id': 'alias-user'}})
     await eventually(lambda: consumer['events'])
     event = consumer['events'][0]
@@ -188,7 +188,7 @@ async def test_ingress_barrier_precedes_later_business_dispatch(lifecycle_app, t
         await send({'t': 'GROUP_AT_MESSAGE_CREATE', 'd': {'group_openid': 'g', 'content': 'query'}})
         await asyncio.sleep(0.02)
         assert not received
-        # A different Bot and group can dispatch while the first group waits.
+        # 第一个群等待期间，其他 Bot 和群仍能分发。
         await send({'t': 'GROUP_AT_MESSAGE_CREATE', 'd': {'group_openid': 'elsewhere', 'content': 'independent'}})
         await eventually(lambda: len(received) == 1)
         assert received[0].content == 'independent'
@@ -214,7 +214,7 @@ async def test_plugin_filters_and_disable_do_not_filter_modules(lifecycle_app, t
         cfg.set_bot_setting('123456', 'non_at_message.group_whitelist', ['other-group'])
         await webhook(app, lifecycle())
         await eventually(lambda: received)
-        # Existing lifecycle fast path bypasses ordinary message filters too.
+        # 现有生命周期快速路径也跳过普通消息过滤。
         assert received[0].event_type == 'GROUP_MEMBER_REMOVE'
         pm.disable_plugin('record')
         await webhook(app, lifecycle('GROUP_MEMBER_ADD'))
@@ -322,7 +322,7 @@ async def test_timeout_does_not_overlap_cancellation_resistant_callback(lifecycl
         await eventually(lambda: len(sub.results) == 3)
         assert sub.results[-1].status == 'busy'
         assert len(calls) == 1
-        # Unrelated Bot uses its own invocation lane.
+        # 无关 Bot 使用独立的调用通道。
         await webhook(app, lifecycle(), appid='other')
         await eventually(lambda: len(calls) == 2)
     finally:
@@ -342,7 +342,7 @@ async def test_delivery_receipt_exposes_complete_correlated_results(lifecycle_ap
     try:
         await webhook(app, lifecycle())
         await started.wait()
-        # The manager receipt is exposed on the real plugin event once dispatch can run.
+        # 开始实际插件分发时，事件携带管理器返回的投递回执。
         release.set()
         await eventually(lambda: received)
         receipt = received[0].group_lifecycle_delivery
@@ -447,7 +447,7 @@ async def test_result_history_is_bounded_and_receipts_are_waiter_safe(lifecycle_
         for _ in range(105):
             await webhook(app, lifecycle())
         await eventually(lambda: len(sub.results) == 100)
-        # Wait all queued deliveries rather than checking the first 100 completions.
+        # 等待队列中的全部投递完成，再检查结果历史上限。
         await eventually(lambda: len(manager.get('consumer')['events']) == 106)
         assert sub.results[0].event.delivery_id != receipt.event.delivery_id
         assert (await receipt.wait())[-1].event.delivery_id == receipt.event.delivery_id

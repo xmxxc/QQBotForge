@@ -1,4 +1,4 @@
-"""Independent sample consumer; no account-sharing code or data."""
+"""独立样例消费者，用于验证模块通知接线。"""
 
 
 def setup(ctx):
