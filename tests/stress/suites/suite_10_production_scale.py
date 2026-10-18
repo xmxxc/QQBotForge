@@ -52,10 +52,12 @@ class _ScaleBot:
 def _make_harness(bots, plugin_manager):
     """构造承载真实 EventHandlerMixin 的最小宿主 (继承以获得 _LIFECYCLE_HANDLERS 等)。"""
     from core.bot.event import EventHandlerMixin
+    from core.module.hook import HookManager
 
     class _ScaleHarness(EventHandlerMixin):
         def __init__(self, bots, plugin_manager):
             self._bots = bots
+            self._hook_manager = HookManager()
             self._plugin_manager = plugin_manager
             self._web_log_count = 0
             self._init_event_state()
