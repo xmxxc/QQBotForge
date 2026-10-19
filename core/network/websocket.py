@@ -5,12 +5,16 @@ import asyncio
 import json
 import platform as _platform
 import ssl as _ssl_mod
+from collections import deque
+from urllib.parse import urlsplit
+from uuid import uuid4
 
 import websockets
 
 from core.base.logger import SERVICE, get_logger
 from core.base.tasks import spawn
 from core.message.event import Event
+from core.module.connection_status import ConnectionCapabilities, ConnectionStatusManager
 
 log = get_logger(SERVICE, 'WebSocket')
 
@@ -58,6 +62,9 @@ class WSClient:
         on_event,
         *,
         ack_interaction,
+        on_event_received=None,
+        connection_status=None,
+        bot_generation=None,
         reconnect_interval=5,
         max_reconnects=-1,
         custom_url='',
@@ -65,8 +72,22 @@ class WSClient:
         subscribe_channel_events=False,
     ):
         self._appid = str(appid)
+        self.connection_status = connection_status if connection_status is not None else ConnectionStatusManager()
+        self._status = self.connection_status._register(self._appid, 'websocket', bot_generation=bot_generation)
+        self._login_kind = None
+        self._auth_mode = None
+        self._ready_seen = False
+        self._resumed_seen = False
+        self._receive_index = 0
+        self._resume_pending = False
+        self._resume_from_sequence = None
+        self._resume_provable = False
+        self._resume_max_sequence = None
+        self._connect_task = None
+        self._stop_generation = 0
         self._tm = token_manager
         self._on_event = on_event
+        self._on_event_received = on_event_received
         self._ack_interaction = ack_interaction
         self._reconnect_interval = reconnect_interval
         self._max_reconnects = max_reconnects
@@ -87,59 +108,159 @@ class WSClient:
         # 固定 worker 消化事件，避免每条事件创建一个等待信号量的 Task。
         self._event_queue = asyncio.Queue()
         self._event_workers = []
+        self._deferred_events = {}
+        self._deferred_tasks = set()
+        self._interaction_tasks = {}
         # 交互事件仍单独走信号量路径，保证 ACK 倒计时不被普通消息队列阻塞。
         self._event_sem = asyncio.Semaphore(_MAX_INFLIGHT_EVENTS)
 
-    async def connect(self):
-        """连接并开始接收事件"""
+    def connect(self):
+        """返回连接协程；close 使此前创建但尚未执行的连接请求失效。"""
+        return self._connect(self._stop_generation)
+
+    async def _connect(self, stop_generation):
+        if stop_generation != self._stop_generation:
+            return
+        if self._connect_task is not None:
+            raise RuntimeError('WebSocket client is already connecting')
+        if not self._status.reactivate():
+            return
+        if self._session_id is None:
+            self._status.update_context(session_id=None, session_generation=None, resume_attempt_id=None)
         self._closed = False
         self._ensure_event_workers()
-        while not self._closed:
-            try:
-                url = await self._get_gateway_url()
-                log.info(f'[{self._appid}] 正在连接 WebSocket: {url}')
-                _ssl = _ssl_mod.create_default_context() if url.startswith('wss://') else None
-                ua = build_user_agent(self._client_name)
-                kw = {'ssl': _ssl, 'additional_headers': {'User-Agent': ua}}
-                async with websockets.connect(url, **kw) as ws:
-                    self._ws = ws
-                    self._reconnect_count = 0
-                    await self._handle_connection()
-            except asyncio.CancelledError:
+        # close 只取消客户端拥有的连接循环，不取消 await connect() 的调用者。
+        connecting = self._connect_task = asyncio.create_task(self._run_connection())
+        try:
+            await connecting
+        except asyncio.CancelledError:
+            # 主动关闭允许调用者正常继续；调用者自身的取消仍须向外传播。
+            if stop_generation == self._stop_generation:
+                # 连接循环尚未开始就被取消时，其 finally 不会运行。
+                if self._connect_task is connecting:
+                    await self.close(reason='connect_cancelled')
                 raise
-            except Exception as e:
+            if asyncio.current_task().cancelling():
+                raise
+
+    async def _run_connection(self):
+        try:
+            # 先让创建方登记任务，兼容 eager 工厂在 create_task 内立即执行协程。
+            await asyncio.sleep(0)
+            while not self._closed:
+                opened, failed = False, False
+                reason = 'socket_eof'
+                self._status.update_context(connection_generation=uuid4().hex, resume_attempt_id=None)
+                self._status.publish('connecting', reason='connect_attempt')
+                try:
+                    url = await self._get_gateway_url()
+                    parsed = urlsplit(url)
+                    official = (
+                        not self._custom_url
+                        and self._tm.api_base in {'https://api.bot.qq.com', 'https://api.sgroup.qq.com'}
+                        and parsed.scheme == 'wss'
+                        and parsed.hostname in {'api.bot.qq.com', 'api.sgroup.qq.com'}
+                        and parsed.port in (None, 443)
+                        and parsed.username is None
+                    )
+                    self._status.capabilities = ConnectionCapabilities(True, official, official, 'qq_official_ws' if official else 'unverified_gateway')
+                    log.info(f'[{self._appid}] 正在连接 WebSocket: {url}')
+                    _ssl = _ssl_mod.create_default_context() if url.startswith('wss://') else None
+                    ua = build_user_agent(self._client_name)
+                    kw = {'ssl': _ssl, 'additional_headers': {'User-Agent': ua}}
+                    async with websockets.connect(url, **kw) as ws:
+                        self._ws = ws
+                        opened = True
+                        self._auth_mode = None
+                        self._ready_seen = False
+                        self._resumed_seen = False
+                        self._status.publish('connected', reason='socket_open')
+                        self._reconnect_count = 0
+                        reason = await self._handle_connection()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    if self._closed:
+                        break
+                    failed = True
+                    reason = 'connection_error'
+                    self._reconnect_count += 1
+                    log.warning(f'[{self._appid}] 连接断开: {e}, {self._reconnect_interval}s 后重连 ({self._reconnect_count})')
+                finally:
+                    self._ws = None
+                    if self._heartbeat_task and not self._heartbeat_task.done():
+                        self._heartbeat_task.cancel()
                 if self._closed:
                     break
-                self._reconnect_count += 1
-                if 0 < self._max_reconnects <= self._reconnect_count:
+                if self._resume_pending:
+                    self._status.publish('resume_failed', reason=reason)
+                    self._resume_pending = False
+                self._status.publish('disconnected' if opened else 'unknown', reason=reason)
+                if failed and 0 < self._max_reconnects <= self._reconnect_count:
                     log.error(f'[{self._appid}] 达到最大重连次数 {self._max_reconnects}')
+                    self._status.publish('stopped', reason='reconnect_exhausted')
                     break
-                log.warning(f'[{self._appid}] 连接断开: {e}, {self._reconnect_interval}s 后重连 ({self._reconnect_count})')
-                await asyncio.sleep(self._reconnect_interval)
+                self._status.publish('reconnecting', reason=reason)
+                if failed:
+                    await asyncio.sleep(self._reconnect_interval)
+        except asyncio.CancelledError:
+            if not self._closed:
+                await self.close(reason='connect_cancelled')
+            raise
+        finally:
+            self._connect_task = None
 
-    async def close(self):
+    async def close(self, *, reason='local_stop'):
+        self._stop_generation += 1
         self._closed = True
+        self._status.publish('stopped', reason=reason)
+        connecting = self._connect_task
+        if connecting is not None and connecting is not asyncio.current_task():
+            connecting.cancel()
+        self._session_id = None
+        self._seq = None
+        self._resume_pending = False
         if self._heartbeat_task and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
         workers, self._event_workers = self._event_workers, []
         for worker in workers:
             worker.cancel()
-        if workers:
-            await asyncio.gather(*workers, return_exceptions=True)
+        deferred = tuple(self._deferred_tasks)
+        for task in deferred:
+            task.cancel()
+        # 首次等待前取消全部任务，避免普通回调清理期间放行等待中的按钮。
+        interactions = tuple(self._interaction_tasks)
+        for task in interactions:
+            self._interaction_tasks[task].finish_dispatch()
+            task.cancel()
+        if workers or deferred or interactions:
+            await asyncio.gather(*workers, *deferred, *interactions, return_exceptions=True)
+        # 恢复任务可能在首次运行前就被取消，需兜底清理未执行 finally 的暂存。
+        for waiting in self._deferred_events.values():
+            while waiting:
+                waiting.popleft()
+                self._event_queue.task_done()
+        self._deferred_events.clear()
+        while not self._event_queue.empty():
+            self._event_queue.get_nowait()
+            self._event_queue.task_done()
         if self._ws:
             await self._ws.close()
+        if connecting is not None and connecting is not asyncio.current_task():
+            await asyncio.gather(connecting, return_exceptions=True)
+            if self._connect_task is connecting:
+                self._connect_task = None
 
     def _ensure_event_workers(self):
         if any(not worker.done() for worker in self._event_workers):
             return
-        self._event_workers = [
-            asyncio.create_task(self._event_worker())
-            for _ in range(_MAX_INFLIGHT_EVENTS)
-        ]
+        self._event_workers = [asyncio.create_task(self._event_worker()) for _ in range(_MAX_INFLIGHT_EVENTS)]
 
     async def _event_worker(self):
         while True:
             event = await self._event_queue.get()
+            if self._defer_event(event):
+                continue
             try:
                 await self._on_event(event)
             except Exception as e:
@@ -147,16 +268,68 @@ class WSClient:
             finally:
                 self._event_queue.task_done()
 
+    def _defer_event(self, event):
+        # 等待群屏障的事件不能占满固定 worker。
+        barriers = tuple(task for task in event._group_lifecycle_barriers if not task.done())
+        if not barriers:
+            return False
+        scope = event._group_lifecycle_scope
+        waiting = self._deferred_events.get(scope)
+        if waiting is None:
+            # eager 工厂可能立即开始排空，创建任务前先保存首条事件。
+            waiting = self._deferred_events[scope] = deque([event])
+            task = spawn(self._resume_deferred(scope, waiting))
+            self._deferred_tasks.add(task)
+            task.add_done_callback(self._deferred_tasks.discard)
+        else:
+            waiting.append(event)
+        return True
+
+    async def _resume_deferred(self, scope, waiting):
+        try:
+            while waiting:
+                event = waiting[0]
+                for barrier in event._group_lifecycle_barriers:
+                    await asyncio.shield(barrier)
+                waiting.popleft()
+                self._event_queue.put_nowait(event)
+                self._event_queue.task_done()
+        finally:
+            # 配平暂存前的队列计数；连接关闭取消时同样清理。
+            for _ in waiting:
+                self._event_queue.task_done()
+            self._deferred_events.pop(scope, None)
+
     async def _handle_connection(self):
         """处理 WS 消息循环"""
-        async for message in self._ws:
+        ws = self._ws
+        async for message in ws:
+            if self._closed or self._ws is not ws:
+                return 'stale_connection'
             try:
                 payload = json.loads(message)
             except json.JSONDecodeError:
+                self._resume_provable = False
+                self._status.publish('unknown', reason='invalid_payload')
                 continue
-            op = payload.get('op')
+            if not isinstance(payload, dict):
+                self._resume_provable = False
+                self._status.publish('unknown', reason='invalid_payload')
+                continue
+            self._receive_index += 1
+            sequence = payload.get('s')
+            self._status.update_context(receive_index=self._receive_index, sequence=sequence if type(sequence) is int else None)
             if payload.get('s') is not None:
                 self._seq = payload['s']
+            op = payload.get('op')
+            if type(op) is not int:
+                self._status.publish('unknown', reason='invalid_opcode')
+                continue
+            if self._resume_pending and op == _OP_DISPATCH:
+                if type(sequence) is not int or sequence < self._resume_max_sequence:
+                    self._resume_provable = False
+                else:
+                    self._resume_max_sequence = sequence
             if op == _OP_HELLO:
                 await self._on_hello(payload)
             elif op == _OP_DISPATCH:
@@ -165,8 +338,10 @@ class WSClient:
                 pass
             elif op == _OP_RECONNECT:
                 log.info(f'[{self._appid}] 收到重连请求')
-                break
+                return 'server_reconnect'
             elif op == _OP_INVALID_SESSION:
+                self._status.publish('resume_failed' if self._auth_mode == 'resume' else 'unknown', reason='invalid_session')
+                self._resume_pending = False
                 resumable = payload.get('d', False) and self._session_id
                 if not resumable:
                     log.warning(f'[{self._appid}] 会话无效, 重新鉴权')
@@ -176,10 +351,17 @@ class WSClient:
                     log.warning(f'[{self._appid}] 会话无效但可恢复')
                 self._gateway_url = None
                 await asyncio.sleep(3)
-                break
+                return 'invalid_session'
+            else:
+                self._status.publish('unknown', reason='unknown_opcode')
+        return 'socket_eof'
 
     async def _on_hello(self, payload):
         """Hello → 启动心跳 + 鉴权/恢复"""
+        if self._auth_mode is not None:
+            self._resume_provable = False
+            self._status.publish('unknown', reason='unexpected_hello')
+            return
         self._heartbeat_interval = payload.get('d', {}).get('heartbeat_interval', 45000) / 1000
         if self._heartbeat_task and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
@@ -187,32 +369,80 @@ class WSClient:
         if self._session_id and self._seq is not None:
             await self._send_resume()
         else:
+            self._auth_mode = 'identify'
+            self._status.update_context(session_id=None, session_generation=None, resume_attempt_id=None)
+            self._status.publish('identifying', reason='identify')
             await self._send_identify()
 
     async def _on_dispatch(self, payload):
         """事件分发 → 构造 Event 并回调"""
+        if self._closed:
+            return
         event_type = payload.get('t', '')
         if event_type == 'READY':
-            self._session_id = payload.get('d', {}).get('session_id')
+            if self._ready_seen:
+                return
+            if self._auth_mode != 'identify':
+                self._resume_pending = False
+                self._status.publish('unknown', reason='unexpected_ready')
+                return
+            data = payload.get('d')
+            session_id = data.get('session_id') if isinstance(data, dict) else None
+            if not isinstance(session_id, str) or not session_id:
+                self._status.publish('unknown', reason='invalid_ready')
+                return
+            self._ready_seen = True
+            self._session_id = session_id
+            self._login_kind = self._status.new_session(session_id)
+            self._status.publish('ready', reason='ready', login_kind=self._login_kind)
             log.info(f'[{self._appid}] WebSocket 已就绪 (session={self._session_id})')
             return
         if event_type == 'RESUMED':
+            if self._resumed_seen:
+                return
+            self._resumed_seen = True
+            if not self._resume_pending or self._auth_mode != 'resume':
+                self._status.publish('unknown', reason='unexpected_resumed')
+                return
+            self._resume_pending = False
+            sequence = payload.get('s')
+            if not self._resume_provable or type(sequence) is not int or sequence < self._resume_from_sequence:
+                self._status.publish('unknown', reason='unproven_resumed', login_kind='resume')
+                return
+            self._status.publish(
+                'replay_complete',
+                reason='resumed',
+                continuity='resumed',
+                login_kind='resume',
+                resume_from_sequence=self._resume_from_sequence,
+                replay_end_sequence=sequence,
+                replay_end_receive_index=self._receive_index,
+            )
             log.info(f'[{self._appid}] 会话已恢复')
             return
         try:
             event = Event.from_websocket(self._appid, payload)
+            event.connection_context = self._status.context
+            if self._on_event_received is not None:
+                self._on_event_received(event, transport='websocket', session_id=self._session_id)
             log.debug(f'[{self._appid}] WS事件: {event}')
             if event_type == 'INTERACTION_CREATE':
                 # 分发插件后用其 code 回复交互回调 (独立任务等待, 不阻塞读取循环)
                 event.start_ack_countdown()
-                task = spawn(self._dispatch_with_backpressure(event))
+                task = self._start_interaction_task(self._dispatch_with_backpressure(event), event)
                 task.add_done_callback(lambda t, ev=event: ev.finish_dispatch())
-                spawn(self._ack_interaction_when_ready(event))
+                self._start_interaction_task(self._ack_interaction_when_ready(event), event)
             else:
                 self._ensure_event_workers()
                 await self._event_queue.put(event)
         except Exception as e:
             log.error(f'[{self._appid}] 事件处理异常: {e}')
+
+    def _start_interaction_task(self, coro, event):
+        task = spawn(coro)
+        self._interaction_tasks[task] = event
+        task.add_done_callback(lambda finished: self._interaction_tasks.pop(finished, None))
+        return task
 
     async def _ack_interaction_when_ready(self, event):
         """等待插件设置 code (或分发结束/超时) 后通过 HTTP PUT /interactions 回复 (与 WH 链路一致)。"""
@@ -224,7 +454,11 @@ class WSClient:
 
     async def _dispatch_with_backpressure(self, event):
         """背压包装: Semaphore 控制并发, 满载时新事件等待空闲槽位"""
+        for barrier in event._group_lifecycle_barriers:
+            await asyncio.shield(barrier)
         async with self._event_sem:
+            if self._closed:
+                return
             try:
                 await self._on_event(event)
             except Exception as e:
@@ -247,6 +481,21 @@ class WSClient:
 
     async def _send_resume(self):
         token = await self._tm.get_token()
+        self._auth_mode = 'resume'
+        self._resume_pending = True
+        self._resume_from_sequence = self._seq if type(self._seq) is int else None
+        self._resume_provable = (
+            self._status.capabilities.replay_boundary and self._status.context.session_generation is not None and type(self._seq) is int and self._seq >= 0
+        )
+        self._resume_max_sequence = self._seq if type(self._seq) is int else -1
+        self._status.update_context(resume_attempt_id=uuid4().hex)
+        self._status.publish(
+            'resuming',
+            reason='resume',
+            continuity='pending' if self._resume_provable else 'unknown',
+            login_kind='resume',
+            resume_from_sequence=self._resume_from_sequence,
+        )
         await self._send_op(
             _OP_RESUME,
             {
