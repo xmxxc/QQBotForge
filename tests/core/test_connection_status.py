@@ -1421,3 +1421,114 @@ async def test_invalid_opcode_cannot_act_as_a_protocol_message(wired, opcode_fie
     assert boundary.continuity == "resumed"
     assert boundary.replay_end_sequence == 3
     assert boundary.context.resume_attempt_id == resuming.context.resume_attempt_id
+
+
+@pytest.mark.parametrize("dependent_cleanup", [False, True])
+@pytest.mark.parametrize("before_socket_open", [False, True])
+async def test_close_preserves_connect_caller_and_does_not_wait_for_its_cleanup(
+    monkeypatch, dependent_cleanup, before_socket_open
+):
+    platform = Platform(monkeypatch)
+    platform.add()
+
+    async def receive(event):
+        pass
+
+    client = WSClient("sample-bot", platform, receive, ack_interaction=receive)
+    close_returned = asyncio.Event()
+    starting = asyncio.Event()
+    continued = []
+
+    async def owner():
+        try:
+            starting.set()
+            await client.connect()
+            continued.append("after connect")
+        finally:
+            if dependent_cleanup:
+                await close_returned.wait()
+
+    async def stop():
+        await client.close()
+        close_returned.set()
+
+    owner_task = asyncio.create_task(owner())
+    stop_task = None
+    restarted = None
+    try:
+        await starting.wait()
+        if not before_socket_open:
+            await until(lambda: bool(platform.opened))
+        if before_socket_open:
+            # 直接关闭，避免新建 stop 任务时连接循环先获得执行机会。
+            async with asyncio.timeout(0.3):
+                await stop()
+        else:
+            stop_task = asyncio.create_task(stop())
+        _, pending = await asyncio.wait(
+            [task for task in (owner_task, stop_task) if task is not None],
+            timeout=0.3,
+        )
+        assert not pending, "close() must not wait for the caller's exit cleanup"
+        assert not owner_task.cancelled(), "close() must not cancel the connect() caller"
+        assert owner_task.exception() is None
+        if stop_task is not None:
+            assert stop_task.exception() is None
+        assert continued == ["after connect"]
+        opened_before_restart = len(platform.opened)
+        platform.add()
+        restarted = asyncio.create_task(client.connect())
+        await until(lambda: len(platform.opened) == opened_before_restart + 1)
+        await client.close()
+        await restarted
+    finally:
+        close_returned.set()
+        await client.close()
+        await asyncio.gather(
+            *[task for task in (owner_task, stop_task, restarted) if task is not None],
+            return_exceptions=True,
+        )
+
+
+@pytest.mark.parametrize("before_socket_open", [False, True])
+async def test_external_connect_cancellation_still_propagates_and_allows_restart(
+    monkeypatch, before_socket_open
+):
+    platform = Platform(monkeypatch)
+    platform.add()
+
+    async def receive(event):
+        pass
+
+    client = WSClient("sample-bot", platform, receive, ack_interaction=receive)
+    starting = asyncio.Event()
+    continued = []
+
+    async def owner():
+        starting.set()
+        await client.connect()
+        continued.append("unexpected continuation")
+
+    owner_task = asyncio.create_task(owner())
+    restarted = None
+    try:
+        await starting.wait()
+        if not before_socket_open:
+            await until(lambda: bool(platform.opened))
+        owner_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await owner_task
+        assert continued == []
+        assert client.connection_status.get("sample-bot").phase == "stopped"
+        restarted = asyncio.create_task(client.connect())
+        if not before_socket_open:
+            platform.add()
+        await until(lambda: len(platform.opened) == (1 if before_socket_open else 2))
+        await client.close()
+        await restarted
+    finally:
+        await client.close()
+        await asyncio.gather(
+            *[task for task in (owner_task, restarted) if task is not None],
+            return_exceptions=True,
+        )
