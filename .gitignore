@@ -69,3 +69,4 @@ config/*.yaml
 plugins/account_sharing/data/
 modules/access_control/data/
 modules/self_qa/data/
+modules/connection_status_probe/data/
