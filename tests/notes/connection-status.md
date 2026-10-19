@@ -7,7 +7,7 @@
 
 ## 覆盖范围
 
-78 项用例通过真实 `WSClient.connect()`、消息循环、BotRegistry/BotInstance 启停及配置同步、
+86 项用例通过真实 `WSClient.connect()`、消息循环、BotRegistry/BotInstance 启停及配置同步、
 WebhookHandler 和 ModuleManager setup/disable/reload，观察公开查询、订阅结果、实际协议帧及不可变事件上下文。
 socket 与 HTTP 使用可控替身，配置和存储使用临时目录，身份、消息和凭据均为样例。
 
@@ -18,6 +18,7 @@ socket 与 HTTP 使用可控替身，配置和存储使用临时目录，身份�
 - 两种调度下群通知等待期间的 Resume 边界、同群消息顺序及其他群隔离；取消群订阅后同群连续通知仍可投递。
 - 重复或迟到状态、多 Bot 隔离、晚订阅快照、过滤、取消、异常/超时/busy 结果，以及模块 setup 失败或取消、卸载和重载。
 - 心跳使用接收序号；Webhook、自定义 WS/API 和网关发现结果的能力限制；缺失/非法身份或序号、倒退边界、非法载荷及启动失败。
+- 非法 Resume 起点在查询与通知中统一为 None；原始字典/列表不进入公开快照，修改快照不能影响后续实际 Resume 参数。
 - 重复 Hello 保留原轮次并使该轮证明失效；回调调用参数错误逐项记录 error/TypeError，健康订阅继续处理。
 - 未支持的整数 opcode 明确报告 unknown/unknown_opcode；缺失或非法 opcode 报告 unknown/invalid_opcode，布尔值和浮点数不会冒充合法操作码。
 - 未知操作码保留接收 seq 和恢复轮次；该输入本身不禁止后续有效 RESUMED，也不会恢复此前已经失效的证明。
@@ -46,8 +47,8 @@ python -m mypy core web main.py
 ```
 
 评审固定版本时，将 SOURCE_SHA 和 TEST_SHA 替换为 PR 中列出的准确提交 SHA。
-标准组合包含 441 项既有测试与 78 项连接状态测试，共 519 项。
-CPython 3.13.13 执行完整组合；CPython 3.11.15 单独执行连接状态测试（74 项通过，4 项 eager 用例因标准库尚未提供该工厂而跳过）。
+标准组合包含 441 项既有测试与 86 项连接状态测试，共 527 项。
+CPython 3.13.13 执行完整组合；CPython 3.11.15 单独执行连接状态测试（82 项通过，4 项 eager 用例因标准库尚未提供该工厂而跳过）。
 工具环境：pytest 9.1.1、pytest-asyncio 1.4.0、Ruff 0.15.22、mypy 2.4.0。
 
 CI 当前从 `ci-assets` 读取测试。新增测试尚未进入该分支时，PR 自动 CI 与上述本地组合的覆盖范围不同。

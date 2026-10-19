@@ -1687,3 +1687,57 @@ async def test_group_barrier_burst_preserves_order_and_other_groups_flow(
     finally:
         release.set()
         subscription.cancel()
+
+
+@pytest.mark.parametrize("sequence", ["bad-seq", {"n": 1}, [1], True, False, 2.5])
+async def test_invalid_resume_start_sequence_is_not_exposed_in_status(wired, sequence):
+    ctx, platform, client, events = wired
+    observed = []
+
+    async def observe(status):
+        observed.append(status)
+
+    subscription = ctx.subscribe_connection_status(observe, replay_current=False)
+    first = await login(ctx, platform)
+    first.feed(99, s=sequence)
+    first.feed(7)
+    second = platform.add()
+    second.feed(10, d={"heartbeat_interval": 45000})
+    await until(lambda: any(s.phase == "resuming" for s in observed))
+    snapshot = ctx.get_connection_status("sample-bot")
+    notification = next(s for s in observed if s.phase == "resuming")
+    assert snapshot.phase == "resuming"
+    assert snapshot.continuity == "unknown"
+    assert snapshot.resume_from_sequence is None
+    assert notification.resume_from_sequence is None
+    # 保留框架原有发送行为；公开状态不泄露原始非法值。
+    assert [f["d"]["seq"] for f in second.sent if f["op"] == 6] == [sequence]
+    second.feed(0, t="RESUMED", s=2, d="")
+    await until(lambda: ctx.get_connection_status("sample-bot").phase == "unknown")
+    assert ctx.get_connection_status("sample-bot").reason == "unproven_resumed"
+    assert ctx.get_connection_status("sample-bot").replay_end_sequence is None
+    assert snapshot.resume_from_sequence is None
+    subscription.cancel()
+
+
+@pytest.mark.parametrize("sequence", [{"n": 1}, [1]])
+async def test_public_resume_snapshot_cannot_mutate_future_wire_sequence(wired, sequence):
+    ctx, platform, client, events = wired
+    first = await login(ctx, platform)
+    first.feed(99, s=sequence)
+    first.feed(7)
+    second = platform.add()
+    second.feed(10, d={"heartbeat_interval": 45000})
+    await until(lambda: any(f["op"] == 6 for f in second.sent))
+    snapshot = ctx.get_connection_status("sample-bot")
+    exposed = snapshot.resume_from_sequence
+    if isinstance(exposed, dict):
+        exposed["n"] = 99
+    elif isinstance(exposed, list):
+        exposed[0] = 99
+    second.feed(7)
+    third = platform.add()
+    third.feed(10, d={"heartbeat_interval": 45000})
+    await until(lambda: any(f["op"] == 6 for f in third.sent))
+    assert [f["d"]["seq"] for f in third.sent if f["op"] == 6] == [sequence]
+    assert snapshot.resume_from_sequence is None
