@@ -145,7 +145,9 @@ async def login(ctx, platform):
     return socket
 
 
-async def test_resume_reports_server_boundary_while_local_processing_is_pending(wired):
+async def test_resume_reports_server_boundary_while_local_processing_is_pending(
+    wired, ws_task_factory
+):
     ctx, platform, client, events = wired
     changes = []
     entered, release = asyncio.Event(), asyncio.Event()
@@ -1624,3 +1626,64 @@ async def test_timed_out_subscriber_recovers_after_busy_without_resubscribing(
         await client.close()
         await asyncio.gather(task, return_exceptions=True)
         loop.set_task_factory(previous_factory)
+
+
+@pytest.fixture(params=[False, True], ids=["scheduled", "eager"])
+async def ws_task_factory(request):
+    eager = request.param
+    if eager and not hasattr(asyncio, "eager_task_factory"):
+        pytest.skip("eager task factories require Python 3.12+")
+    loop = asyncio.get_running_loop()
+    previous_factory = loop.get_task_factory()
+    loop.set_task_factory(asyncio.eager_task_factory if eager else None)
+    try:
+        yield
+    finally:
+        loop.set_task_factory(previous_factory)
+
+
+async def test_group_barrier_burst_preserves_order_and_other_groups_flow(
+    wired, ws_task_factory
+):
+    ctx, platform, client, events = wired
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def observe(event):
+        entered.set()
+        await release.wait()
+
+    subscription = ctx.subscribe_group_lifecycle(observe)
+    first = await login(ctx, platform)
+    first.feed(
+        0, t="GROUP_MEMBER_REMOVE", s=2,
+        d={"group_openid": "group-a", "member_openid": "sample-member"},
+    )
+    await until(entered.is_set)
+    for sequence, group, content in [
+        (3, "group-a", "a-first"),
+        (4, "group-a", "a-second"),
+        (5, "group-b", "b-independent"),
+    ]:
+        first.feed(
+            0, t="GROUP_AT_MESSAGE_CREATE", s=sequence,
+            d={"id": content, "group_openid": group, "content": content,
+               "author": {"member_openid": "sample-member"}},
+        )
+    try:
+        await until(lambda: any(e.content == "b-independent" for e in events))
+        assert [e.content for e in events] == ["b-independent"]
+        release.set()
+        await until(lambda: len(events) == 4)
+        assert [e.connection_context.sequence for e in events] == [5, 2, 3, 4]
+        subscription.cancel()
+        # 群观察订阅取消后，同一群后续通知仍应继续交给原有事件链。
+        for sequence in (6, 7):
+            first.feed(
+                0, t="GROUP_MEMBER_REMOVE", s=sequence,
+                d={"group_openid": "group-a", "member_openid": "sample-member"},
+            )
+        await until(lambda: len(events) == 6)
+        assert [e.connection_context.sequence for e in events] == [5, 2, 3, 4, 6, 7]
+    finally:
+        release.set()
+        subscription.cancel()
