@@ -1532,3 +1532,95 @@ async def test_external_connect_cancellation_still_propagates_and_allows_restart
             *[task for task in (owner_task, restarted) if task is not None],
             return_exceptions=True,
         )
+
+
+@pytest.mark.parametrize("eager", [False, True], ids=["scheduled", "eager"])
+async def test_immediately_exhausted_connection_can_be_started_again(eager):
+    if eager and not hasattr(asyncio, "eager_task_factory"):
+        pytest.skip("eager task factories require Python 3.12+")
+    loop = asyncio.get_running_loop()
+    previous_factory = loop.get_task_factory()
+
+    async def receive(event):
+        pass
+
+    client = WSClient(
+        "sample-bot", SimpleNamespace(api_base="https://api.bot.qq.com"),
+        receive, ack_interaction=receive,
+        custom_url="ws://sample.invalid:not-a-port", max_reconnects=1,
+    )
+    loop.set_task_factory(asyncio.eager_task_factory if eager else None)
+    try:
+        await client.connect()
+        first = client.connection_status.get("sample-bot")
+        assert first.phase == "stopped"
+        assert first.reason == "reconnect_exhausted"
+        await client.connect()
+        second = client.connection_status.get("sample-bot")
+        assert second.phase == "stopped"
+        assert second.reason == "reconnect_exhausted"
+        assert second.context.connection_generation != first.context.connection_generation
+    finally:
+        await client.close()
+        loop.set_task_factory(previous_factory)
+
+
+@pytest.mark.parametrize("eager", [False, True], ids=["scheduled", "eager"])
+async def test_timed_out_subscriber_recovers_after_busy_without_resubscribing(
+    monkeypatch, tmp_path, eager
+):
+    if eager and not hasattr(asyncio, "eager_task_factory"):
+        pytest.skip("eager task factories require Python 3.12+")
+    loop = asyncio.get_running_loop()
+    previous_factory = loop.get_task_factory()
+    platform = Platform(monkeypatch)
+    app = Application()
+    ctx = ModuleContext("sample", str(tmp_path), app.hook_manager)
+    release, finished = asyncio.Event(), asyncio.Event()
+    delivered = []
+
+    async def receive(event):
+        pass
+
+    async def observe(status):
+        delivered.append(status.phase)
+        if len(delivered) == 1:
+            try:
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    await release.wait()
+            finally:
+                finished.set()
+
+    client = WSClient(
+        "sample-bot", platform, receive, ack_interaction=receive,
+        connection_status=app.hook_manager.connection_status,
+    )
+    loop.set_task_factory(asyncio.eager_task_factory if eager else None)
+    task = asyncio.create_task(client.connect())
+    subscription = None
+    try:
+        first = await login(ctx, platform)
+        subscription = ctx.subscribe_connection_status(observe, timeout=0.02)
+        await until(lambda: any(r.outcome == "timeout" for r in subscription.results))
+        first.feed(99, s=2)
+        await until(lambda: any(r.outcome == "busy" for r in subscription.results))
+        release.set()
+        await finished.wait()
+        first.feed(7, s=3)
+        second = platform.add()
+        second.feed(10, d={"heartbeat_interval": 45000})
+        await until(lambda: any(f["op"] == 6 for f in second.sent))
+        second.feed(0, t="RESUMED", s=4, d="")
+        await until(lambda: "replay_complete" in delivered)
+        assert subscription.active
+        assert subscription.results[-1].outcome == "success"
+        assert subscription.results[-1].status.phase == "replay_complete"
+    finally:
+        release.set()
+        if subscription is not None:
+            subscription.cancel()
+        await client.close()
+        await asyncio.gather(task, return_exceptions=True)
+        loop.set_task_factory(previous_factory)
