@@ -53,7 +53,14 @@ class GroupDelivery:
             raise ValueError('请选择已启用的账户')
         async with self.locks.setdefault((bot, group, resource), asyncio.Lock()):
             mode = await self.mode(bot, group, resource)
-            self.invalidate_stale_mode(bot, mode)
+            key = (bot, mode['id'])
+            previous = self.reports.get(key)
+            if mode['actual'] == 'group' and previous and not self.service.access().report_facts_current(bot, previous):
+                # Group facts changed since the last passing check (member, role, roster or
+                # connection): drop to private; restoring needs the owner or auto-restore.
+                mode['actual'] = 'private'
+                mode['report'].update(eligible=False, reason='state_changed')
+            # Authorization edits alone only make the report stale; the fresh check decides.
             before = copy.deepcopy(mode)
             if 'auto_restore' in data:
                 mode['auto_restore'] = data['auto_restore']
@@ -63,7 +70,6 @@ class GroupDelivery:
                     # Turning group delivery off also clears any restore intent.
                     mode['auto_restore'] = False if 'auto_restore' not in data else mode['auto_restore']
             mode['actual'] = 'private'
-            key = (bot, mode['id'])
             if mode['desired'] == 'group':
                 report = await self.report(bot, group, resource)
                 self.reports[key] = report
@@ -100,16 +106,10 @@ class GroupDelivery:
             return self.public(mode, bot)
 
     def public(self, mode, bot):
-        self.invalidate_stale_mode(bot, mode)
         result = copy.deepcopy(mode)
-        if not self.can_send(bot, mode):
-            result['actual'] = 'private'
+        # Whether the last check still holds; the next query re-checks either way.
+        result['report_current'] = self.can_send(bot, mode)
         return result
-
-    def invalidate_stale_mode(self, bot, mode):
-        if mode['actual'] == 'group' and not self.can_send(bot, mode):
-            mode['actual'] = 'private'
-            mode['report'].update(eligible=False, reason='state_changed')
 
     def can_send(self, bot, mode):
         report = self.reports.get((bot, mode['id']))
