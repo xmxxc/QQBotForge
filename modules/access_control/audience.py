@@ -108,6 +108,9 @@ class Audience:
         source = self.access.group_state()
         return bool(proof and proof['roster']['usable'] and source and source.fact_current(proof['roster'])), proof
 
+    def facts_current(self, bot, report):
+        return self._roster_current(bot, report)[0]
+
     def current(self, bot, report):
         """Every recipient decision and the roster proof are still the latest."""
         current, proof = self._roster_current(bot, report)

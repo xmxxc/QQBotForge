@@ -729,6 +729,10 @@ class Authorization(AccessControl):
     def report_current(self, bot, report):
         return self.audience.current(bot, report)
 
+    def report_facts_current(self, bot, report):
+        """Only the group-fact part of a report (roster, members, roles, recovery) is unchanged."""
+        return self.audience.facts_current(bot, report)
+
     def member_current(self, bot, report, member):
         return self.audience.member_current(bot, report, member)
 
