@@ -11,7 +11,8 @@ from .storage import ExtensionStore
 
 # Exact beats contains beats regex; within a mode a higher priority wins.
 MODES = {'exact': 2, 'contains': 1, 'regex': 0}
-FIELDS = {'name', 'kind', 'target', 'keywords', 'mode', 'priority', 'enabled', 'groups'}
+FIELDS = {'name', 'kind', 'target', 'keywords', 'mode', 'priority', 'enabled', 'groups', 'access', 'function'}
+ACCESS = {'public', 'restricted'}
 
 
 def namespace_key(namespace):
@@ -39,6 +40,13 @@ def validate_settings(settings):
 def validate_rule(rule):
     # Empty groups is a global rule; otherwise only the listed native groups.
     rule['groups'] = native_ids(rule.get('groups', []))
+    # Restricted rules are decided by the authorization module; public is the default.
+    rule.setdefault('access', 'public')
+    if rule['access'] not in ACCESS:
+        raise ValueError('访问方式须为 public 或 restricted')
+    function = rule.get('function')
+    if function is not None and (not isinstance(function, str) or not function or len(function) > 256):
+        raise ValueError('规则授权功能须为非空文字或空值')
     if rule.get('kind') not in {'text', 'resource'} or rule.get('mode') not in MODES:
         raise ValueError('规则类型或匹配方式无效')
     if not isinstance(rule.get('enabled'), bool):
@@ -90,7 +98,9 @@ class QuestionAnswer:
     def version(self, bot, namespace):
         return self.versions.get((bot, namespace), 0)
 
-    async def manage(self, bot, namespace, operation, data=None, key=''):
+    async def manage(self, bot, namespace, operation, data=None, key='', *, guard=None, scope=None):
+        """Rule CRUD. ``guard()`` is re-checked under the lock right before a write;
+        ``scope(old_rule)`` limits which existing rules a caller may touch."""
         if not self.active:
             raise RuntimeError('自助问答模块未启用')
         collection = namespace_key(namespace)
@@ -100,8 +110,10 @@ class QuestionAnswer:
             old = await self.store.get(bot, collection, key) if key else None
             if operation == 'get':
                 return old
-            if operation in {'update', 'delete'} and not old:
+            if operation in {'update', 'delete'} and (not old or scope is not None and not scope(old)):
                 raise KeyError('规则不存在')
+            if operation in {'create', 'update', 'delete'} and guard is not None and not guard():
+                raise PermissionError('管理资格已变化，请重新发送')
             if operation == 'delete':
                 self.versions[(bot, namespace)] = self.version(bot, namespace) + 1
                 await self.store.delete(bot, collection, key)
@@ -137,22 +149,18 @@ class QuestionAnswer:
         """Every admitted rule that matches, best first, one result per rule.
 
         group=None skips rule scope (consumer-owned); '' is private chat, which
-        only global rules serve. ``admit(rule)`` (sync or async) filters before
-        ranking, so ties never expose rules the caller may not see. Regex rules
+        only global rules serve. ``admit(rule)`` (sync or async) runs on every
+        hit before ranking, so ties never expose rules the caller may not see. Regex rules
         run bounded in the Bot's worker; a timeout leaves them unmatched.
         """
         if not isinstance(text, str):
             return []
         text = text.strip()
-        rules = []
-        for rule in await self.manage(bot, namespace, 'list'):
-            if not rule['enabled'] or group is not None and rule.get('groups') and group not in rule['groups']:
-                continue
-            if admit is not None:
-                allowed = admit(rule)
-                if not (await allowed if asyncio.iscoroutine(allowed) else allowed):
-                    continue
-            rules.append(rule)
+        rules = [
+            rule
+            for rule in await self.manage(bot, namespace, 'list')
+            if rule['enabled'] and (group is None or not rule.get('groups') or group in rule['groups'])
+        ]
         patterns = list(dict.fromkeys(k['text'] for rule in rules if rule['mode'] == 'regex' for k in rule['keywords'] if k['enabled']))
         found = dict(zip(patterns, await self.regex.search(bot, patterns, text) or [False] * len(patterns), strict=True))
         results = []
@@ -164,20 +172,25 @@ class QuestionAnswer:
                 hits = [k for k in keywords if k in text]
             else:
                 hits = [k for k in keywords if found.get(k)]
-            if hits:
-                # Explicit equal priorities stay tied; unset contains priority prefers the longer keyword.
-                length = max(map(len, hits)) if rule['mode'] == 'contains' and rule['priority'] is None else 0
-                results.append(
-                    {
-                        'rule_id': rule['id'],
-                        'revision': rule.get('revision', 0),
-                        'name': rule['name'],
-                        'kind': rule['kind'],
-                        'target': rule['target'],
-                        'mode': rule['mode'],
-                        'rank': (MODES[rule['mode']], rule['priority'] or 0, length),
-                    }
-                )
+            if not hits:
+                continue
+            if admit is not None:
+                allowed = admit(rule)
+                if not (await allowed if asyncio.iscoroutine(allowed) else allowed):
+                    continue
+            # Explicit equal priorities stay tied; unset contains priority prefers the longer keyword.
+            length = max(map(len, hits)) if rule['mode'] == 'contains' and rule['priority'] is None else 0
+            results.append(
+                {
+                    'rule_id': rule['id'],
+                    'revision': rule.get('revision', 0),
+                    'name': rule['name'],
+                    'kind': rule['kind'],
+                    'target': rule['target'],
+                    'mode': rule['mode'],
+                    'rank': (MODES[rule['mode']], rule['priority'] or 0, length),
+                }
+            )
         return sorted(results, key=lambda r: r['rank'], reverse=True)
 
     @staticmethod

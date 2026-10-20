@@ -15,6 +15,7 @@ from core.base.config import cfg
 from core.plugin._blacklist import get_blacklist_map
 from core.plugin._dispatch import _strip_leading_bot_name_at
 
+from .access import AccessBridge
 from .menus import PAGE, Menus
 
 PREFIX = '/api/ext/self-qa/'
@@ -33,6 +34,7 @@ class PublicEntry:
     def __init__(self, qa):
         self.qa = qa
         self.menus = Menus()
+        self.access = AccessBridge(qa, NAMESPACE)
 
     @staticmethod
     def sender(bot):
@@ -50,9 +52,28 @@ class PublicEntry:
         if operation == 'list':
             if values:
                 raise ValueError('查看不接受其他字段')
-            return {'settings': await self.qa.settings(bot, NAMESPACE), 'rules': await self.qa.manage(bot, NAMESPACE, 'list')}
+            return {
+                'settings': await self.qa.settings(bot, NAMESPACE),
+                'rules': await self.qa.manage(bot, NAMESPACE, 'list'),
+                'capabilities': await self.access.status(bot),
+            }
         if operation == 'settings':
             return await self.qa.save_settings(bot, NAMESPACE, values)
+        if 'function' in values:
+            raise ValueError('规则授权功能请用 rule_policy 设置')
+        if operation == 'delegate':
+            # Owner only: open delegation per group; role is decided by authorization.
+            if set(values) != {'groups'}:
+                raise ValueError('委托须提供 groups 列表')
+            return {'delegated_groups': await self.access.set_delegation(bot, values['groups'])}
+        if operation == 'rule_policy':
+            if set(values) != {'id', 'policy'}:
+                raise ValueError('须提供规则 id 与 policy（null 为继承默认受限策略）')
+            rule = await self.qa.manage(bot, NAMESPACE, 'get', key=values['id'])
+            if not rule or rule.get('access') != 'restricted':
+                raise ValueError('只有受限规则可设置单独策略')
+            function = await self.access.set_rule_policy(bot, rule, values['policy'])
+            return await self.qa.manage(bot, NAMESPACE, 'update', {'function': function}, values['id'])
         if operation == 'create':
             return await self.qa.manage(bot, NAMESPACE, 'create', {'kind': 'text', **values})
         if operation == 'test':
@@ -66,7 +87,7 @@ class PublicEntry:
             if not isinstance(key, str) or not key:
                 raise ValueError('请提供规则 id')
             return await self.qa.manage(bot, NAMESPACE, operation, values if operation == 'update' else None, key)
-        raise ValueError('操作须为 list/settings/create/update/delete/test')
+        raise ValueError('操作须为 list/settings/create/update/delete/test/delegate/rule_policy')
 
     async def reply(self, event, content, **kwargs):
         # before_event runs before dispatch assigns event._sender; use the Bot's sender.
@@ -84,9 +105,34 @@ class PublicEntry:
             chosen.setdefault(result['target'], result)
         return list(chosen.values())
 
+    async def matched(self, event, text):
+        """Best candidates this asker may see, with the rules and decisions behind them."""
+        if not await self.enabled(event):
+            return [], {}
+        group, member = (event.group_id if event.is_group else ''), event.raw_user_id or event.user_id
+        admitted = {}
+
+        async def admit(rule):
+            decision = await self.access.admit(event.appid, rule, group, member)
+            if decision is not None:
+                admitted[rule['id']] = rule, decision
+            return decision is not None
+
+        return self.candidates(await self.qa.match(event.appid, NAMESPACE, text, group=group, admit=admit)), admitted
+
     async def current(self, event, menu):
-        group = event.group_id if event.is_group else ''
-        return self.candidates(await self.qa.match(event.appid, NAMESPACE, menu['text'], group=group)) if await self.enabled(event) else []
+        return await self.matched(event, menu['text'])
+
+    async def deliver(self, event, candidate, admitted):
+        rule, decision = admitted[candidate['rule_id']]
+        if rule.get('access') == 'restricted' and event.is_group and await self.access.group_view(event.appid, rule, event.group_id) is None:
+            # Only send restricted content to a group whose every member may view it.
+            await self.reply(event, f'「{candidate["name"]}」仅限有权成员查看，不能在本群公开发送。')
+            return
+        if not self.access.current(event.appid, decision):
+            await self.reply(event, '资格已变化，请重新提问。')
+            return
+        await self.reply(event, candidate['target'])
 
     async def on_event(self, event):
         text = (event.content or '').strip()
@@ -94,19 +140,19 @@ class PublicEntry:
             return event
         if text.startswith(COMMAND) and owner(event):
             return await self.command(event, text)
-        bot, group = event.appid, event.group_id if event.is_group else ''
+        if text.startswith(COMMAND) and event.is_group:
+            return await self.delegated_command(event, text)
+        bot = event.appid
         if event.event_type == 'GROUP_MESSAGE_CREATE' and cfg.get_bot_setting(bot, 'non_at_message.strip_bot_name_at', False):
             text = _strip_leading_bot_name_at(text, getattr(self.sender(bot), '_bot_name', '') or '').strip()
         try:
             if text == SELECT or text.startswith(SELECT + ' '):
                 return await self.select_text(event, text[len(SELECT) :].strip())
-            if not await self.enabled(event):
-                return event
-            candidates = self.candidates(await self.qa.match(bot, NAMESPACE, text, group=group))
+            candidates, admitted = await self.matched(event, text)
             if not candidates:
                 return event
             if len(candidates) == 1:
-                await self.reply(event, candidates[0]['target'])
+                await self.deliver(event, candidates[0], admitted)
             else:
                 await self.offer(event, self.menus.issue(event, NAMESPACE, text, candidates), candidates, 0)
         except (sqlite3.Error, OSError, RuntimeError):
@@ -145,7 +191,7 @@ class PublicEntry:
 
     async def choose(self, event, menu, token, action):
         """Re-read current rules for this caller/context; stale choices answer nothing."""
-        candidates = await self.current(event, menu)
+        candidates, admitted = await self.current(event, menu)
         if action.startswith('p'):
             menu['rules'] = [c['rule_id'] for c in candidates]
             if not candidates:
@@ -159,7 +205,7 @@ class PublicEntry:
         if chosen is None:
             await self.reply(event, '该答案已失效，请重新提问。')
             return
-        await self.reply(event, chosen['target'])
+        await self.deliver(event, chosen, admitted)
 
     async def select_text(self, event, argument):
         menu, reason = self.menus.resolve(event)
@@ -206,6 +252,50 @@ class PublicEntry:
         except (sqlite3.Error, OSError, RuntimeError):
             await self.reply(event, '问答暂不可用，请稍后重试。')
         return event
+
+    async def delegated_command(self, event, text):
+        """Current group owner/admin, only where the owner opened delegation, only this group's rules."""
+        bot, group = event.appid, event.group_id
+        decision = await self.access.delegate(bot, group, event.raw_user_id or event.user_id)
+        if decision is None:
+            return event
+        try:
+            data = json.loads(text[len(COMMAND) :])
+            if not isinstance(data, dict):
+                raise ValueError('操作须为对象')
+            values = dict(data)
+            operation = values.pop('operation', '')
+            if operation not in {'list', 'create', 'update', 'delete'}:
+                raise ValueError('委托只能管理本群规则：list/create/update/delete')
+            if set(values) - {'id', 'name', 'target', 'keywords', 'mode', 'priority', 'enabled'}:
+                raise ValueError('委托不能修改适用群、访问方式、授权策略或委托设置')
+            own = lambda rule: rule.get('groups') == [group]  # noqa: E731
+
+            def guard():
+                return self.access.current(bot, decision)
+
+            if operation == 'list':
+                result = [{k: r[k] for k in ('id', 'name', 'keywords', 'mode', 'enabled')} for r in await self.qa.manage(bot, NAMESPACE, 'list') if own(r)]
+            elif operation == 'create':
+                if 'id' in values:
+                    raise ValueError('新增不接受 id')
+                rule = await self.qa.manage(bot, NAMESPACE, 'create', {'kind': 'text', **values, 'groups': [group]}, guard=guard)
+                result = {'id': rule['id'], 'name': rule['name']}
+            else:
+                key = values.pop('id', '')
+                rule = await self.qa.manage(bot, NAMESPACE, operation, values if operation == 'update' else None, key, guard=guard, scope=own)
+                result = {'id': rule['id']}
+            content = json.dumps(result, ensure_ascii=False)
+        except KeyError:
+            content = '本群没有该规则'
+        except PermissionError as error:
+            content = str(error)
+        except (ValueError, TypeError) as error:
+            content = str(error)
+        except (sqlite3.Error, OSError, RuntimeError):
+            content = '问答存储暂不可用'
+        await self.reply(event, content)
+        return None
 
     async def command(self, event, text):
         sender = self.sender(event.appid)
