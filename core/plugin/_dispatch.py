@@ -193,6 +193,12 @@ class _DispatchMixin:
             except Exception as e:
                 report_error(PLUGIN, ic.get('_plugin', '?'), e)
 
+        # 模块处理器: 已通过黑名单、维护、非@权限与拦截器, 先于插件处理器; 返回 None 表示已处理
+        if not skip_at_other and (not is_non_at or non_at_ok):
+            hooks = _hook_manager()
+            if hooks is not None and hooks.has('before_handler') and await hooks.pipeline('before_handler', event) is None:
+                return True
+
         # 普通处理器先完成原文和斜杠兼容匹配，均未命中才进入 fallback。
         scene = _event_scene(event)
         handlers = self._handlers_for(et, explicit_only=explicit_only)
@@ -362,6 +368,16 @@ class _DispatchMixin:
             _DispatchMixin._cached_app = app
         bot = app.get_bot(event.appid)
         return bot.log_service if bot else None
+
+
+def _hook_manager() -> Any:
+    try:
+        from core.application import get_app
+
+        app = get_app()
+    except Exception:
+        return None
+    return app.hook_manager if app is not None else None
 
 
 def _fallback_enabled(h: dict[str, Any], event: Event) -> bool:
