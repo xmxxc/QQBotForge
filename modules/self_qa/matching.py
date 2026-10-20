@@ -6,8 +6,11 @@ The ``public`` namespace belongs to the module's own message entry (entry.py).
 import asyncio
 from uuid import uuid4
 
+from .regex_runner import RegexRunner, compile_check
 from .storage import ExtensionStore
 
+# Exact beats contains beats regex; within a mode a higher priority wins.
+MODES = {'exact': 2, 'contains': 1, 'regex': 0}
 FIELDS = {'name', 'kind', 'target', 'keywords', 'mode', 'priority', 'enabled', 'groups'}
 
 
@@ -36,7 +39,7 @@ def validate_settings(settings):
 def validate_rule(rule):
     # Empty groups is a global rule; otherwise only the listed native groups.
     rule['groups'] = native_ids(rule.get('groups', []))
-    if rule.get('kind') not in {'text', 'resource'} or rule.get('mode') not in {'exact', 'contains'}:
+    if rule.get('kind') not in {'text', 'resource'} or rule.get('mode') not in MODES:
         raise ValueError('规则类型或匹配方式无效')
     if not isinstance(rule.get('enabled'), bool):
         raise ValueError('规则启用状态须为布尔值')
@@ -62,6 +65,8 @@ def validate_rule(rule):
         ):
             raise ValueError('关键词须为非空文字或 text/enabled 对象，最多 500 字符')
         normalized.append({'text': entry['text'].strip(), 'enabled': entry.get('enabled', True)})
+        if rule['mode'] == 'regex':
+            compile_check(normalized[-1]['text'])
     rule['keywords'] = normalized
     return rule
 
@@ -72,12 +77,14 @@ class QuestionAnswer:
         self.lock = asyncio.Lock()
         self.active = True
         self.versions = {}
+        self.regex = RegexRunner()
 
     async def initialize(self):
         await self.store.ready()
 
     def close(self):
         self.active = False
+        self.regex.close()
         self.store.close()
 
     def version(self, bot, namespace):
@@ -103,7 +110,9 @@ class QuestionAnswer:
                 raise ValueError('规则操作或字段无效')
             rule = old or {'id': uuid4().hex, 'enabled': True, 'mode': 'exact', 'kind': 'resource', 'priority': None}
             rule.update(data)
+            # A rejected rule raises before the store write; the saved rule stays as it was.
             validate_rule(rule)
+            rule['revision'] = rule.get('revision', 0) + 1
             self.versions[(bot, namespace)] = self.version(bot, namespace) + 1
             await self.store.put(bot, collection, rule['id'], rule)
             return rule
@@ -124,21 +133,50 @@ class QuestionAnswer:
             self.versions[(bot, namespace)] = self.version(bot, namespace) + 1
         return settings
 
-    async def match(self, bot, namespace, text, *, group=None):
-        """group=None skips rule scope (consumer-owned); '' is private chat, which only global rules serve."""
+    async def match(self, bot, namespace, text, *, group=None, admit=None):
+        """Every admitted rule that matches, best first, one result per rule.
+
+        group=None skips rule scope (consumer-owned); '' is private chat, which
+        only global rules serve. ``admit(rule)`` (sync or async) filters before
+        ranking, so ties never expose rules the caller may not see. Regex rules
+        run bounded in the Bot's worker; a timeout leaves them unmatched.
+        """
         if not isinstance(text, str):
             return []
         text = text.strip()
-        results = []
+        rules = []
         for rule in await self.manage(bot, namespace, 'list'):
             if not rule['enabled'] or group is not None and rule.get('groups') and group not in rule['groups']:
                 continue
-            hits = [k['text'] for k in rule['keywords'] if k['enabled'] and (text == k['text'] if rule['mode'] == 'exact' else k['text'] in text)]
+            if admit is not None:
+                allowed = admit(rule)
+                if not (await allowed if asyncio.iscoroutine(allowed) else allowed):
+                    continue
+            rules.append(rule)
+        patterns = list(dict.fromkeys(k['text'] for rule in rules if rule['mode'] == 'regex' for k in rule['keywords'] if k['enabled']))
+        found = dict(zip(patterns, await self.regex.search(bot, patterns, text) or [False] * len(patterns), strict=True))
+        results = []
+        for rule in rules:
+            keywords = [k['text'] for k in rule['keywords'] if k['enabled']]
+            if rule['mode'] == 'exact':
+                hits = [k for k in keywords if text == k]
+            elif rule['mode'] == 'contains':
+                hits = [k for k in keywords if k in text]
+            else:
+                hits = [k for k in keywords if found.get(k)]
             if hits:
-                # Explicit equal priorities remain ambiguous; unset priorities use keyword length.
-                rank = (1, 0, 0) if rule['mode'] == 'exact' else (0, rule['priority'] or 0, max(map(len, hits)) if rule['priority'] is None else 0)
+                # Explicit equal priorities stay tied; unset contains priority prefers the longer keyword.
+                length = max(map(len, hits)) if rule['mode'] == 'contains' and rule['priority'] is None else 0
                 results.append(
-                    {'rule_id': rule['id'], 'name': rule['name'], 'kind': rule['kind'], 'target': rule['target'], 'mode': rule['mode'], 'rank': rank}
+                    {
+                        'rule_id': rule['id'],
+                        'revision': rule.get('revision', 0),
+                        'name': rule['name'],
+                        'kind': rule['kind'],
+                        'target': rule['target'],
+                        'mode': rule['mode'],
+                        'rank': (MODES[rule['mode']], rule['priority'] or 0, length),
+                    }
                 )
         return sorted(results, key=lambda r: r['rank'], reverse=True)
 

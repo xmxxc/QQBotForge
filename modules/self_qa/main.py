@@ -18,6 +18,8 @@ async def setup(ctx):
         await candidate.initialize()
         entry = PublicEntry(candidate)
         ctx.register_hook('before_handler', entry.on_event, priority=100)
+        # Button callbacks take the dispatcher's non-message path; receive them first.
+        ctx.register_hook('before_event', entry.on_interaction, priority=100)
         register_route('*', PREFIX + '*', entry.http, auth=True)
         register_page('self-qa', '自助问答', source='module', source_name='self_qa', html_file=str(Path(__file__).with_name('page.html')))
     except BaseException:
