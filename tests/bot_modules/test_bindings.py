@@ -293,11 +293,17 @@ async def test_explicit_new_owner_confirmation_after_revoke_keeps_old_import_blo
 async def test_platform_rejected_binding_receipt_preserves_error_code(access_host, monkeypatch):
     host = access_host
 
-    async def reject(event, content=None, **kwargs):
-        return False, {'code': 11253}
+    # Sender.reply returns the platform response dict, never a (success, data) tuple.
+    responses = [{'id': 'fake-reply', 'timestamp': 1}, {'code': 11253, 'message': 'denied'}, {'code': -1, 'message': '框架网络层请求超时'}]
 
-    monkeypatch.setattr(host.sender, 'reply', reject)
-    await host.event('身份绑定 申请 group-a member-a', user='private-a')
-    pending = (await host.access.binding_snapshot('bot-a'))['requests'][0]
-    assert pending['status'] == 'pending'
-    assert pending['notification'] == 'platform_rejected' and pending['notification_error'] == '11253'
+    async def reply(event, content=None, **kwargs):
+        return responses.pop(0)
+
+    monkeypatch.setattr(host.sender, 'reply', reply)
+    for index, native in enumerate(('member-a', 'member-b', 'member-c')):
+        await host.event(f'身份绑定 申请 group-a {native}', user=f'private-{index}')
+    sent, rejected, unknown = (await host.access.binding_snapshot('bot-a'))['requests']
+    assert sent['notification'] == 'sent'
+    assert rejected['status'] == 'pending'
+    assert rejected['notification'] == 'platform_rejected' and rejected['notification_error'] == '11253'
+    assert unknown['notification'] == 'send_failed' and unknown['notification_error'] == 'network_error'

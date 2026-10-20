@@ -118,10 +118,16 @@ class Management:
                 content = '绑定申请暂不可用，请核对原生身份或联系主人'
             status, error = 'send_failed', None
             try:
+                # Sender.reply returns the platform response dict: an error carries
+                # ``code`` (-1 is the framework's network failure), otherwise sent.
                 reply = await instance.sender.reply(event, content)
-                status = 'sent' if isinstance(reply, tuple) and reply[0] is True else 'platform_rejected'
-                if status == 'platform_rejected' and isinstance(reply, tuple) and len(reply) > 1 and isinstance(reply[1], dict):
-                    error = str(reply[1].get('code', 'unknown'))[:128]
+                code = reply.get('code') if isinstance(reply, dict) else None
+                if reply is None or str(code) == '-1':
+                    status, error = 'send_failed', 'network_error'
+                elif code not in (None, 0):
+                    status, error = 'platform_rejected', str(code)[:128]
+                else:
+                    status = 'sent'
             except Exception:
                 status, error = 'send_failed', 'network_error'
             if result:
