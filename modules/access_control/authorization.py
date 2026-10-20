@@ -14,6 +14,7 @@ from .bindings import Bindings
 from .policy import AccessControl, expiry, identifier
 
 COLLECTION = 'access_consumers'
+LEGACY_CYCLE = 'legacy:'
 _MISSING = object()
 
 
@@ -362,11 +363,12 @@ class Authorization(AccessControl):
             'deny': {'function_scope'},
             'allow': {'function_scope', 'source'},
             'expiry': {'source', 'expires_at'},
+            'adopt_legacy': {'source'},
         }
         if operation not in allowed or set(data) - allowed[operation]:
             raise ValueError('授权操作或字段无效')
         proof = None
-        if operation == 'grant':
+        if operation in {'grant', 'adopt_legacy'}:
             identifier(group), identifier(member)
             proof = await self._facts().fact(bot, group, member)
             if not proof['usable'] or proof['member']['status'] != 'present':
@@ -419,6 +421,21 @@ class Authorization(AccessControl):
                 }
                 state['grants'].append(result)
                 affected = set(functions)
+            elif operation == 'adopt_legacy':
+                # Owner re-anchors imported sources to the member's current, verified cycle.
+                grants = [
+                    g
+                    for g in state['grants']
+                    if g['group'] == group and g['member'] == member and g['cycle'].startswith(LEGACY_CYCLE) and data.get('source', g['id']) == g['id']
+                ]
+                if not grants:
+                    raise ValueError('该成员没有待恢复的迁移来源')
+                if not self._facts().fact_current(proof):
+                    raise ValueError('群事实已变化，请重新核验')
+                for grant in grants:
+                    grant.update(cycle=proof['member']['cycle'], adopted_at=self.clock())
+                affected = {name for name in state['functions'] if any(self._source_matches_function(state, g, name) for g in grants)}
+                result = {'adopted': [g['id'] for g in grants]}
             elif operation in {'revoke', 'expiry'}:
                 grants = [
                     g
@@ -503,7 +520,13 @@ class Authorization(AccessControl):
                     if grant['group'] == group and grant not in targets:
                         proof = await source.fact(bot, group, grant['member'])
                         fact = proof['member'] or {}
-                        if fact.get('status') == 'left' or fact.get('cycle') and fact['cycle'] != grant['cycle']:
+                        # Imported legacy sources wait for owner adoption; only a real leave retires them.
+                        if (
+                            fact.get('status') == 'left'
+                            or fact.get('cycle')
+                            and fact['cycle'] != grant['cycle']
+                            and not grant['cycle'].startswith(LEGACY_CYCLE)
+                        ):
                             targets.append(grant)
                 if targets:
                     self._retire(state, targets, 'group_lifecycle')
@@ -518,6 +541,96 @@ class Authorization(AccessControl):
                         # This consumer remains quarantined; shared group facts
                         # and unrelated consumers can still finish their update.
                         continue
+
+    async def import_legacy(self, bot, consumer, function, *, legacy_function=None):
+        """Carry one legacy function's sources into a scoped consumer without widening access.
+
+        Grants keep IDs, expiry, resources that still exist and mode, but are bound
+        to ``legacy:<old cycle>`` so they stay inactive until the owner adopts them
+        for a currently verified member (``adopt_legacy``). Denies and revocation
+        history are carried; legacy whitelisted groups only seed an empty policy.
+        Re-running skips records already present.
+        """
+        legacy_function = legacy_function or function
+        legacy = await self._state(bot)
+        current = await self._scope(bot, consumer)
+        # Build on a copy; the live row changes only after the merged result validates.
+        state = copy.deepcopy(current)
+        if function not in state['functions']:
+            raise ValueError('消费方功能尚未声明')
+        report = {'grants': 0, 'denies': 0, 'revocations': 0, 'policy_groups': [], 'skipped': 0, 'dropped_resources': 0}
+
+        def covers(record):
+            scope = record.get('function_scope', {'kind': 'function', 'id': record.get('function')})
+            return record.get('function') == legacy_function or scope.get('kind') == 'all' or legacy_function in record.get('functions', [])
+
+        def source(record, *, revoked=False):
+            resources = [r for r in record.get('resources', []) if r in state['resources']]
+            report['dropped_resources'] += len(record.get('resources', [])) - len(resources)
+            scope = record.get('resource_scope', {'kind': 'resources', 'ids': resources})
+            if scope.get('kind') == 'resources':
+                scope = {'kind': 'resources', 'ids': [r for r in scope.get('ids', []) if r in state['resources']]}
+            converted = {
+                'id': identifier(record['id']),
+                'function': function,
+                'group': identifier(record['group']),
+                'member': identifier(record['member']),
+                'cycle': LEGACY_CYCLE + str(record.get('cycle', 'unknown'))[:200],
+                'resources': resources,
+                'functions': [function],
+                'function_scope': {'kind': 'function', 'id': function},
+                'resource_scope': scope,
+                'resource_namespace': consumer,
+                'mode': record.get('mode', 'snapshot'),
+                'invoke': bool(record.get('invoke', True)),
+                'expires_at': expiry(record.get('expires_at')),
+                'created_at': record.get('created_at', self.clock()),
+                'imported_from': 'legacy',
+            }
+            if revoked:
+                converted.update(revoked_at=record.get('revoked_at'), reason=record.get('reason', 'legacy_revoked'))
+            return converted
+
+        async with self.scope_locks.setdefault((bot, consumer), asyncio.Lock()):
+            known = {r['id'] for field in ('grants', 'denies', 'revocations') for r in state[field]}
+            for field, revoked in (('revocations', True), ('grants', False)):
+                for record in legacy.get(field, []):
+                    if not covers(record) or record.get('resource_namespace', record.get('function')) not in {legacy_function, None}:
+                        continue
+                    if record['id'] in known:
+                        report['skipped'] += 1
+                        continue
+                    state[field].append(source(record, revoked=revoked))
+                    known.add(record['id'])
+                    report[field] += 1
+            for record in legacy.get('denies', []):
+                if not covers(record):
+                    continue
+                if record['id'] in known:
+                    report['skipped'] += 1
+                    continue
+                legacy_scope = record.get('function_scope', {}).get('kind')
+                state['denies'].append(
+                    {
+                        'id': identifier(record['id']),
+                        'function': function,
+                        'group': record.get('group', ''),
+                        'member': record.get('member', ''),
+                        'function_scope': {'kind': 'all'} if legacy_scope == 'all' else {'kind': 'function', 'id': function},
+                    }
+                )
+                known.add(record['id'])
+                report['denies'] += 1
+            groups = sorted(json.loads(key)[0] for key, enabled in legacy.get('whitelist', {}).items() if enabled and json.loads(key)[1] == legacy_function)
+            if groups and not state['functions'][function]['groups']:
+                state['functions'][function] = policy({**state['functions'][function], 'groups': groups})
+                report['policy_groups'] = groups
+            # A bad legacy record aborts the whole import.
+            self._validate_scope(state, consumer)
+            current.clear()
+            current.update(state)
+            await self._persist(bot, consumer, current)
+        return report
 
     async def evaluate(self, bot, consumer, function, group, member, resource='', *, action='view', framework_allowed=True):
         return await self._evaluate(bot, consumer, function, group, member, resource, action=action, framework_allowed=framework_allowed)
