@@ -17,7 +17,7 @@
 | 基础兼容与框架契约 | [#19](https://github.com/xmxxc/QQBotForge/issues/19)、[#20](https://github.com/xmxxc/QQBotForge/issues/20) | 已实现与验证，票据关闭；draft PR #37、#38、#39 保持待审核 |
 | 完整群状态 | [#21](https://github.com/xmxxc/QQBotForge/issues/21)—[#23](https://github.com/xmxxc/QQBotForge/issues/23) | G01—G03 已实现／验证，票据关闭；draft PR #40、#41、#42 保持待审核 |
 | 通用授权 | [#24](https://github.com/xmxxc/QQBotForge/issues/24)—[#27](https://github.com/xmxxc/QQBotForge/issues/27) | A01 #24 已实现／验证，draft PR #43；A02 #25 已实现／验证，draft PR #44；A03 #26 已实现／验证，draft PR #45；A04 #27 已实现／验证，draft PR #46 |
-| 独立问答 | [#28](https://github.com/xmxxc/QQBotForge/issues/28)—[#32](https://github.com/xmxxc/QQBotForge/issues/32) | 已有匹配核心；待独立入口、正则、权限、委托和丰富回复 |
+| 独立问答 | [#28](https://github.com/xmxxc/QQBotForge/issues/28)—[#32](https://github.com/xmxxc/QQBotForge/issues/32) | Q01 #28 已实现／验证，draft PR #48（框架前置 draft PR #47，已同步 #39）；Q02—Q05 待实施 |
 | 账户组合 | [#33](https://github.com/xmxxc/QQBotForge/issues/33)—[#36](https://github.com/xmxxc/QQBotForge/issues/36) | 已有业务基础；待接口迁移和完整验收 |
 
 已有实现与新票完成是不同状态。框架提供接口、消费者接入、自动测试和真实平台许可分别报告。当前发布动作及原票关闭读回结果记录在实施清单与 GitHub 时间线。
@@ -47,8 +47,8 @@ G03 #23：`fe873ac` 及成员周期锚点修正 `0a83634`，draft [PR #42](https
 
 ## 当前位置
 
-主人此前要求在 A03 后暂停，随后指示继续。A04 #27：代码 `f26aff0`，draft [PR #46](https://github.com/xmxxc/QQBotForge/pull/46)，分支 `feat/access-control-a04`（工作树 `/opt/qqbot/QQBotForge-access-control-a01`），目标 personal；完整业务 190 passed，全员报告专项 6 项，Ruff／format／三文件 mypy／页面脚本语法通过，票据关闭。新规划 18 票中 #19—#27 共 9 票完成，#28—#36 仍待实施。
+A04 #27：代码 `f26aff0`，draft [PR #46](https://github.com/xmxxc/QQBotForge/pull/46)。Q01 #28：业务 `6461759`，draft [PR #48](https://github.com/xmxxc/QQBotForge/pull/48)，分支 `feat/self-qa-q01`；框架前置 `before_handler` Hook `bf462cf`，draft [PR #47](https://github.com/xmxxc/QQBotForge/pull/47) 目标 main，已合入同步分支 `integrate/bot-modules-framework` `e501c95`（PR #39）。新规划 18 票中 #19—#28 共 10 票完成，#29—#36 待实施。
 
-验证组合：框架同步 `b23572b` + 业务 `f26aff0`，`/tmp/qqbotforge-a01-runner` 指向相应 core/web 和业务 modules/plugins/tests；命令 `/opt/qqbot/QQBotForge-account-sharing/.venv/bin/python -m pytest -q`。推送使用 SSH 地址 `git@github.com:xmxxc/QQBotForge.git`（origin 为 HTTPS，无凭据）。浏览器和真实 QQ／平台许可未验收；未迁移生产数据、合并或部署，全部 PR 保持 draft。
+验证组合：框架同步 `e501c95` + 业务 `6461759`，`/tmp/qqbotforge-a01-runner` 指向同步工作树 core/web 和业务工作树 `/opt/qqbot/QQBotForge-access-control-a01` 的 modules/plugins/tests；命令 `/opt/qqbot/QQBotForge-account-sharing/.venv/bin/python -m pytest -q`，195 passed。推送使用 SSH 地址 `git@github.com:xmxxc/QQBotForge.git`。浏览器和真实 QQ／平台许可未验收；未迁移生产数据、合并或部署，全部 PR 保持 draft。
 
-下一张：授权四票完成，按顺序进入独立问答 Q01 #28（仅依赖 #19），之后 Q02—Q05，再到账户 C01—C04。
+下一张：Q02 #29（正则、统一排序和多答案选择），之后 Q03／Q04、Q05，再到账户 C01—C04。
