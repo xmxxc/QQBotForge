@@ -19,7 +19,10 @@ async def setup(ctx):
         ctx.register_hook('before_event', candidate.on_event, priority=0)
         register_route('*', PREFIX + '*', candidate.http, auth=True)
         register_page('group-state', '群状态', source='module', source_name='group_state', html_file=str(Path(__file__).with_name('page.html')))
+        await ctx.emit('group_state_available', candidate)
     except BaseException:
+        unregister_route('*', PREFIX + '*')
+        unregister_page('group-state')
         candidate.close()
         raise
     _instance = candidate
