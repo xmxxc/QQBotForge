@@ -12,6 +12,8 @@ from aiohttp import web
 from core.base.config import cfg
 from core.plugin._blacklist import get_blacklist_map
 
+from .reader import ROLES, MembershipReader
+from .reader import native as valid_native
 from .storage import ExtensionStore
 
 PREFIX = '/api/ext/group-state/'
@@ -31,12 +33,16 @@ class GroupState:
         self.store = ExtensionStore(path)
         self.sender_provider = sender_provider or self._sender
         self.clock = clock
+        self.reader = MembershipReader(self.sender_provider)
         self.active = True
         self.generation = uuid4().hex
         self.states = {}
         self.load_locks = {}
         self.write_locks = {}
         self.refresh_locks = {}
+        self.roster_locks = {}
+        self.failed_bots = set()
+        self.pending_writes = {}
 
     @staticmethod
     def _sender(bot):
@@ -55,8 +61,8 @@ class GroupState:
 
     async def _state(self, bot):
         identifier(bot)
-        if not self.active:
-            raise RuntimeError('群状态模块未启用')
+        if not self.active or bot in self.failed_bots:
+            raise RuntimeError('群状态模块未启用或该 Bot 持久化失败')
         async with self.load_locks.setdefault(bot, asyncio.Lock()):
             if bot not in self.states:
                 state = await self.store.get(bot, 'group_state', 'state') or {'schema_version': 1, 'version': 0, 'groups': {}}
@@ -64,30 +70,84 @@ class GroupState:
                     raise RuntimeError('群状态数据版本不兼容')
                 for group in state['groups'].values():
                     group.update(reliable=False, status='historical', reason='process_restart')
+                    group.setdefault('members', {})
+                    group.setdefault('roster', {'complete': False, 'reason': 'not_verified'})
+                    group['roster'].update(complete=False, reason='process_restart')
+                    for member in group['members'].values():
+                        member.update(reliable=False, status='historical', reason='process_restart')
                 state['version'] += 1
                 self.states[bot] = state
         return self.states[bot]
 
     async def _save(self, bot, state):
-        async with self.write_locks.setdefault(bot, asyncio.Lock()):
-            await self.store.put(bot, 'group_state', 'state', state)
+        self.pending_writes[bot] = self.pending_writes.get(bot, 0) + 1
+        try:
+            async with self.write_locks.setdefault(bot, asyncio.Lock()):
+                if bot in self.failed_bots:
+                    raise RuntimeError('该 Bot 持久化已失效，需要重载并重新核验')
+                await self.store.put(bot, 'group_state', 'state', state)
+        except BaseException:
+            self.failed_bots.add(bot)
+            for group in state['groups'].values():
+                group.update(reliable=False, reason='persistence_failed')
+                group['roster'].update(complete=False, reason='persistence_failed')
+                for member in group['members'].values():
+                    member.update(reliable=False, reason='persistence_failed')
+            raise
+        finally:
+            self.pending_writes[bot] -= 1
 
     def _group(self, state, group):
-        return state['groups'].setdefault(identifier(group), {
-            'group': group, 'version': 0, 'source': 'owner_refresh', 'observed_at': None,
-            'checked_at': None, 'bot_state': None, 'reliable': False, 'status': 'pending', 'reason': 'not_verified',
-        })
+        return state['groups'].setdefault(
+            identifier(group),
+            {
+                'group': group,
+                'version': 0,
+                'source': 'owner_refresh',
+                'observed_at': None,
+                'members': {},
+                'roster': {'complete': False, 'reason': 'not_verified'},
+                'checked_at': None,
+                'bot_state': None,
+                'reliable': False,
+                'status': 'pending',
+                'reason': 'not_verified',
+            },
+        )
 
     @staticmethod
     def capabilities():
-        return {'group_list': 'known_only', 'bot_state_query': 'framework_supported_permission_required',
-                'member_roster': 'not_verified', 'role_events': 'not_supported'}
+        return {
+            'group_list': 'known_only',
+            'bot_state_query': 'framework_supported_permission_required',
+            'member_roster': 'paginated_permission_required',
+            'role_events': 'not_supported',
+        }
+
+    def _public_group(self, bot, group):
+        result = copy.deepcopy(group)
+        if result['roster'].get('complete') and result['roster'].get('version') != result['version']:
+            result['roster'].update(complete=False, reason='state_changed')
+        if self.pending_writes.get(bot, 0):
+            result.update(reliable=False, reason='persistence_pending')
+            result['roster'].update(complete=False, reason='persistence_pending')
+            for member in result['members'].values():
+                member.update(reliable=False, reason='persistence_pending')
+        return result
 
     async def snapshot(self, bot):
         state = await self._state(bot)
-        return copy.deepcopy({'bot': bot, 'generation': self.generation, 'version': state['version'],
-                              'scope': 'known', 'complete': False, 'groups': list(state['groups'].values()),
-                              'capabilities': self.capabilities()})
+        return copy.deepcopy(
+            {
+                'bot': bot,
+                'generation': self.generation,
+                'version': state['version'],
+                'scope': 'known',
+                'complete': False,
+                'groups': [self._public_group(bot, group) for group in state['groups'].values()],
+                'capabilities': self.capabilities(),
+            }
+        )
 
     async def observe(self, event):
         native = event.get('d/group_openid')
@@ -95,8 +155,20 @@ class GroupState:
             return
         state = await self._state(event.appid)
         group = self._group(state, native)
-        group.update(version=group['version'] + 1, source='native_event', observed_at=self.clock(),
-                     event_type=event.event_type, reliable=False, status='historical', reason='observed_event_requires_refresh')
+        group.update(
+            version=group['version'] + 1,
+            source='native_event',
+            observed_at=self.clock(),
+            event_type=event.event_type,
+            reliable=False,
+            status='historical',
+            reason='observed_event_requires_refresh',
+        )
+        group['roster'].update(complete=False, reason='observed_event')
+        member = event.get('d/member_openid') or event.get('d/author/member_openid')
+        if valid_native(member):
+            record = group['members'].setdefault(member, {'member': member, 'member_role': None, 'bot': None})
+            record.update(reliable=False, status='observed', reason='requires_verification', source='native_event', observed_at=self.clock())
         state['version'] += 1
         await self._save(event.appid, state)
 
@@ -105,8 +177,8 @@ class GroupState:
         async with self.refresh_locks.setdefault((bot, native), asyncio.Lock()):
             state = await self._state(bot)
             group = self._group(state, native)
-            group.update(version=group['version'] + 1, reliable=False, status='pending', reason='refreshing')
-            state['version'] += 1
+            self._invalidate(state, group, 'bot_state_refreshing')
+            group.update(reliable=False, status='pending', reason='refreshing')
             version = group['version']
             await self._save(bot, state)
             sender = self.sender_provider(bot)
@@ -125,24 +197,165 @@ class GroupState:
             if not self.active:
                 raise RuntimeError('群状态模块已卸载')
             if group['version'] != version:
-                return copy.deepcopy({**group, 'reliable': False, 'reason': 'state_changed'})
+                return {**self._public_group(bot, group), 'reliable': False, 'reason': 'state_changed'}
             if isinstance(error, dict):
                 reason = 'permission_denied' if str(error.get('code')) == '11253' else 'query_failed'
-            valid = (not reason and error is None and isinstance(data, dict)
-                     and data.get('member_role') in {'owner', 'admin', 'member'}
-                     and isinstance(data.get('recv_msg_setting'), str) and bool(data['recv_msg_setting'])
-                     and isinstance(data.get('allow_proactive_msg'), bool))
-            state['version'] += 1
-            group['version'] += 1
-            group.update(checked_at=self.clock(), reliable=bool(valid), status='verified' if valid else 'historical',
-                         reason='' if valid else reason or 'response_unknown')
+            valid = (
+                not reason
+                and error is None
+                and isinstance(data, dict)
+                and data.get('member_role') in {'owner', 'admin', 'member'}
+                and isinstance(data.get('recv_msg_setting'), str)
+                and bool(data['recv_msg_setting'])
+                and isinstance(data.get('allow_proactive_msg'), bool)
+            )
+            self._invalidate(state, group, 'bot_state_refreshed')
+            group.update(
+                checked_at=self.clock(),
+                reliable=bool(valid),
+                status='verified' if valid else 'historical',
+                reason='' if valid else reason or 'response_unknown',
+            )
             if valid and isinstance(data, dict):
-                group.update(source='platform_bot_state', bot_state={
-                    'member_role': data['member_role'], 'recv_msg_setting': data['recv_msg_setting'],
-                    'allow_proactive_msg': data['allow_proactive_msg'], 'in_group': True,
-                })
+                group.update(
+                    source='platform_bot_state',
+                    bot_state={
+                        'member_role': data['member_role'],
+                        'recv_msg_setting': data['recv_msg_setting'],
+                        'allow_proactive_msg': data['allow_proactive_msg'],
+                        'in_group': True,
+                    },
+                )
             await self._save(bot, state)
-            return copy.deepcopy(group)
+            return self._public_group(bot, group)
+
+    @staticmethod
+    def _invalidate(state, group, reason):
+        state['version'] += 1
+        group['version'] += 1
+        group['roster'].update(complete=False, reason=reason)
+
+    async def sync_roster(self, bot, native_group):
+        identifier(native_group)
+        async with self.roster_locks.setdefault((bot, native_group), asyncio.Lock()):
+            state = await self._state(bot)
+            group = self._group(state, native_group)
+            known = {key for key, member in group['members'].items() if member.get('status') != 'left'}
+            self._invalidate(state, group, 'roster_refreshing')
+            for record in group['members'].values():
+                record.update(reliable=False, status='historical', reason='roster_refreshing')
+            version = group['version']
+            await self._save(bot, state)
+            report = await self.reader.roster(bot, native_group)
+            if not self.active:
+                raise RuntimeError('群状态模块已卸载')
+            changed = group['version'] != version
+            if changed:
+                report.update(complete=False, reason='state_changed')
+            elif report['complete'] and known - {r['member'] for r in report['members']}:
+                report.update(complete=False, reason='known_member_missing', missing_known_members=sorted(known - {r['member'] for r in report['members']}))
+            checked = self.clock()
+            if not changed:
+                for record in report['members']:
+                    reliable = record['member_role'] is not None
+                    group['members'][record['member']] = {
+                        **record,
+                        'reliable': reliable,
+                        'status': 'present' if reliable else 'pending',
+                        'reason': '' if reliable else 'role_missing',
+                        'source': 'platform_roster',
+                        'checked_at': checked,
+                    }
+            self._invalidate(state, group, report['reason'])
+            report.update(
+                id=uuid4().hex, generation=self.generation, version=group['version'], group=native_group, source='platform_roster', checked_at=checked
+            )
+            group['roster'] = copy.deepcopy(report)
+            await self._save(bot, state)
+            if group['version'] != report['version']:
+                report.update(complete=False, reason='state_changed')
+            return copy.deepcopy(report)
+
+    async def verify_member(self, bot, native_group, member):
+        identifier(native_group)
+        identifier(member)
+        state = await self._state(bot)
+        group = self._group(state, native_group)
+        self._invalidate(state, group, 'individual_verification')
+        version = group['version']
+        record = group['members'].setdefault(member, {'member': member, 'member_role': None, 'bot': None})
+        record.update(reliable=False, status='pending', reason='verifying')
+        await self._save(bot, state)
+        result = await self.reader.member(bot, native_group, member)
+        if not self.active:
+            raise RuntimeError('群状态模块已卸载')
+        if group['version'] != version:
+            return {**copy.deepcopy(record), 'state': 'unknown', 'reliable': False, 'reason': 'state_changed'}
+        record.update(
+            result,
+            source='platform_member',
+            checked_at=self.clock(),
+            reliable=result['state'] == 'present',
+            status='present' if result['state'] == 'present' else 'pending',
+        )
+        self._invalidate(state, group, 'individual_verification')
+        version = group['version']
+        await self._save(bot, state)
+        result = {**copy.deepcopy(record), 'group': native_group, 'version': version, 'generation': self.generation}
+        if group['version'] != version or self.pending_writes.get(bot, 0):
+            result.update(reliable=False, state='unknown', reason='state_changed')
+        return result
+
+    async def confirm_member(self, bot, native_group, member, *, evidence, member_role=None):
+        identifier(native_group)
+        identifier(member)
+        if not isinstance(evidence, str) or not evidence.strip() or len(evidence) > 1000:
+            raise ValueError('请记录主人核验依据，最多 1000 字符')
+        if member_role is not None and (not isinstance(member_role, str) or member_role not in ROLES):
+            raise ValueError('角色须为 member、admin、owner 或 null')
+        state = await self._state(bot)
+        group = self._group(state, native_group)
+        record = group['members'].setdefault(member, {'member': member, 'bot': None})
+        record.update(
+            member_role=member_role,
+            reliable=True,
+            status='present',
+            reason='',
+            source='owner_confirmed',
+            checked_at=self.clock(),
+            evidence=evidence,
+            state='present',
+        )
+        self._invalidate(state, group, 'individual_verification')
+        version = group['version']
+        await self._save(bot, state)
+        result = {**copy.deepcopy(record), 'group': native_group, 'version': version, 'generation': self.generation}
+        if group['version'] != version or self.pending_writes.get(bot, 0):
+            result.update(reliable=False, state='unknown', reason='state_changed')
+        return result
+
+    async def members(self, bot, native_group, *, cursor='', limit=30, version=None, generation=None):
+        identifier(native_group)
+        if type(limit) is not int or not 1 <= limit <= 100 or not isinstance(cursor, str) or (cursor and not cursor.isdecimal()):
+            raise ValueError('成员分页 limit 须为 1 至 100，cursor 须为非负偏移')
+        state = await self._state(bot)
+        if self.pending_writes.get(bot, 0):
+            raise ValueError('群事实持久化中，请稍后从第一页读取')
+        group = state['groups'].get(native_group, {'version': 0, 'members': {}, 'roster': {'complete': False, 'reason': 'unknown_group'}})
+        if cursor and (generation != self.generation or str(version) != str(group['version'])):
+            raise ValueError('成员快照已变化，请从第一页重新读取')
+        group = self._public_group(bot, group)
+        rows, offset = list(group['members'].values()), int(cursor or 0)
+        return copy.deepcopy(
+            {
+                'group': native_group,
+                'generation': self.generation,
+                'version': group['version'],
+                'roster': {key: value for key, value in group['roster'].items() if key != 'members'},
+                'members': rows[offset : offset + limit],
+                'next_cursor': str(offset + limit) if offset + limit < len(rows) else '',
+            }
+        )
 
     async def http(self, request):
         from web.auth import authorize_request
@@ -154,9 +367,31 @@ class GroupState:
         if not cfg.get_bot_config(bot):
             return web.json_response({'success': False, 'error': '请选择有效 Bot'}, status=404)
         try:
-            path = request.path[len(PREFIX):].strip('/')
+            path = request.path[len(PREFIX) :].strip('/')
             if request.method == 'GET' and not path:
                 result = await self.snapshot(bot)
+            elif request.method == 'GET' and path == 'members':
+                result = await self.members(
+                    bot,
+                    request.query.get('group', ''),
+                    cursor=request.query.get('cursor', ''),
+                    limit=int(request.query.get('limit', '30')),
+                    version=request.query.get('version'),
+                    generation=request.query.get('generation'),
+                )
+            elif request.method == 'POST' and path in {'roster', 'member', 'confirm-member'}:
+                data = await request.json()
+                fields = {'roster': {'group'}, 'member': {'group', 'member'}, 'confirm-member': {'group', 'member', 'evidence', 'member_role'}}[path]
+                if not isinstance(data, dict) or set(data) - fields or not {'group'} <= data.keys():
+                    raise ValueError('成员核验字段无效')
+                if path == 'roster':
+                    result = await self.sync_roster(bot, data['group'])
+                elif path == 'member':
+                    result = await self.verify_member(bot, data['group'], data.get('member'))
+                else:
+                    result = await self.confirm_member(
+                        bot, data['group'], data.get('member'), evidence=data.get('evidence'), member_role=data.get('member_role')
+                    )
             elif request.method == 'POST' and path == 'refresh':
                 data = await request.json()
                 if not isinstance(data, dict) or set(data) != {'group'}:
@@ -180,7 +415,9 @@ class GroupState:
         owner_ids = (cfg.get_bot_config(event.appid) or {}).get('owner_ids', [])
         if event.user_id not in owner_ids:
             return event
-        if any(identity in get_blacklist_map(event.appid, 'user') for identity in (event.user_id, event.raw_user_id)) or event.group_id in get_blacklist_map(event.appid, 'group'):
+        if any(identity in get_blacklist_map(event.appid, 'user') for identity in (event.user_id, event.raw_user_id)) or event.group_id in get_blacklist_map(
+            event.appid, 'group'
+        ):
             return None
         sender = self.sender_provider(event.appid)
         if sender is None:
@@ -189,12 +426,24 @@ class GroupState:
             words = text.split()
             if len(words) == 3 and words[1] == '刷新':
                 result = await self.refresh(event.appid, words[2])
+            elif len(words) == 3 and words[1] == '名册':
+                result = await self.sync_roster(event.appid, words[2])
+            elif len(words) == 4 and words[1] == '核验':
+                result = await self.verify_member(event.appid, words[2], words[3])
+            elif text.startswith('群状态 确认 '):
+                data = json.loads(text.split(maxsplit=2)[2])
+                if not isinstance(data, dict) or set(data) - {'group', 'member', 'evidence', 'member_role'}:
+                    raise ValueError('人工确认须为成员事实对象')
+                result = await self.confirm_member(
+                    event.appid, data.get('group'), data.get('member'), evidence=data.get('evidence'), member_role=data.get('member_role')
+                )
             elif len(words) == 1:
                 result = await self.snapshot(event.appid)
             else:
-                raise ValueError('群状态 / 群状态 刷新 <群原生ID>')
-            content = ('已知群状态已处理，详情请在主人私聊或已登录后台查看' if event.is_group
-                       else '已知群（不代表全部群）\n' + json.dumps(result, ensure_ascii=False))
+                raise ValueError('群状态 / 群状态 刷新或名册 <群ID> / 群状态 核验 <群ID> <成员ID> / 群状态 确认 <JSON>')
+            content = (
+                '已知群状态已处理，详情请在主人私聊或已登录后台查看' if event.is_group else '已知群（不代表全部群）\n' + json.dumps(result, ensure_ascii=False)
+            )
         except ValueError as error:
             content = str(error)
         except (RuntimeError, sqlite3.Error, OSError):

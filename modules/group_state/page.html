@@ -4,23 +4,45 @@
 <label>Bot <select id="gs-bot"></select></label>
 <button id="gs-load">查看已知群</button>
 <p><label>群原生标识 <input id="gs-group" maxlength="256"></label> <button id="gs-refresh">刷新 Bot 在群状态</button></p>
-<p>平台成员名册与角色变化的完整性尚需独立核验。普通成员无此页面管理权限。</p>
+<h3>成员与角色核验</h3>
+<p>名册按平台分页核验，包含本 Bot 及其他 Bot。缺页、冲突、缺少角色、许可不足或核验期间变化都不能证明完整。人工核验一个人不会证明全群完整。</p>
+<p><button id="gs-roster">刷新完整分页名册</button> <button id="gs-members">查看已知成员</button> <button id="gs-next" disabled>下一页成员</button></p>
+<p><label>成员原生标识 <input id="gs-member" maxlength="256"></label> <button id="gs-verify">自动核验单人</button></p>
+<p><label>主人核验依据 <input id="gs-evidence" maxlength="1000"></label> <label>已核实角色 <select id="gs-role"><option value="">角色未知</option><option value="member">普通成员</option><option value="admin">管理员</option><option value="owner">群主</option></select></label> <button id="gs-confirm">记录单人事实</button></p>
+<p>以上仅记录群事实，不授予功能资格。错误结果保留历史，不能直接认定成员离群。普通成员无此页面管理权限。</p>
 <p id="gs-status" role="status"></p><pre id="gs-output" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
 <script>
 (()=>{
  const bot=document.getElementById('gs-bot'), status=document.getElementById('gs-status'), output=document.getElementById('gs-output');
- async function run(refresh=false){
+ let memberPage=null;
+ async function run(action='', next=false){
   status.textContent='正在读取…';
   try {
-   const response=await fetch('/api/ext/group-state/'+(refresh?'refresh':'')+'?bot='+encodeURIComponent(bot.value),{
-    method:refresh?'POST':'GET',credentials:'same-origin',headers:refresh?{'Content-Type':'application/json'}:{},
-    ...(refresh?{body:JSON.stringify({group:document.getElementById('gs-group').value.trim()})}:{})});
+   const group=document.getElementById('gs-group').value.trim();
+   const query=new URLSearchParams({bot:bot.value});
+   if(action==='members'){
+    query.set('group',group);query.set('limit','30');
+    if(next&&memberPage){for(const key of ['generation','version'])query.set(key,memberPage[key]);query.set('cursor',memberPage.next_cursor);}
+   }
+   let body={group};
+   if(action==='member'||action==='confirm-member')body.member=document.getElementById('gs-member').value.trim();
+   if(action==='confirm-member'){body.evidence=document.getElementById('gs-evidence').value.trim();body.member_role=document.getElementById('gs-role').value||null;}
+   const writing=action&&action!=='members';
+   const response=await fetch('/api/ext/group-state/'+action+'?'+query,{
+    method:writing?'POST':'GET',credentials:'same-origin',headers:writing?{'Content-Type':'application/json'}:{},
+    ...(writing?{body:JSON.stringify(body)}:{})});
    const data=await response.json();
-   if(!response.ok||!data.success) throw Error(data.error||'读取失败');
-   output.textContent=JSON.stringify(data.data,null,2);status.textContent='已更新：请结合 reliable、status 和 reason 查看可信程度';
-  }catch(error){status.textContent=error.message;output.textContent='';}
+   if(!response.ok||!data.success)throw Error(data.error||data.message||'读取失败');
+   if(action==='members')memberPage=data.data;else memberPage=null;
+   document.getElementById('gs-next').disabled=!memberPage?.next_cursor;
+   output.textContent=JSON.stringify(data.data,null,2);status.textContent='已更新：请结合完整性、来源与历史标记查看核验结果';
+  }catch(error){status.textContent=error.message;output.textContent='';memberPage=null;document.getElementById('gs-next').disabled=true;}
  }
- document.getElementById('gs-load').onclick=()=>run();document.getElementById('gs-refresh').onclick=()=>run(true);
+ document.getElementById('gs-load').onclick=()=>run();document.getElementById('gs-refresh').onclick=()=>run('refresh');
+ document.getElementById('gs-roster').onclick=()=>run('roster');document.getElementById('gs-members').onclick=()=>run('members');
+ document.getElementById('gs-next').onclick=()=>run('members',true);document.getElementById('gs-verify').onclick=()=>run('member');
+ document.getElementById('gs-confirm').onclick=()=>run('confirm-member');
+ bot.onchange=()=>run();
  fetch('/api/bots',{credentials:'same-origin'}).then(r=>r.json()).then(data=>{
   const rows=data.data?.bots||data.bots||[];
   for(const row of rows){const option=document.createElement('option');option.value=row.appid;option.textContent=(row.name||row.appid)+' ('+row.appid+')';bot.append(option);}
