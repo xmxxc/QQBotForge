@@ -55,7 +55,7 @@ G02 验证组合仍为框架 `b23572b` 与当前业务目录。完整业务回�
 
 模块 setup 会广播 `group_state_available`（参数为该实例）；晚启用或重载时消费方可重绑通知订阅。已运行消费方首次安装应同时查询 ModuleManager 当前实例。该可用性通知不代表基线或事实已可信。
 
-消费方用 `await state.fact(bot, group, member=None)` 取得事实凭据，使用前再次执行 `state.fact_current(proof)`。`usable` 包含模块代际、群版本、恢复进度版本、真实写入者版本、持久化／消费完成和来源就绪状态；它只说明事实可用，不授予功能资格。成员事实还须按 `status/state` 区分在群与已离群。快照、核验和名册结果在恢复未完成时不报告可靠／完整。
+消费方用 `await state.fact(bot, group, member=None)` 取得事实凭据（需要一次核对全群时用 `await state.facts(bot, group)`，从同一公开副本返回群凭据与逐成员凭据，成员凭据不含群副本），使用前再次执行 `state.fact_current(proof)`。`usable` 包含模块代际、群版本、恢复进度版本、真实写入者版本、持久化／消费完成和来源就绪状态；它只说明事实可用，不授予功能资格。成员事实还须按 `status/state` 区分在群与已离群。快照、核验和名册结果在恢复未完成时不报告可靠／完整。
 
 `state.subscribe(async_callback, timeout=5.0)` 发布持久化后的事实变化和连接转换；回调收到递归只读的 Bot、群、代际、版本、原因及原生事件信息。返回订阅有 `active`、幂等 `cancel()` 和最近 100 个 `results`，状态为 `success/error/timeout/cancelled/unloaded`。变化先使旧凭据失效，随后保存历史、等待消费通知成功，最后确认框架投递。失败保持暂停直至重建。同 Bot 的正常通知依次排队，跨群事件或连接变化不会把现行回调误作旧写入者。超时或卸载不无限等待不合作回调；仍在运行的真实写入者按安装目录及 Bot 隔离，跨重复重载保留，退出前不能建立基线。消费方不得在回调外启动未被本契约等待的后台写入。
 

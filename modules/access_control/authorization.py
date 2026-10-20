@@ -9,6 +9,7 @@ from uuid import uuid4
 from core.base.config import cfg
 from core.plugin._blacklist import get_blacklist_map
 
+from .audience import Audience
 from .bindings import Bindings
 from .policy import AccessControl, expiry, identifier
 
@@ -64,6 +65,7 @@ class Authorization(AccessControl):
         self.fact_subscription = None
         self.fact_source = None
         self.bindings = Bindings(self)
+        self.audience = Audience(self)
 
     @staticmethod
     def group_state():
@@ -518,6 +520,9 @@ class Authorization(AccessControl):
                         continue
 
     async def evaluate(self, bot, consumer, function, group, member, resource='', *, action='view', framework_allowed=True):
+        return await self._evaluate(bot, consumer, function, group, member, resource, action=action, framework_allowed=framework_allowed)
+
+    async def _evaluate(self, bot, consumer, function, group, member, resource='', *, action='view', framework_allowed=True, proof=None):
         if action not in {'invoke', 'view'}:
             raise ValueError('动作须为 invoke/view')
         state = await self._scope(bot, consumer)
@@ -567,7 +572,7 @@ class Authorization(AccessControl):
         else:
             try:
                 source = self._facts()
-                proof = await source.fact(bot, group, member)
+                proof = proof or await source.fact(bot, group, member)
             except RuntimeError:
                 result['reason'] = 'group_facts_unavailable'
                 return result
@@ -603,6 +608,16 @@ class Authorization(AccessControl):
         if result['allowed'] and not self.decision_current(bot, result):
             result.update(allowed=False, reason='state_changed')
         return result
+
+    async def audience_report(self, bot, consumer, function, group, resource='', *, actions=('view',)):
+        """Whole-group report, every Bot included; check ``report_current`` before sending."""
+        return await self.audience.report(bot, consumer, function, group, resource, actions=actions)
+
+    def report_current(self, bot, report):
+        return self.audience.current(bot, report)
+
+    def member_current(self, bot, report, member):
+        return self.audience.member_current(bot, report, member)
 
     async def binding_snapshot(self, bot):
         return await self.bindings.manage(bot, 'binding_list', {}, 'internal_owner')

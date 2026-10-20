@@ -28,7 +28,7 @@
 授权管理 {"consumer":"reports","operation":"explain","function":"read","group":"假群","member":"假成员","resource":"report-r"}
 ```
 
-注册同一归属可安全重试；grant 每次新增来源，不应自动重试未知结果。撤销、拒绝、范围或期限调整先使在途决定失效，再保存。范围组、快照／持续批量由 #25 扩展；绑定由 #26 扩展，全员报告仍待 #27。
+注册同一归属可安全重试；grant 每次新增来源，不应自动重试未知结果。撤销、拒绝、范围或期限调整先使在途决定失效，再保存。范围组、快照／持续批量由 #25 扩展；绑定由 #26 扩展，全员报告由 #27 提供（见下文 A04）。
 
 ## 数据与故障范围
 
@@ -82,3 +82,24 @@ A02 自动验证使用真实独立模块／鉴权 HTTP／主人命令及临时 S
 旧账户绑定迁移使用 `binding_import` 操作，bundle 包含 private_identities、bindings、binding_requests 三个显式列表。仅接受原始 observed_c2c 观察与有依据的 owner_confirmed 绑定；保留已有绑定ID（旧格式无ID时用原群／成员复合键）、申请ID、来源、证据及 pending/rejected 等状态。现存冲突和同群私聊身份关联多个成员均拒绝，检查在资格筛选前执行；按绑定ID归档每轮撤销，并保留群／成员撤销标记；持久保存关联撤销历史，重导入旧记录不能恢复已撤销关联，须新申请并由主人核实。不推断关联，不导入授权／拒绝／成员事实；迁移后的上下文仍需要新模块的当前资格。测试以旧字面数据在临时库验证导入、幂等重试、重载和不扩权；未读取或迁移运行数据库。账户组合实际调用迁移接口留给 #33。
 
 A03 验证：实际独立模块、Application 私聊、主人命令、鉴权 HTTP 与原始 WS 退群／重入；两个消费方共享关联但不串权，多 Bot 分区、多群选择、角色撤回、到期、拒绝、待审／驳回、平台替身私发失败及旧数据导入。浏览器无可用实例，视觉与真实 QQ 许可未验证。
+
+
+## 全员资格报告与发送前检查（A04）
+
+消费方提交功能、资源和动作，取得含本 Bot 与其他 Bot 的全群资格报告，不自行查询平台名册或解析授权版本：
+
+```python
+report = await access.audience_report(bot, consumer, function, group, resource, actions=['invoke', 'view'])
+access.member_current(bot, report, asker)   # 提问者本人当前是否仍通过所需动作
+access.report_current(bot, report)          # 群发前的非等待最终检查
+```
+
+受限问答传 `actions=['view']`；账户群发传 `['invoke', 'view']`。报告字段：`complete`（群状态本轮完整名册且可信）、`eligible`、`reason`（eligible/member_ineligible/roster_incomplete/group_facts_unavailable/state_changed）、`roster_reason`、`members`（成员原生ID、名称、bot、self、可靠角色、`private_bound` 及逐动作允许与原因）、`failures`、`failures_complete` 与 `valid_until`。
+
+成员只来自群状态完整名册，名册要求显式末页、角色可识别、无遗漏已知成员且本 Bot 在册；不使用历史活跃名单或人数。名册不完整、分页失败或群状态停用时 `eligible=false`，只列出当前可靠在群的已确认成员，`failures_complete=false`，不宣称列出全部失败者。明确无权与完整性未知分别由每人原因和 `complete/roster_reason` 区分。
+
+报告内含不供读取的 `_proof`：本轮名册群凭据与每人每动作决定。`report_current` 不等待地复查名册凭据（群版本、恢复进度、写入者和持久化）、全部决定（策略、来源、拒绝、框架拒绝、模块代际）及最早到期时间。成员退群、新人观察／入群、角色核验变化、授权撤销／拒绝或到期都会立即使旧报告失效；其他消费方或其他 Bot 的变化不影响。群状态 `facts(bot, group)` 从同一份公开副本一次取得群与逐成员凭据，避免大群逐人复制；3000 人两动作报告约 1.3 秒，最终检查约 0.1 秒（本机临时测试）。
+
+主人管理：后台“全员资格报告”或 `授权管理 {"consumer":"reports","operation":"audience","function":"read","group":"假群","resource":"report-r","actions":["invoke","view"]}`。HTTP 与私聊返回去除 `_proof` 的管理副本；群里只给简短状态，普通成员命令不处理。
+
+A04 验证：实际 ModuleManager 独立加载授权、群状态及一个测试消费模块，Application 群消息入口在报告后、发送前检查；原始 WS 退群／入群、临时 SQLite、平台分页替身。覆盖两个 Bot 成员、Bot 不合格、分页失败、检查中退群、新人入群、到期、角色变化、拒绝、消费方与 Bot 隔离及主人鉴权。浏览器无可用实例，未做视觉核查；未连接真实 QQ 或核查平台许可。账户群发改用本接口由 C03 #35 交付，受限问答由 Q05 #32 使用。

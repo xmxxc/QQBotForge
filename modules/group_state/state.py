@@ -424,7 +424,21 @@ class GroupState:
     async def fact(self, bot, group, member=None):
         state = await self._state(bot)
         record = state['groups'].get(group)
+        return self._proof(bot, group, record, self._public_group(bot, record) if record else None, member)
+
+    async def facts(self, bot, group):
+        """One group proof plus per-member proofs from the same public copy.
+
+        Each member proof is checked with ``fact_current`` exactly like ``fact``
+        but omits ``group_state``, avoiding a group copy per roster member.
+        """
+        state = await self._state(bot)
+        record = state['groups'].get(group)
         public = self._public_group(bot, record) if record else None
+        members = {member: {**self._proof(bot, group, record, public, member), 'group_state': None} for member in (public['members'] if public else {})}
+        return self._proof(bot, group, record, public), members
+
+    def _proof(self, bot, group, record, public, member=None):
         row = public['members'].get(member) if public and member else None
         status = self.recovery.get_status(bot)
         return {
