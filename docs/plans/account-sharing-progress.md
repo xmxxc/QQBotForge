@@ -16,7 +16,7 @@
 | --- | --- | --- |
 | 基础兼容与框架契约 | [#19](https://github.com/xmxxc/QQBotForge/issues/19)、[#20](https://github.com/xmxxc/QQBotForge/issues/20) | 已实现与验证，票据关闭；draft PR #37、#38、#39 保持待审核 |
 | 完整群状态 | [#21](https://github.com/xmxxc/QQBotForge/issues/21)—[#23](https://github.com/xmxxc/QQBotForge/issues/23) | G01—G03 已实现／验证，票据关闭；draft PR #40、#41、#42 保持待审核 |
-| 通用授权 | [#24](https://github.com/xmxxc/QQBotForge/issues/24)—[#27](https://github.com/xmxxc/QQBotForge/issues/27) | A01 #24 已实现／验证，draft PR #43；A02 #25 实施范围、批量和解释，其余待验收 |
+| 通用授权 | [#24](https://github.com/xmxxc/QQBotForge/issues/24)—[#27](https://github.com/xmxxc/QQBotForge/issues/27) | A01 #24 已实现／验证，draft PR #43；A02 #25 已实现／验证，draft PR #44；A03 #26 实施身份绑定，其余待验收 |
 | 独立问答 | [#28](https://github.com/xmxxc/QQBotForge/issues/28)—[#32](https://github.com/xmxxc/QQBotForge/issues/32) | 已有匹配核心；待独立入口、正则、权限、委托和丰富回复 |
 | 账户组合 | [#33](https://github.com/xmxxc/QQBotForge/issues/33)—[#36](https://github.com/xmxxc/QQBotForge/issues/36) | 已有业务基础；待接口迁移和完整验收 |
 
@@ -42,4 +42,4 @@
 - 浏览器尝试：CUA 返回无可用浏览器（apps=[]、browsers=[]），G01 未完成浏览器核查。真实 QQ 平台许可、生产数据迁移及部署均未执行。
 - 原始工作树 `/opt/qqbot/QQBotForge-account-sharing` 的已跟踪改动已与起点二进制 diff 备份核对一致；实施文件位于 `/opt/qqbot/QQBotForge-bot-modules`。框架与同步分别位于 `QQBotForge-framework-f01`、`QQBotForge-bot-modules-framework-sync`，测试资产位于 `QQBotForge-f01-test-assets`。
 
-G03 #23：`fe873ac` 及成员周期锚点修正 `0a83634`，draft [PR #42](https://github.com/xmxxc/QQBotForge/pull/42) 目标 personal。实际 WS 接线及消费屏障、异常、重载、SQLite 延迟和原生事件冲突验证通过，组合业务 140 passed；双轴最终无剩余发现。A01 #24：`bfab97f`，draft [PR #43](https://github.com/xmxxc/QQBotForge/pull/43)，目标 personal；完整业务160 passed，授权20项，双轴最终0剩余发现，票据关闭。后续 A02 #25 已认领，当前工作树 `/opt/qqbot/QQBotForge-access-control-a01`，分支 `feat/access-control-a02` 基于 `bfab97f`，正在实施，尚未关闭。优先按群状态 → 授权 → 独立问答 → 账户共享推进；未完成票不继承旧验收状态。所有 PR 保持 draft，合并与部署由主人决定。
+G03 #23：`fe873ac` 及成员周期锚点修正 `0a83634`，draft [PR #42](https://github.com/xmxxc/QQBotForge/pull/42) 目标 personal。实际 WS 接线及消费屏障、异常、重载、SQLite 延迟和原生事件冲突验证通过，组合业务 140 passed；双轴最终无剩余发现。A01 #24：`bfab97f`，draft [PR #43](https://github.com/xmxxc/QQBotForge/pull/43)，目标 personal；完整业务160 passed，授权20项，双轴最终0剩余发现，票据关闭。A02 #25：`57debf6`，draft [PR #44](https://github.com/xmxxc/QQBotForge/pull/44)，目标 personal；完整业务172 passed，范围专项12项，双轴最终0剩余发现，票据关闭。后续 A03 #26 已认领，工作树 `/opt/qqbot/QQBotForge-access-control-a01`，分支 `feat/access-control-a03` 基于 `57debf6`，正在实施，尚未关闭。优先按群状态 → 授权 → 独立问答 → 账户共享推进；未完成票不继承旧验收状态。所有 PR 保持 draft，合并与部署由主人决定。

@@ -15,11 +15,19 @@ class Management:
     def __init__(self, service):
         self.service = service
 
-    async def execute(self, bot, data):
+    async def execute(self, bot, data, *, actor='web_admin'):
         if not isinstance(data, dict):
             raise ValueError('操作须为对象')
         values = dict(data)
         consumer, operation = values.pop('consumer', ''), values.pop('operation', '')
+        if operation == 'binding_import':
+            if consumer or set(values) != {'bundle'}:
+                raise ValueError('身份迁移须提供bundle且不选择消费方')
+            return await self.service.bindings.import_history(bot, values['bundle'])
+        if operation.startswith('binding_'):
+            if consumer:
+                raise ValueError('身份关联独立于消费方，不填写consumer')
+            return await self.service.bindings.manage(bot, operation, values, actor)
         if operation == 'register':
             if set(values) != {'owner', 'functions'}:
                 raise ValueError('注册须明确 owner/functions')
@@ -64,7 +72,57 @@ class Management:
             return web.json_response({'success': False, 'error': '该授权范围暂不可用，请检查存储与群事实'}, status=503)
 
     async def on_event(self, event):
+        if event.event_type == 'C2C_MESSAGE_CREATE':
+            await self.service.bindings.observe(event)
         text = (event.content or '').strip()
+        if event.event_type == 'C2C_MESSAGE_CREATE' and text.startswith('身份绑定 '):
+            if any(value in get_blacklist_map(event.appid, 'user') for value in (event.user_id, event.raw_user_id)):
+                return None
+            from core.application import get_app
+
+            app = get_app()
+            instance = app.get_bot(event.appid) if app else None
+            if not instance:
+                return None
+            result = None
+            try:
+                words = text.split()
+                if len(words) == 4 and words[1] == '申请':
+                    result = await self.service.bindings.request(event.appid, event.get('d/author/id'), words[2], words[3])
+                    content = '绑定待主人核实，申请编号：' + result['id'] + '；绑定不授予功能资格'
+                elif 4 <= len(words) <= 6 and words[1] == '群资格':
+                    contexts = await self.service.private_contexts(
+                        event.appid,
+                        words[2],
+                        words[3],
+                        event.get('d/author/id'),
+                        group=words[4] if len(words) > 4 else '',
+                        resource=words[5] if len(words) > 5 else '',
+                    )
+                    selected = contexts['selected']
+                    content = json.dumps(
+                        {
+                            'reason': contexts['reason'],
+                            'groups': [row['group'] for row in contexts['candidates']],
+                            'selected': selected['group'] if selected else None,
+                        },
+                        ensure_ascii=False,
+                    )
+                else:
+                    raise ValueError('身份绑定 申请 <群原生ID> <成员原生ID> / 身份绑定 群资格 <消费方> <功能> [群] [资源]')
+            except (ValueError, RuntimeError, sqlite3.Error, OSError):
+                content = '绑定申请暂不可用，请核对原生身份或联系主人'
+            status, error = 'send_failed', None
+            try:
+                reply = await instance.sender.reply(event, content)
+                status = 'sent' if isinstance(reply, tuple) and reply[0] is True else 'platform_rejected'
+                if status == 'platform_rejected' and isinstance(reply, tuple) and len(reply) > 1 and isinstance(reply[1], dict):
+                    error = str(reply[1].get('code', 'unknown'))[:128]
+            except Exception:
+                status, error = 'send_failed', 'network_error'
+            if result:
+                await self.service.bindings.delivery(event.appid, result['id'], status, error)
+            return None
         if (
             event.event_type not in {'GROUP_AT_MESSAGE_CREATE', 'GROUP_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE'}
             or event.is_channel
@@ -87,7 +145,7 @@ class Management:
         if source is None:
             return None
         try:
-            result = await self.execute(event.appid, json.loads(text.split(maxsplit=1)[1]))
+            result = await self.execute(event.appid, json.loads(text.split(maxsplit=1)[1]), actor=event.user_id)
             content = '已处理，请在主人私聊或后台查看详情' if event.is_group else json.dumps(result, ensure_ascii=False)
         except (ValueError, TypeError, KeyError) as error:
             content = str(error)
