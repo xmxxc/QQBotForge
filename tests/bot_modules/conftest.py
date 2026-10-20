@@ -61,6 +61,10 @@ async def group_host(tmp_path, monkeypatch):
                 self.messages.append(('push', user_id, content))
             return ok, data, {}
 
+        async def send_to_group(self, group_id, content=None, **kwargs):
+            self.messages.append(('group-push', group_id, content))
+            return True, {'id': 'fake-group-push'}, {}
+
         async def send_image(self, target_type, target_id, image, content='', **kwargs):
             self.messages.append(('push-image', target_id, image))
             return True, {'id': 'fake-image'}

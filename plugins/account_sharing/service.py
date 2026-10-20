@@ -1,7 +1,13 @@
-"""Account ownership and shared business entry points for QQ and the extension page."""
+"""Account business on top of the group-state, authorization and Q&A modules.
+
+The plugin owns accounts, account rules (Q&A namespace ``account_sharing``),
+delivery intent and owner results. Eligibility, private identities and group
+facts come from the authorization module (consumer ``account_sharing``), which
+reads group state; keywords come from the Q&A matcher. The plugin never reads
+platform rosters, binding internals or authorization versions.
+"""
 
 import asyncio
-import hashlib
 import json
 import sqlite3
 import time
@@ -12,17 +18,21 @@ from aiohttp import web
 from core.base.config import cfg
 from core.base.logger import PLUGIN, get_logger
 from core.plugin._blacklist import get_blacklist_map
-from .storage import ExtensionStore
 
 from .group_delivery import GroupDelivery
-from .identities import IdentityBindings
 from .menus import MenuSessions
+from .storage import ExtensionStore
 
 log = get_logger(PLUGIN, '账户共享')
 PREFIX = '/api/ext/account-sharing/'
 UNAVAILABLE = '账户共享存储暂不可用，请联系主人检查后台日志'
 DENIED = '你暂无此功能的使用权限，请联系主人'
 FUNCTION = 'account_sharing'
+CONSUMER = 'account_sharing'
+OWNER = 'plugin:account_sharing'
+DEFAULT_POLICY = {'kind': 'explicit', 'groups': [], 'private': True}
+BIND_HINT = '身份绑定 申请 {group} {member}'
+# Owner commands → scoped authorization operations (function = account_sharing).
 ACCESS_COMMANDS = {
     '白名单': 'whitelist',
     '授权': 'grant',
@@ -33,13 +43,16 @@ ACCESS_COMMANDS = {
     '功能组': 'function_group',
     '批量授权': 'bulk_grant',
     '批量撤权': 'bulk_revoke',
-    '期限': 'set_expiry',
+    '期限': 'expiry',
     '批量期限': 'bulk_expiry',
-    '成员': 'members',
-    '核验': 'verify',
-    '批量核验': 'bulk_verify',
-    '自动核验': 'verify_auto',
-    '同步名册': 'roster_sync',
+    '恢复来源': 'adopt_legacy',
+}
+MOVED = {
+    'members': '成员事实请在“群状态”查看',
+    'verify': '成员核验请使用群状态：群状态 核验／群状态 确认',
+    'bulk_verify': '成员核验请使用群状态：群状态 核验／群状态 确认',
+    'verify_auto': '成员核验请使用群状态：群状态 核验',
+    'roster_sync': '完整名册请使用群状态：群状态 名册',
 }
 ACCOUNT_FIELDS = {'name', 'login', 'password', 'enabled', 'description', 'url', 'groups'}
 
@@ -68,26 +81,35 @@ def validate_account(data, *, create=False):
 
 
 class AccountSharing:
+    CONSUMER = CONSUMER
+    FUNCTION = FUNCTION
+
     def __init__(self, path, *, access_provider=None, sender_provider=None, qa_provider=None, clock=time.time):
         self.store = ExtensionStore(path)
         self.lock = asyncio.Lock()
         self.active = True
-        self.access_provider = access_provider or self._access_module
+        self.access_provider = access_provider or self._module('access_control')
+        self.qa_provider = qa_provider or self._module('self_qa')
+        self.sender_provider = sender_provider or self._bot_sender
         self.denial_times = {}
         self.notification_locks = {}
-        self.sender_provider = sender_provider or self._bot_sender
-        self.identities = IdentityBindings(self.store, self.access)
-        self.qa_provider = qa_provider or self._qa_module
+        self.declared = {}
+        self.inventory_version = {}
         self.clock = clock
         self.menus = MenuSessions(self.store, lambda: self.clock())
         self.group_delivery = GroupDelivery(self)
 
-    @staticmethod
-    def _access_module():
-        from core.application import get_app
+    # ---------- providers ----------
 
-        app = get_app()
-        return app.module_manager.get('access_control') if app else None
+    @staticmethod
+    def _module(name):
+        def provider():
+            from core.application import get_app
+
+            app = get_app()
+            return app.module_manager.get(name) if app and app.module_manager else None
+
+        return provider
 
     def access(self):
         module = self.access_provider()
@@ -95,94 +117,11 @@ class AccountSharing:
             raise BusinessError('黑白名单授权模块未启用，查询暂停，请联系主人', 503)
         return module
 
-    @staticmethod
-    def _qa_module():
-        from core.application import get_app
-
-        app = get_app()
-        return app.module_manager.get('self_qa') if app else None
-
     def qa(self):
         module = self.qa_provider()
         if module is None or not module.active:
             raise BusinessError('自助问答模块未启用，关键词查询暂停', 503)
         return module
-
-    async def rule_management(self, bot, operation, data=None, key=''):
-        try:
-            if operation in {'create', 'update'} and isinstance(data, dict):
-                old = await self.qa().manage(bot, FUNCTION, 'get', key=key) if key else None
-                merged = {**(old or {}), **data}
-                if merged.get('kind', 'resource') == 'resource' and not await self.store.get(bot, 'accounts', merged.get('target', '')):
-                    raise BusinessError('规则引用的账户不存在', 404)
-            return await self.qa().manage(bot, FUNCTION, operation, data, key)
-        except KeyError as error:
-            raise BusinessError('规则不存在', 404) from error
-        except BusinessError:
-            raise
-        except ValueError as error:
-            raise BusinessError(str(error)) from error
-
-    async def keyword_query(self, event, *, text=None, page=0):
-        module = self.qa_provider()
-        if module is None or not module.active:
-            return
-        match_text = event.content or '' if text is None else text
-        matches = await module.match(event.appid, FUNCTION, match_text)
-        qa_guard = (module, module.version(event.appid, FUNCTION))
-        if not matches:
-            return
-        await self.sync_access_resources(event.appid)
-        context = await self.resolve_context(event)
-        if not context:
-            await self.deny(event)
-            return
-        if context.get('selection_required'):
-            return
-        allowed = []
-        for match in matches:
-            resource = match['target'] if match['kind'] == 'resource' else ''
-            decision = await self.access().decide(
-                event.appid,
-                FUNCTION,
-                context['group'],
-                context['member'],
-                resource,
-                action='view' if match['kind'] == 'resource' else 'invoke',
-                framework_allowed=await self.framework_context_allowed(event.appid, context['group'], context['member']),
-            )
-            if not decision['allowed']:
-                continue
-            if match['kind'] == 'resource':
-                account = await self.store.get(event.appid, 'accounts', resource)
-                if not account or not account['enabled']:
-                    continue
-                match['name'] = account['name']
-            allowed.append(match)
-        selected = {}
-        for match in module.best(allowed):
-            selected.setdefault((match['kind'], match['target']), match)
-        candidates = list(selected.values())
-        if not candidates:
-            await self.deny(event)
-        elif len(candidates) == 1:
-            match = candidates[0]
-            await self.query(
-                event, match['target'] if match['kind'] == 'resource' else '', rule_id=match['rule_id'] if match['kind'] == 'text' else None, qa_guard=qa_guard
-            )
-        else:
-            items = [
-                (m['name'], {'kind': 'query', 'resource': m['target']}) if m['kind'] == 'resource' else (m['name'], {'kind': 'reply', 'rule': m['rule_id']})
-                for m in candidates
-            ]
-            await self.present_menu(event, {**context, 'menu': 'candidates', 'keyword': match_text}, items, page=page, title='请选择有权候选')
-
-    async def query_content(self, bot, resource, rule_id):
-        if rule_id:
-            rule = await self.qa().manage(bot, FUNCTION, 'get', key=rule_id)
-            return rule['target'] if rule and rule['enabled'] and rule['kind'] == 'text' else None
-        account = await self.store.get(bot, 'accounts', resource)
-        return self.credentials(account) if account and account['enabled'] else None
 
     @staticmethod
     def _bot_sender(bot):
@@ -192,609 +131,45 @@ class AccountSharing:
         instance = app.get_bot(bot) if app else None
         return instance.sender if instance else None
 
-    @staticmethod
-    def framework_subject_allowed(bot, group, user, raw_user=''):
-        users = get_blacklist_map(bot, 'user')
-        groups = get_blacklist_map(bot, 'group')
-        owner = user in (cfg.get_bot_config(bot) or {}).get('owner_ids', [])
-        return not (user in users or raw_user in users or group in groups or (cfg.get_bot_setting(bot, 'maintenance.enabled', False) and not owner))
-
-    @classmethod
-    def framework_allowed(cls, event):
-        return cls.framework_subject_allowed(event.appid, event.group_id, event.user_id, event.raw_user_id)
-
-    @staticmethod
-    def framework_guard(bot):
-        restrictions = {
-            'users': get_blacklist_map(bot, 'user'),
-            'groups': get_blacklist_map(bot, 'group'),
-            'maintenance': cfg.get_bot_setting(bot, 'maintenance.enabled', False),
-            'union': cfg.get_bot_setting(bot, 'identity.use_union_id_for_group', False),
-            'owners': (cfg.get_bot_config(bot) or {}).get('owner_ids', []),
-        }
-        return hashlib.sha256(json.dumps(restrictions, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-
-    async def operation(self, bot, kind, **status):
-        result = {'id': uuid4().hex, 'kind': kind, 'created_at': time.time(), **status}
-        await self.store.put(bot, 'operations', result['id'], result)
-        log.info(f'[{bot}] {kind} operation={result["id"]}')
-        return result
-
-    async def notify_result(self, bot, result):
-        async with self.notification_locks.setdefault((bot, result['id']), asyncio.Lock()):
-            saved = await self.store.get(bot, 'operations', result['id'])
-            if saved and saved.get('notification') == 'sent':
-                return saved
-            return await self._notify_result(bot, result)
-
-    async def _notify_result(self, bot, result):
-        owner = await self.store.get(bot, 'owners', 'observed_c2c')
-        sender = self.sender_provider(bot)
-        owner_ids = (cfg.get_bot_config(bot) or {}).get('owner_ids', [])
-        if not owner or sender is None or owner.get('authenticated_id') not in owner_ids or not await self.framework_private_allowed(bot, owner['private_id']):
-            result['notification'] = 'unavailable'
-        else:
-            try:
-                response = await sender.send_to_user(
-                    owner['private_id'],
-                    f'账户共享操作 {result["id"]}：{result["kind"]}；授权={result.get("authorization", "未变更")}，绑定={result.get("binding", "未变更")}，核验={result.get("verification", "未变更")}，模式={result.get("mode", "未变更")}，发送={result.get("delivery", "未请求")}；详情请在后台查看',
-                )
-                result['notification'] = 'sent' if response[0] else 'failed'
-            except Exception:
-                result['notification'] = 'failed'
-        await self.store.put(bot, 'operations', result['id'], result)
-        return result
-
-    async def tasks(self, bot, filters=None):
-        filters = filters or {}
-        if (
-            not isinstance(filters, dict)
-            or set(filters) - {'group', 'member', 'resource'}
-            or any(not isinstance(v, str) or len(v) > 256 for v in filters.values())
-        ):
-            raise BusinessError('待办筛选只接受 group、member、resource 文字')
-        tasks = []
+    async def ensure(self, bot):
+        """Register the consumer and the current account inventory with authorization."""
         acl = self.access()
-        await self.sync_access_resources(bot)
-        for subject in await acl.subjects(bot, FUNCTION):
-            key = (subject['group'], subject['member'])
-            identity = await acl.subject_identity(bot, *key)
-            base = subject
-            if not await self.identities.lookup(bot, *key):
-                tasks.append({**base, 'type': 'binding', 'action': '核对两侧身份并确认绑定申请'})
-            if identity.get('status') != 'present':
-                tasks.append({**base, 'type': 'verification', 'reason': identity.get('verification_reason', 'pending'), 'action': '核验当前成员及入群周期'})
-        for request in await self.store.all(bot, 'binding_requests'):
-            if request['status'] == 'pending':
-                tasks.append({**request, 'type': 'binding_request', 'action': '确认绑定'})
-        for mode in await self.group_delivery.list(bot):
-            if mode['desired'] == 'group' and mode['actual'] != 'group':
-                tasks.append({**mode, 'type': 'group_delivery', 'action': '查看逐人原因并重新检查'})
-        for result in await self.store.all(bot, 'operations'):
-            if result.get('notification') in {'failed', 'unavailable', 'pending'}:
-                tasks.append({**result, 'type': 'notification', 'operation_id': result['id'], 'action': '重试主人通知'})
-        return [
-            t
-            for t in tasks
-            if all(not value or t.get(key) == value or (key == 'resource' and value in t.get('resources', [])) for key, value in filters.items())
-        ]
+        key = (id(acl), acl.generation, self.inventory_version.get(bot, 0))
+        if self.declared.get(bot) != key:
+            await acl.declare(bot, CONSUMER, owner=OWNER, functions={FUNCTION: DEFAULT_POLICY})
+            accounts = await self.accounts(bot)
+            await acl.declare_resources(bot, CONSUMER, [{'id': a['id'], 'groups': a.get('groups', []), 'enabled': a['enabled']} for a in accounts])
+            self.declared[bot] = key
+        return acl
 
-    async def task_action(self, bot, data):
-        if not isinstance(data, dict) or set(data) != {'operation', 'id'} or data['operation'] != 'retry_notification' or not isinstance(data['id'], str):
-            raise BusinessError('请提供 retry_notification 和操作 id')
-        result = await self.store.get(bot, 'operations', data['id'])
-        if not result:
-            raise BusinessError('操作不存在', 404)
-        return await self.notify_result(bot, result)
+    def accounts_changed(self, bot):
+        self.inventory_version[bot] = self.inventory_version.get(bot, 0) + 1
 
-    async def grant_result(self, bot, source):
-        binding = await self.identities.lookup(bot, source['group'], source['member'])
-        result = await self.operation(
-            bot,
-            'grant',
-            group=source['group'],
-            member=source['member'],
-            source=source['id'],
-            resources=source['resources'],
-            authorization='saved',
-            binding='verified' if binding else 'pending',
-            notification='pending',
-            delivery='not_requested',
-        )
-        if not self.access().lifecycle_available:
-            result.update(event_integration='unavailable', guidance='unavailable')
-        elif not binding:
-            sender = self.sender_provider(bot)
-            try:
-                response = (
-                    await sender.send_to_group(
-                        source['group'], '授权已保存。需绑定的成员请私聊本 Bot：账户绑定 <群原生ID> <成员原生OpenID>，再由主人核对确认。'
-                    )
-                    if sender
-                    else (False, {})
-                )
-                result['guidance'] = 'sent' if response[0] else 'unavailable'
-            except Exception:
-                result['guidance'] = 'failed'
-        return await self.notify_result(bot, result)
+    # ---------- reply results ----------
 
-    async def binding_management(self, bot, data, actor='panel_admin'):
+    @staticmethod
+    def reply_outcome(result):
+        """Sender.reply returns the platform response dict; pushes return (ok, data, ...)."""
+        if isinstance(result, tuple) and result and isinstance(result[0], bool):
+            data = result[1] if len(result) > 1 else None
+            if result[0]:
+                return 'sent'
+            return 'unknown' if isinstance(data, dict) and str(data.get('code')) == '-1' else 'failed'
+        if not isinstance(result, dict):
+            return 'unknown'
+        code = result.get('code')
+        if code in (None, 0):
+            return 'sent'
+        return 'unknown' if str(code) == '-1' else 'failed'
+
+    async def safe_reply(self, event, content, **kwargs):
+        sender = self.sender_provider(event.appid)
         try:
-            binding = await self.identities.confirm(bot, data, actor)
-        except (ValueError, TypeError) as error:
-            raise BusinessError(str(error)) from error
-        result = await self.operation(
-            bot, 'binding', group=binding['group'], member=binding['member'], binding='verified', notification='pending', delivery='not_requested'
-        )
-        await self.notify_result(bot, result)
-        return binding
+            return await sender.reply(event, content, **kwargs) if sender else None
+        except Exception:  # noqa: BLE001 - transport failures leave the result unknown
+            return {'code': -1}
 
-    async def resolve_context(self, event, *, select=''):
-        if not await self.framework_event_allowed(event):
-            return None
-        if event.is_group:
-            return {'group': event.group_id, 'member': event.raw_user_id}
-        if not event.is_direct or event.is_channel:
-            return None
-        bindings = await self.private_contexts(event)
-        if select:
-            chosen = next((b for b in bindings if b['group'] == select), None)
-            if chosen:
-                await self.store.put(event.appid, 'contexts', event.raw_user_id, {'group': select})
-            return chosen
-        if len(bindings) == 1:
-            return bindings[0]
-        selected = await self.store.get(event.appid, 'contexts', event.raw_user_id)
-        chosen = next((b for b in bindings if selected and selected['group'] == b['group']), None)
-        if chosen:
-            return chosen
-        if bindings:
-            await self.show_groups(event)
-            return {'selection_required': True}
-        return None
-
-    async def private_contexts(self, event):
-        return [
-            b
-            for b in await self.identities.contexts(event.appid, event.raw_user_id)
-            if await self.framework_context_allowed(event.appid, b['group'], b['member'])
-        ]
-
-    async def show_groups(self, event, page=0):
-        if not event.is_direct or event.is_channel or not await self.framework_event_allowed(event):
-            await self.deny(event)
-            return
-        items = []
-        for binding in await self.private_contexts(event):
-            identity = await self.access().subject_identity(event.appid, binding['group'], binding['member'])
-            items.append((binding['group'], {'kind': 'group', 'group': binding['group'], 'member': binding['member'], 'cycle': identity.get('cycle')}))
-        if not items:
-            await self.deny(event)
-            return
-        await self.present_menu(event, {'menu': 'groups'}, items, page=page, title='请选择授权群')
-
-    async def present_menu(self, event, context, items, *, page=0, title='账户列表'):
-        size = 6
-        last = max((len(items) - 1) // size, 0)
-        page = max(0, min(page, last))
-        selected = list(items[page * size : (page + 1) * size])
-        lines = []
-        for label, action in selected:
-            command = {
-                'query': '账户查询 ' + action.get('resource', ''),
-                'reply': '账户答复 ' + action.get('rule', ''),
-                'group': '账户群 ' + action.get('group', ''),
-            }.get(action['kind'], '')
-            lines.append(label + ' — ' + command)
-        if page > 0:
-            selected.append(('上一页', {'kind': 'page', 'page': page - 1}))
-        if page < last:
-            selected.append(('下一页', {'kind': 'page', 'page': page + 1}))
-        if context.get('group'):
-            identity = await self.access().subject_identity(event.appid, context['group'], context['member'])
-            context = {**context, 'cycle': identity.get('cycle')}
-        text = title + f'（{page + 1}/{last + 1}）\n' + '\n'.join(lines)
-        if context['menu'] == 'accounts':
-            text += f'\n文字翻页：账户列表 {page + 2}' if page < last else '\n发送“账户列表”刷新当前资格'
-        module = self.access()
-        decisions = []
-        for _, action in selected:
-            if action['kind'] == 'page':
-                continue
-            target = action if action['kind'] == 'group' else context
-            decision = await module.decide(
-                event.appid,
-                FUNCTION,
-                target['group'],
-                target['member'],
-                action.get('resource', ''),
-                action='view' if action['kind'] == 'query' else 'invoke',
-                framework_allowed=await self.framework_event_allowed(event)
-                and await self.framework_context_allowed(event.appid, target['group'], target['member']),
-            )
-            decisions.append(decision)
-        rows = await self.menus.issue(event, context, selected)
-
-        def current():
-            return self.access_provider() is module and all(module.decision_current(event.appid, d) for d in decisions)
-
-        if not current():
-            await self.deny(event)
-            return
-        for row in rows:
-            for button in row:
-                if button['text'] in {'上一页', '下一页'}:
-                    text += f'\n{button["text"]}：账户翻页 {button["data"]}'
-        try:
-            if not cfg.get_bot_setting(event.appid, 'message.use_markdown', True):
-                raise RuntimeError('Markdown disabled')
-            response = await event.reply(text, buttons=rows)
-            if not response or not response[0]:
-                raise RuntimeError('Buttons rejected')
-        except Exception:
-            if current():
-                await event.reply(text + '\n按钮暂不可用，请使用以上文字命令。')
-            else:
-                await self.deny(event)
-
-    async def on_interaction(self, event):
-        payload = event.content or ''
-        if event.event_type != 'INTERACTION_CREATE' or not payload.startswith('as:'):
-            return False
-        raw = event.interaction_data or {}
-        if raw.get('type') not in {11, 12}:
-            return False
-        event.set_callback_code(0)  # Receipt only. The transport sends ACK independently from business messages.
-        valid_scene = (raw.get('scene') == 'group' and raw.get('chat_type', 1) == 1 and event.group_id and event.raw_user_id) or (
-            raw.get('scene') == 'c2c' and raw.get('chat_type', 2) == 2 and not event.group_id and event.raw_user_id
-        )
-        if not valid_scene or event.channel_id or raw.get('application_id', event.appid) != event.appid or not await self.framework_event_allowed(event):
-            await self.deny(event)
-            return True
-        return await self.activate_menu(event, payload)
-
-    async def activate_menu(self, event, payload):
-        if not await self.framework_event_allowed(event) or event.is_channel or not (event.is_group or event.is_direct):
-            await self.deny(event)
-            return True
-        try:
-            if payload == 'as:list':
-                await self.directory(event)
-                return True
-            context, action = await self.menus.resolve(event, payload)
-            if context.get('group'):
-                identity = await self.access().subject_identity(event.appid, context['group'], context['member'])
-                if identity.get('cycle') != context.get('cycle'):
-                    raise ValueError('成员周期已变化，请重新发送：账户列表')
-                if event.is_group:
-                    if context['group'] != event.group_id or context['member'] != event.raw_user_id:
-                        raise PermissionError('群上下文不匹配')
-                else:
-                    selected = await self.resolve_context(event, select=context['group'])
-                    if not selected or selected['member'] != context['member']:
-                        raise PermissionError('私聊上下文不匹配')
-            if action['kind'] == 'query':
-                await self.query(event, action['resource'])
-            elif action['kind'] == 'reply':
-                await self.query(event, '', rule_id=action['rule'])
-            elif action['kind'] == 'group':
-                selected = await self.resolve_context(event, select=action['group'])
-                identity = await self.access().subject_identity(event.appid, action['group'], action['member'])
-                if not selected or selected['member'] != action['member'] or identity.get('cycle') != action.get('cycle'):
-                    raise PermissionError('授权群上下文不匹配')
-                await self.directory(event)
-            elif action['kind'] == 'page':
-                if context['menu'] == 'groups':
-                    await self.show_groups(event, action['page'])
-                elif context['menu'] == 'candidates':
-                    await self.keyword_query(event, text=context['keyword'], page=action['page'])
-                else:
-                    await self.directory(event, page=action['page'])
-        except PermissionError:
-            await self.deny(event)
-        except (BusinessError, RuntimeError, sqlite3.Error, OSError):
-            await self.deny(event)
-        except ValueError as error:
-            await event.reply(str(error))
-        return True
-
-    async def query_decision(self, event, context, resource, rule_id=None):
-        return await self.access().decide(
-            event.appid,
-            FUNCTION,
-            context['group'],
-            context['member'],
-            resource,
-            action='invoke' if rule_id else 'view',
-            framework_allowed=await self.framework_event_allowed(event)
-            and await self.framework_context_allowed(event.appid, context['group'], context['member']),
-        )
-
-    def current_rules(self, bot, guard):
-        if guard is None:
-            return True
-        module, version = guard
-        return self.qa_provider() is module and module.active and module.version(bot, FUNCTION) == version
-
-    async def query(self, event, resource, *, rule_id=None, qa_guard=None):
-        await self.sync_access_resources(event.appid)
-        context = await self.resolve_context(event)
-        if context is None:
-            await self.deny(event)
-            return
-        if context.get('selection_required'):
-            return
-        bot, group, member = event.appid, context['group'], context['member']
-        decision = await self.query_decision(event, context, resource, rule_id)
-        if not decision['allowed'] or not self.current_rules(bot, qa_guard):
-            await self.deny(event)
-            return
-        if event.is_group and resource and await self.group_delivery.try_send(event, context, resource, qa_guard):
-            return
-        content = await self.query_content(bot, resource, rule_id)
-        if content is None:
-            await self.deny(event)
-            return
-        if event.is_group:
-            await event.reply('将尝试私发账户信息，请留意本 Bot 私聊；发送结果以实际状态为准。')
-        binding = await self.identities.lookup(bot, group, member)
-        if not binding or (not event.is_group and binding['private_id'] != event.raw_user_id):
-            await self.operation(bot, 'delivery', group=group, member=member, resource=resource, delivery='pending_binding')
-            await event.reply(f'私发未完成：尚未绑定。请私聊本 Bot：账户绑定 {group} {member}，由主人核对确认。')
-            return
-        current = await self.query_decision(event, context, resource, rule_id)
-        if not current['allowed'] or not self.current_rules(bot, qa_guard) or not await self.framework_private_allowed(bot, binding['private_id']):
-            await self.deny(event)
-            return
-        content = await self.query_content(bot, resource, rule_id)
-        private_allowed = await self.framework_private_allowed(bot, binding['private_id'])
-        final = await self.query_decision(event, context, resource, rule_id)
-        if (
-            not final['allowed']
-            or final['version'] != current['version']
-            or content is None
-            or not self.active
-            or not self.current_rules(bot, qa_guard)
-            or not private_allowed
-            or not self.access().decision_current(bot, final)
-        ):
-            await self.deny(event)
-            return
-        try:
-            response = await event._sender.send_to_user(binding['private_id'], content)
-            ok, data = response[:2]
-            code = str(data.get('code', 'send_failed'))[:80] if isinstance(data, dict) else 'send_failed'
-        except Exception:
-            ok, code = False, 'network_error'
-        await self.operation(bot, 'delivery', group=group, member=member, resource=resource, delivery='sent' if ok else 'failed', error='' if ok else code)
-        if not ok:
-            await event.reply(f'私发失败（{code}），请检查好友关系、接收许可或重新提交账户绑定申请；账密未公开。')
-        elif event.is_group:
-            await event.reply('账户信息已私发。')
-
-    async def framework_private_allowed(self, bot, private_id):
-        if not self.identities.identity_healthy:
-            return False
-        identity = await self.identities.private_identity(bot, private_id)
-        users = get_blacklist_map(bot, 'user')
-        union_enabled = cfg.get_bot_setting(bot, 'identity.use_union_id_for_group', False)
-        if union_enabled and users and not identity.get('identity_observed'):
-            return False
-        if any(alias in users for alias in identity.get('union_ids', [])):
-            return False
-        display = identity.get('current_union_id', private_id) if union_enabled else private_id
-        return self.framework_subject_allowed(bot, '', display, private_id)
-
-    async def framework_event_allowed(self, event):
-        if not self.framework_allowed(event):
-            return False
-        if event.is_direct and not event.is_channel:
-            return await self.framework_private_allowed(event.appid, event.raw_user_id)
-        return True
-
-    async def framework_context_allowed(self, bot, group, member):
-        subject = await self.access().subject_identity(bot, group, member)
-        aliases = subject.get('union_ids', [])
-        users = get_blacklist_map(bot, 'user')
-        union_enabled = cfg.get_bot_setting(bot, 'identity.use_union_id_for_group', False)
-        if union_enabled and users and not subject.get('identity_observed'):
-            return False  # Cannot check a configured display-identity deny without a reliable relation.
-        if any(alias in users for alias in aliases):
-            return False
-        display_id = subject.get('current_union_id', member) if union_enabled else member
-        return self.framework_subject_allowed(bot, group, display_id, member)
-
-    async def deny(self, event):
-        key = (event.appid, event.group_id, event.raw_user_id)
-        now = time.monotonic()
-        # Bound retained rate-limit entries without exposing denial details to members.
-        if len(self.denial_times) > 10000:
-            self.denial_times = {k: t for k, t in self.denial_times.items() if now - t < 10}
-        if now - self.denial_times.get(key, -100) >= 10:
-            self.denial_times[key] = now
-            await event.reply(DENIED)
-        log.info(f'[{event.appid}] 查询拒绝 group={event.group_id} member={event.raw_user_id}')
-
-    async def sync_access_resources(self, bot):
-        async with self.lock:
-            await self._sync_access_resources_locked(bot)
-
-    async def _sync_access_resources_locked(self, bot):
-        module = self.access_provider()
-        if module is None or not module.active:
-            return
-        await module.register_function(bot, FUNCTION)
-        inventory = [{'id': a['id'], 'groups': a.get('groups', []), 'enabled': a['enabled']} for a in await self.accounts(bot)]
-        await module.register_resources(bot, FUNCTION, inventory)
-
-    async def account_batches(self, bot, data):
-        if not isinstance(data, dict) or set(data) - {'operation', 'ids', 'data'} or data.get('operation') not in {'update', 'delete'}:
-            raise BusinessError('账户批量操作须选择 update/delete、ids 及修改字段 data')
-        ids = data.get('ids')
-        if not isinstance(ids, list) or not 1 <= len(ids) <= 500 or any(not isinstance(key, str) or not key for key in ids):
-            raise BusinessError('请选择 1 至 500 个账户 ID')
-        if data['operation'] == 'update':
-            validate_account(data.get('data'))
-        items = []
-        for key in dict.fromkeys(ids):
-            try:
-                await self.manage(bot, data['operation'], data.get('data'), key)
-                items.append({'id': key, 'status': 'saved'})
-            except BusinessError as error:
-                items.append({'id': key, 'status': 'failed', 'error': str(error)})
-        success = sum(i['status'] == 'saved' for i in items)
-        return {'items': items, 'summary': {'success': success, 'failed': len(items) - success}}
-
-    async def bulk_result(self, bot, operation, group, result):
-        pending = False
-        for item in result['items']:
-            if item['status'] == 'saved' and operation == 'bulk_grant':
-                binding = await self.identities.lookup(bot, group, item['member'])
-                item['binding'] = 'verified' if binding else 'pending'
-                item['delivery'] = 'not_requested'
-                pending |= not binding
-        summary = result['summary']
-        status = 'saved' if not summary['failed'] else 'partial' if summary['success'] else 'failed'
-        record = await self.operation(
-            bot,
-            operation,
-            group=group,
-            authorization='not_changed' if operation == 'bulk_verify' else status,
-            verification=status if operation == 'bulk_verify' else 'not_changed',
-            binding='pending' if pending else 'not_requested',
-            notification='pending',
-            delivery='not_requested',
-            items=result['items'],
-            summary=summary,
-        )
-        if not self.access().lifecycle_available:
-            record.update(event_integration='unavailable', guidance='unavailable')
-        elif pending:
-            sender = self.sender_provider(bot)
-            try:
-                response = (
-                    await sender.send_to_group(group, '批量授权已处理。需绑定的成员请私聊本 Bot：账户绑定 <群原生ID> <成员原生OpenID>，再由主人核对确认。')
-                    if sender
-                    else (False, {})
-                )
-                record['guidance'] = 'sent' if response[0] else 'unavailable'
-            except Exception:
-                record['guidance'] = 'failed'
-        result['operation_result'] = await self.notify_result(bot, record)
-        return result
-
-    async def access_management(self, bot, data, *, actor='panel_admin'):
-        if not isinstance(data, dict):
-            raise BusinessError('授权请求须为对象')
-        values = dict(data)
-        operation = values.pop('operation', '')
-        if operation in {'verify', 'bulk_verify'}:
-            values['actor'] = actor
-        private_explanation = operation == 'explain' and values.get('action') == 'private'
-        if private_explanation:
-            values['action'] = 'view'
-        values.setdefault('function', FUNCTION)
-        try:
-            await self.sync_access_resources(bot)
-            if operation in {'grant', 'bulk_grant'}:
-                if values.get('resource_namespace', FUNCTION) != FUNCTION:
-                    raise BusinessError('账户共享管理仅接受当前 Bot 的账户资源范围')
-                values['resource_namespace'] = FUNCTION
-            if operation == 'explain':
-                values['framework_allowed'] = await self.framework_context_allowed(bot, values.get('group', ''), values.get('member', ''))
-            if operation in {'grant', 'bulk_grant'}:
-                resources = values.get('resources', [])
-                scope = values.get('resource_scope')
-                if isinstance(scope, dict) and scope.get('kind') == 'resources':
-                    resources = scope.get('ids')
-                if not isinstance(resources, list) or len(resources) > 500:
-                    raise BusinessError('资源标识须为列表，最多 500 个')
-                for resource in resources:
-                    if not isinstance(resource, str) or not await self.store.get(bot, 'accounts', resource):
-                        raise BusinessError('账户不存在', 404)
-            result = await self.access().execute(bot, operation, **values)
-            if private_explanation:
-                result['qualification_allowed'] = result['allowed']
-                binding = await self.identities.lookup(bot, values.get('group', ''), values.get('member', ''))
-                result['binding'] = 'verified' if binding else 'pending'
-                if result['allowed'] and not binding:
-                    result.update(allowed=False, reason='pending_binding')
-                elif result['allowed'] and binding and not await self.framework_private_allowed(bot, binding['private_id']):
-                    result.update(allowed=False, reason='framework_denied')
-            if operation == 'grant':
-                result['operation_result'] = await self.grant_result(bot, result)
-            elif operation in {'bulk_grant', 'bulk_revoke', 'bulk_expiry', 'bulk_verify'}:
-                await self.bulk_result(bot, operation, values.get('group', ''), result)
-            elif operation == 'verify':
-                record = await self.operation(
-                    bot,
-                    'verification',
-                    group=values.get('group'),
-                    member=values.get('member'),
-                    verification=result['state'],
-                    delivery='not_requested',
-                    notification='pending',
-                )
-                result['operation_result'] = await self.notify_result(bot, record)
-            elif operation in {'verify_auto', 'roster_sync'}:
-                record = await self.operation(
-                    bot,
-                    operation,
-                    group=values.get('group'),
-                    member=values.get('member', ''),
-                    verification=result.get('state', 'complete' if result.get('complete') else 'incomplete'),
-                    delivery='not_requested',
-                    notification='pending',
-                )
-                result['operation_result'] = await self.notify_result(bot, record)
-            return result
-        except BusinessError:
-            raise
-        except (TypeError, ValueError) as error:
-            raise BusinessError(str(error) if isinstance(error, ValueError) else '授权参数不完整') from error
-
-    async def directory(self, event, *, page=0):
-        await self.sync_access_resources(event.appid)
-        context = await self.resolve_context(event)
-        if not context:
-            await self.deny(event)
-            return
-        if context.get('selection_required'):
-            return
-        module = self.access()
-        allowed = []
-        for account in await self.accounts(event.appid):
-            decision = await module.decide(
-                event.appid,
-                FUNCTION,
-                context['group'],
-                context['member'],
-                account['id'],
-                framework_allowed=await self.framework_context_allowed(event.appid, context['group'], context['member']),
-            )
-            if account['enabled'] and decision['allowed']:
-                allowed.append(account)
-        if not allowed:
-            await self.deny(event)
-            return
-        # Re-evaluate after async reads, so a known mutation cannot leak an old list.
-        visible = []
-        for account in allowed:
-            if (
-                await module.decide(
-                    event.appid,
-                    FUNCTION,
-                    context['group'],
-                    context['member'],
-                    account['id'],
-                    framework_allowed=await self.framework_context_allowed(event.appid, context['group'], context['member']),
-                )
-            )['allowed']:
-                visible.append((account['name'], {'kind': 'query', 'resource': account['id']}))
-        if not visible:
-            await self.deny(event)
-            return
-        await self.present_menu(event, {**context, 'menu': 'accounts'}, visible, page=page)
+    # ---------- accounts ----------
 
     async def initialize(self):
         await self.store.ready()
@@ -821,7 +196,8 @@ class AccountSharing:
                 return old
             if operation == 'delete':
                 await self.store.delete(bot, 'accounts', key)
-                await self._sync_access_resources_locked(bot)
+                self.accounts_changed(bot)
+                await self._sync_resources(bot)
                 log.info(f'[{bot}] 删除账户 {key}')
                 return {'id': key}
             if operation not in {'create', 'update'}:
@@ -830,9 +206,656 @@ class AccountSharing:
             account = old or {'id': uuid4().hex, 'enabled': True, 'description': '', 'url': '', 'groups': []}
             account.update(data)
             await self.store.put(bot, 'accounts', account['id'], account)
-            await self._sync_access_resources_locked(bot)
+            self.accounts_changed(bot)
+            await self._sync_resources(bot)
             log.info(f'[{bot}] 保存账户 {account["id"]}')
             return account
+
+    async def _sync_resources(self, bot):
+        """Deleting an account removes it as a resource: its direct grants lose it, a new ID inherits nothing."""
+        module = self.access_provider()
+        if module is not None and module.active:
+            try:
+                await self.ensure(bot)
+            except (RuntimeError, ValueError, sqlite3.Error, OSError) as error:
+                log.warning(f'[{bot}] 账户资源同步暂不可用: {error}')
+
+    async def account_batches(self, bot, data):
+        if not isinstance(data, dict) or set(data) - {'operation', 'ids', 'data'} or data.get('operation') not in {'update', 'delete'}:
+            raise BusinessError('账户批量操作须选择 update/delete、ids 及修改字段 data')
+        ids = data.get('ids')
+        if not isinstance(ids, list) or not 1 <= len(ids) <= 500 or any(not isinstance(key, str) or not key for key in ids):
+            raise BusinessError('请选择 1 至 500 个账户 ID')
+        if data['operation'] == 'update':
+            validate_account(data.get('data'))
+        items = []
+        for key in dict.fromkeys(ids):
+            try:
+                await self.manage(bot, data['operation'], data.get('data'), key)
+                items.append({'id': key, 'status': 'saved'})
+            except BusinessError as error:
+                items.append({'id': key, 'status': 'failed', 'error': str(error)})
+        success = sum(i['status'] == 'saved' for i in items)
+        return {'items': items, 'summary': {'success': success, 'failed': len(items) - success}}
+
+    @staticmethod
+    def credentials(account):
+        return f'{account["name"]}\n账号：{account["login"]}\n密码：{account["password"]}\n{account["description"]}\n{account["url"]}'
+
+    async def query_content(self, bot, resource, rule_id):
+        if rule_id:
+            rule = await self.qa().manage(bot, FUNCTION, 'get', key=rule_id)
+            return rule['target'] if rule and rule['enabled'] and rule['kind'] == 'text' else None
+        account = await self.store.get(bot, 'accounts', resource)
+        return self.credentials(account) if account and account['enabled'] else None
+
+    # ---------- rules (Q&A namespace account_sharing) ----------
+
+    async def rule_management(self, bot, operation, data=None, key=''):
+        try:
+            if operation in {'create', 'update'} and isinstance(data, dict):
+                old = await self.qa().manage(bot, FUNCTION, 'get', key=key) if key else None
+                merged = {**(old or {}), **data}
+                # Account rules reference stable account IDs; credentials never go into rules.
+                if merged.get('kind', 'resource') == 'resource' and not await self.store.get(bot, 'accounts', merged.get('target', '')):
+                    raise BusinessError('规则引用的账户不存在', 404)
+            return await self.qa().manage(bot, FUNCTION, operation, data, key)
+        except KeyError as error:
+            raise BusinessError('规则不存在', 404) from error
+        except BusinessError:
+            raise
+        except ValueError as error:
+            raise BusinessError(str(error)) from error
+
+    # ---------- authorization (scoped consumer) ----------
+
+    async def access_management(self, bot, data, *, actor='panel_admin'):
+        if not isinstance(data, dict):
+            raise BusinessError('授权请求须为对象')
+        values = dict(data)
+        operation = values.pop('operation', '')
+        operation = {'set_expiry': 'expiry'}.get(operation, operation)
+        values.pop('scope', None)  # legacy deny scope; scoped denies use function_scope
+        if operation in MOVED:
+            raise BusinessError(MOVED[operation])
+        values.pop('function', None)
+        values.pop('identity_type', None)
+        values.pop('resource_namespace', None)
+        try:
+            acl = await self.ensure(bot)
+            group, member = values.pop('group', ''), values.pop('member', '')
+            if operation == 'whitelist':
+                enabled = values.pop('enabled', None)
+                if values or not isinstance(enabled, bool) or not group:
+                    raise BusinessError('白名单须提供 group 与 enabled')
+                configured = (await acl.access_snapshot(bot, CONSUMER))['functions'][FUNCTION]
+                groups = [g for g in configured['groups'] if g != group] + ([group] if enabled else [])
+                await acl.manage_access(bot, CONSUMER, 'policy', function=FUNCTION, policy={**configured, 'groups': groups})
+                return {'groups': groups}
+            if operation == 'explain':
+                action = values.pop('action', 'view')
+                resource = values.pop('resource', '')
+                if values:
+                    raise BusinessError('解释只接受 group、member、resource、action')
+                if action == 'private':
+                    found = await acl.member_context(bot, CONSUMER, FUNCTION, group, member, resource, action='view')
+                    return {'allowed': found['context'] is not None, 'reason': found['reason'], 'binding': 'verified' if found['context'] else 'pending'}
+                return await acl.evaluate(bot, CONSUMER, FUNCTION, group, member, resource, action=action)
+            if operation in {'grant', 'bulk_grant'}:
+                resources = values.get('resources', [])
+                scope = values.get('resource_scope')
+                if isinstance(scope, dict) and scope.get('kind') == 'resources':
+                    resources = scope.get('ids')
+                if not isinstance(resources, list) or len(resources) > 500:
+                    raise BusinessError('资源标识须为列表，最多 500 个')
+                for resource in resources:
+                    if not isinstance(resource, str) or not await self.store.get(bot, 'accounts', resource):
+                        raise BusinessError('账户不存在', 404)
+            result = await acl.manage_access(bot, CONSUMER, operation, function=FUNCTION, group=group, member=member, **values)
+            if operation == 'grant':
+                result['operation_result'] = await self.grant_result(bot, result)
+            elif operation in {'bulk_grant', 'bulk_revoke', 'bulk_expiry'}:
+                await self.bulk_result(bot, operation, group, result)
+            return result
+        except BusinessError:
+            raise
+        except (TypeError, ValueError) as error:
+            raise BusinessError(str(error) if isinstance(error, ValueError) else '授权参数不完整') from error
+
+    async def binding_state(self, bot, group, member):
+        try:
+            snapshot = await self.access().binding_snapshot(bot)
+        except (BusinessError, RuntimeError, ValueError):
+            return 'unavailable'
+        return 'verified' if any(b['group'] == group and b['member'] == member for b in snapshot['bindings']) else 'pending'
+
+    async def grant_result(self, bot, source):
+        binding = await self.binding_state(bot, source['group'], source['member'])
+        result = await self.operation(
+            bot,
+            'grant',
+            group=source['group'],
+            member=source['member'],
+            source=source['id'],
+            resources=source['resources'],
+            authorization='saved',
+            binding=binding,
+            notification='pending',
+            delivery='not_requested',
+        )
+        if binding == 'pending':
+            result['guidance'] = await self.group_guidance(
+                bot, source['group'], '授权已保存。需要私聊接收的成员请私聊本 Bot：身份绑定 申请 <群原生ID> <成员原生ID>，再由主人核实。'
+            )
+        return await self.notify_result(bot, result)
+
+    async def group_guidance(self, bot, group, text):
+        sender = self.sender_provider(bot)
+        try:
+            return self.reply_outcome(await sender.send_to_group(group, text)) if sender else 'unavailable'
+        except Exception:  # noqa: BLE001
+            return 'failed'
+
+    async def bulk_result(self, bot, operation, group, result):
+        pending = False
+        for item in result['items']:
+            if item['status'] == 'saved' and operation == 'bulk_grant':
+                item['binding'] = await self.binding_state(bot, group, item['member'])
+                item['delivery'] = 'not_requested'
+                pending |= item['binding'] == 'pending'
+        summary = result['summary']
+        status = 'saved' if not summary['failed'] else 'partial' if summary['success'] else 'failed'
+        record = await self.operation(
+            bot,
+            operation,
+            group=group,
+            authorization=status,
+            binding='pending' if pending else 'not_requested',
+            notification='pending',
+            delivery='not_requested',
+            items=result['items'],
+            summary=summary,
+        )
+        if pending:
+            record['guidance'] = await self.group_guidance(
+                bot, group, '批量授权已处理。需要私聊接收的成员请私聊本 Bot：身份绑定 申请 <群原生ID> <成员原生ID>，再由主人核实。'
+            )
+        result['operation_result'] = await self.notify_result(bot, record)
+        return result
+
+    async def migrate(self, bot):
+        """Owner-run migration of legacy authorization and plugin bindings; never widens access."""
+        acl = await self.ensure(bot)
+        report = {'authorization': await acl.import_legacy(bot, CONSUMER, FUNCTION)}
+        bundle = {name: await self.store.all(bot, name) for name in ('private_identities', 'bindings', 'binding_requests')}
+        try:
+            report['bindings'] = await acl.bindings.import_history(bot, bundle) if any(bundle.values()) else {'bindings': 0, 'requests': 0}
+        except ValueError as error:
+            report['bindings'] = {'error': str(error)}
+        rules = await self.qa().manage(bot, FUNCTION, 'list')
+        accounts = {a['id'] for a in await self.accounts(bot)}
+        report['rules'] = {'total': len(rules), 'dangling': [r['id'] for r in rules if r['kind'] == 'resource' and r['target'] not in accounts]}
+        result = await self.operation(
+            bot, 'migration', authorization='imported', binding='imported', notification='pending', delivery='not_requested', report=report
+        )
+        await self.notify_result(bot, result)
+        return report
+
+    # ---------- owner results ----------
+
+    async def operation(self, bot, kind, **status):
+        result = {'id': uuid4().hex, 'kind': kind, 'created_at': time.time(), **status}
+        await self.store.put(bot, 'operations', result['id'], result)
+        log.info(f'[{bot}] {kind} operation={result["id"]}')
+        return result
+
+    async def notify_result(self, bot, result):
+        async with self.notification_locks.setdefault((bot, result['id']), asyncio.Lock()):
+            saved = await self.store.get(bot, 'operations', result['id'])
+            if saved and saved.get('notification') == 'sent':
+                return saved
+            owner = await self.store.get(bot, 'owners', 'observed_c2c')
+            sender = self.sender_provider(bot)
+            owner_ids = (cfg.get_bot_config(bot) or {}).get('owner_ids', [])
+            if not owner or sender is None or owner.get('authenticated_id') not in owner_ids or owner['private_id'] in get_blacklist_map(bot, 'user'):
+                result['notification'] = 'unavailable'
+            else:
+                try:
+                    response = await sender.send_to_user(
+                        owner['private_id'],
+                        f'账户共享操作 {result["id"]}：{result["kind"]}；授权={result.get("authorization", "未变更")}，绑定={result.get("binding", "未变更")}，'
+                        f'模式={result.get("mode", "未变更")}，发送={result.get("delivery", "未请求")}；详情请在后台查看',
+                    )
+                    result['notification'] = 'sent' if self.reply_outcome(response) == 'sent' else 'failed'
+                except Exception:  # noqa: BLE001
+                    result['notification'] = 'failed'
+            await self.store.put(bot, 'operations', result['id'], result)
+            return result
+
+    async def tasks(self, bot, filters=None):
+        filters = filters or {}
+        if (
+            not isinstance(filters, dict)
+            or set(filters) - {'group', 'member', 'resource'}
+            or any(not isinstance(v, str) or len(v) > 256 for v in filters.values())
+        ):
+            raise BusinessError('待办筛选只接受 group、member、resource 文字')
+        acl = await self.ensure(bot)
+        snapshot = await acl.access_snapshot(bot, CONSUMER)
+        identities = await acl.binding_snapshot(bot)
+        bound = {(b['group'], b['member']) for b in identities['bindings']}
+        tasks = []
+        for grant in snapshot['grants']:
+            base = {'group': grant['group'], 'member': grant['member'], 'resources': grant['resources'], 'source': grant['id']}
+            if grant['cycle'].startswith('legacy:'):
+                tasks.append({**base, 'type': 'legacy_adoption', 'action': '在群状态核验成员后“恢复来源”'})
+                continue
+            if (grant['group'], grant['member']) not in bound:
+                tasks.append({**base, 'type': 'binding', 'action': '成员申请身份绑定后由主人在授权管理确认'})
+        for request in identities['requests']:
+            if request['status'] == 'pending':
+                tasks.append({**request, 'type': 'binding_request', 'action': '在授权管理确认或拒绝身份绑定'})
+        for mode in await self.group_delivery.list(bot):
+            if mode['desired'] == 'group' and mode['actual'] != 'group':
+                tasks.append({**mode, 'type': 'group_delivery', 'action': '查看逐人原因并重新检查'})
+        for result in await self.store.all(bot, 'operations'):
+            if result.get('notification') in {'failed', 'unavailable', 'pending'}:
+                tasks.append({**result, 'type': 'notification', 'operation_id': result['id'], 'action': '重试主人通知'})
+        return [
+            t
+            for t in tasks
+            if all(not value or t.get(key) == value or (key == 'resource' and value in t.get('resources', [])) for key, value in filters.items())
+        ]
+
+    async def task_action(self, bot, data):
+        if not isinstance(data, dict) or set(data) != {'operation', 'id'} or data['operation'] != 'retry_notification' or not isinstance(data['id'], str):
+            raise BusinessError('请提供 retry_notification 和操作 id')
+        result = await self.store.get(bot, 'operations', data['id'])
+        if not result:
+            raise BusinessError('操作不存在', 404)
+        return await self.notify_result(bot, result)
+
+    # ---------- member queries ----------
+
+    async def decision(self, bot, context, resource, action):
+        acl = await self.ensure(bot)
+        return await acl.evaluate(bot, CONSUMER, FUNCTION, context['group'], context['member'], resource, action=action)
+
+    async def resolve_context(self, event, *, select=''):
+        """Group: the asker's native member identity. Private: an authorization-verified group context."""
+        if event.is_channel or not (event.is_group or event.is_direct):
+            return None
+        if event.is_group:
+            return {'group': event.group_id, 'member': event.raw_user_id}
+        acl = await self.ensure(event.appid)
+        chosen = select or ((await self.store.get(event.appid, 'contexts', event.raw_user_id)) or {}).get('group', '')
+        found = await acl.private_contexts(event.appid, CONSUMER, FUNCTION, event.raw_user_id, group=chosen, action='invoke')
+        if found['selected']:
+            if select:
+                await self.store.put(event.appid, 'contexts', event.raw_user_id, {'group': select})
+            return {'group': found['selected']['group'], 'member': found['selected']['member'], 'private': True}
+        if found['reason'] == 'choose_group' and not select:
+            await self.show_groups(event, found['candidates'])
+            return {'selection_required': True}
+        return None
+
+    async def show_groups(self, event, candidates, page=0):
+        items = [(c['group'], {'kind': 'group', 'group': c['group']}) for c in candidates]
+        if not items:
+            await self.deny(event)
+            return
+        await self.present_menu(event, {'menu': 'groups'}, items, page=page, title='请选择授权群')
+
+    async def keyword_query(self, event, *, text=None, page=0):
+        module = self.qa_provider()
+        if module is None or not module.active:
+            return
+        match_text = event.content or '' if text is None else text
+        # Cheap pre-check: no account rule matches at all → not ours.
+        if not await module.match(event.appid, FUNCTION, match_text):
+            return
+        context = await self.resolve_context(event)
+        if not context:
+            await self.deny(event)
+            return
+        if context.get('selection_required'):
+            return
+
+        async def admit(rule):
+            if rule['kind'] == 'resource':
+                account = await self.store.get(event.appid, 'accounts', rule['target'])
+                if not account or not account['enabled']:
+                    return False
+                return (await self.decision(event.appid, context, rule['target'], 'view'))['allowed']
+            return (await self.decision(event.appid, context, '', 'invoke'))['allowed']
+
+        matches = await module.match(event.appid, FUNCTION, match_text, group=context['group'], admit=admit)
+        selected = {}
+        for match in module.best(matches):
+            if match['kind'] == 'resource':
+                match['name'] = (await self.store.get(event.appid, 'accounts', match['target']) or {}).get('name', match['name'])
+            selected.setdefault((match['kind'], match['target']), match)
+        candidates = list(selected.values())
+        if not candidates:
+            await self.deny(event)
+        elif len(candidates) == 1:
+            match = candidates[0]
+            await self.query(event, match['target'] if match['kind'] == 'resource' else '', rule_id=match['rule_id'] if match['kind'] == 'text' else None)
+        else:
+            items = [
+                (m['name'], {'kind': 'query', 'resource': m['target']}) if m['kind'] == 'resource' else (m['name'], {'kind': 'reply', 'rule': m['rule_id']})
+                for m in candidates
+            ]
+            await self.present_menu(event, {**context, 'menu': 'candidates', 'keyword': match_text}, items, page=page, title='请选择有权候选')
+
+    async def directory(self, event, *, page=0):
+        context = await self.resolve_context(event)
+        if not context:
+            await self.deny(event)
+            return
+        if context.get('selection_required'):
+            return
+        visible = []
+        for account in await self.accounts(event.appid):
+            if account['enabled'] and (await self.decision(event.appid, context, account['id'], 'view'))['allowed']:
+                visible.append((account['name'], {'kind': 'query', 'resource': account['id']}))
+        if not visible:
+            await self.deny(event)
+            return
+        await self.present_menu(event, {**context, 'menu': 'accounts'}, visible, page=page)
+
+    async def present_menu(self, event, context, items, *, page=0, title='账户列表'):
+        size = 6
+        last = max((len(items) - 1) // size, 0)
+        page = max(0, min(page, last))
+        selected = list(items[page * size : (page + 1) * size])
+        lines = []
+        for label, action in selected:
+            command = {
+                'query': '账户查询 ' + action.get('resource', ''),
+                'reply': '账户答复 ' + action.get('rule', ''),
+                'group': '账户群 ' + action.get('group', ''),
+            }.get(action['kind'], '')
+            lines.append(label + ' — ' + command)
+        if page > 0:
+            selected.append(('上一页', {'kind': 'page', 'page': page - 1}))
+        if page < last:
+            selected.append(('下一页', {'kind': 'page', 'page': page + 1}))
+        text = title + f'（{page + 1}/{last + 1}）\n' + '\n'.join(lines)
+        if context['menu'] == 'accounts':
+            text += f'\n文字翻页：账户列表 {page + 2}' if page < last else '\n发送“账户列表”刷新当前资格'
+        rows = await self.menus.issue(event, context, selected)
+        for row in rows:
+            for button in row:
+                if button['text'] in {'上一页', '下一页'}:
+                    text += f'\n{button["text"]}：账户翻页 {button["data"]}'
+        # Menus hold only names the caller may see; only a definite rejection falls back.
+        if cfg.get_bot_setting(event.appid, 'message.use_markdown', True) and self.reply_outcome(await self.safe_reply(event, text, buttons=rows)) != 'failed':
+            return
+        await self.safe_reply(event, text + '\n按钮暂不可用，请使用以上文字命令。')
+
+    async def query(self, event, resource, *, rule_id=None):
+        context = await self.resolve_context(event)
+        if context is None:
+            await self.deny(event)
+            return
+        if context.get('selection_required'):
+            return
+        bot, group, member = event.appid, context['group'], context['member']
+        action = 'invoke' if rule_id else 'view'
+        decision = await self.decision(bot, context, resource, action)
+        if not decision['allowed']:
+            await self.deny(event)
+            return
+        if event.is_group and resource and await self.group_delivery.try_send(event, context, resource):
+            return
+        acl = self.access()
+        if event.is_group:
+            await self.safe_reply(event, '将尝试私发账户信息，请留意本 Bot 私聊；发送结果以实际状态为准。')
+            found = await acl.member_context(bot, CONSUMER, FUNCTION, group, member, resource, action=action)
+            target = found['context']
+            if target is None:
+                await self.operation(bot, 'delivery', group=group, member=member, resource=resource, delivery='pending_binding', reason=found['reason'])
+                await self.safe_reply(event, '私发未完成：尚未确认私聊身份。请私聊本 Bot：' + BIND_HINT.format(group=group, member=member) + '，由主人核实。')
+                return
+        else:
+            found = await acl.private_contexts(bot, CONSUMER, FUNCTION, event.raw_user_id, group=group, resource=resource, action=action)
+            target = found['selected']
+            if not target or target['group'] != group:
+                await self.deny(event)
+                return
+        content = await self.query_content(bot, resource, rule_id)
+        # Final gate right before sending: binding, private denial, decision, current content.
+        if content is None or not self.active or not acl.context_current(bot, target):
+            await self.deny(event)
+            return
+        sender = self.sender_provider(bot)
+        try:
+            result = await sender.send_to_user(target['private_id'], content) if event.is_group else await sender.reply(event, content)
+            state = self.reply_outcome(result)
+            data = result[1] if isinstance(result, tuple) and len(result) > 1 else result
+            code = str(data.get('code', ''))[:80] if isinstance(data, dict) else ''
+        except Exception:  # noqa: BLE001
+            state, code = 'unknown', 'network_error'
+        await self.operation(bot, 'delivery', group=group, member=member, resource=resource, delivery=state, error=code if state != 'sent' else '')
+        if event.is_group:
+            if state == 'sent':
+                await self.safe_reply(event, '账户信息已私发。')
+            elif state == 'failed':
+                await self.safe_reply(event, f'私发失败（{code or "平台拒绝"}），请检查好友关系、接收许可或身份绑定；账密未公开。')
+            else:
+                await self.safe_reply(event, '私发结果未知，请先查看私聊，勿重复索取；账密未公开。')
+
+    async def deny(self, event):
+        key = (event.appid, event.group_id, event.raw_user_id)
+        now = time.monotonic()
+        # Bound retained rate-limit entries without exposing denial details to members.
+        if len(self.denial_times) > 10000:
+            self.denial_times = {k: t for k, t in self.denial_times.items() if now - t < 10}
+        if now - self.denial_times.get(key, -100) >= 10:
+            self.denial_times[key] = now
+            await self.safe_reply(event, DENIED)
+        log.info(f'[{event.appid}] 查询拒绝 group={event.group_id} member={event.raw_user_id}')
+
+    # ---------- buttons ----------
+
+    async def on_interaction(self, event):
+        payload = event.content or ''
+        if event.event_type != 'INTERACTION_CREATE' or not payload.startswith('as:'):
+            return False
+        raw = event.interaction_data or {}
+        if raw.get('type') not in {11, 12}:
+            return False
+        event.set_callback_code(0)  # Receipt only. The transport sends ACK independently from business messages.
+        valid_scene = (raw.get('scene') == 'group' and raw.get('chat_type', 1) == 1 and event.group_id and event.raw_user_id) or (
+            raw.get('scene') == 'c2c' and raw.get('chat_type', 2) == 2 and not event.group_id and event.raw_user_id
+        )
+        blocked = event.raw_user_id in get_blacklist_map(event.appid, 'user') or event.group_id in get_blacklist_map(event.appid, 'group')
+        if not valid_scene or event.channel_id or raw.get('application_id', event.appid) != event.appid or blocked:
+            await self.deny(event)
+            return True
+        return await self.activate_menu(event, payload)
+
+    async def activate_menu(self, event, payload):
+        if event.is_channel or not (event.is_group or event.is_direct):
+            await self.deny(event)
+            return True
+        try:
+            if payload == 'as:list':
+                await self.directory(event)
+                return True
+            context, action = await self.menus.resolve(event, payload)
+            if event.is_group and context.get('group') and (context['group'] != event.group_id or context['member'] != event.raw_user_id):
+                raise PermissionError('群上下文不匹配')
+            # Every action re-resolves the clicker's own context and current eligibility.
+            if action['kind'] == 'query':
+                await self.query(event, action['resource'])
+            elif action['kind'] == 'reply':
+                await self.query(event, '', rule_id=action['rule'])
+            elif action['kind'] == 'group':
+                if await self.resolve_context(event, select=action['group']):
+                    await self.directory(event)
+                else:
+                    await self.deny(event)
+            elif action['kind'] == 'page':
+                if context['menu'] == 'candidates':
+                    await self.keyword_query(event, text=context['keyword'], page=action['page'])
+                elif context['menu'] == 'groups':
+                    await self.resolve_context(event)
+                else:
+                    await self.directory(event, page=action['page'])
+        except PermissionError:
+            await self.deny(event)
+        except (BusinessError, RuntimeError, sqlite3.Error, OSError):
+            await self.deny(event)
+        except ValueError as error:
+            await self.safe_reply(event, str(error))
+        return True
+
+    # ---------- QQ entry ----------
+
+    async def on_event(self, event):
+        content = (event.content or '').strip()
+        if content == '账户列表' or content.startswith(('账户列表 ', '账户查询 ', '账户群 ', '账户绑定 ', '账户答复 ', '账户翻页 ')):
+            try:
+                if content == '账户列表' or content.startswith('账户列表 '):
+                    page = int(content.split()[1]) - 1 if len(content.split()) > 1 else 0
+                    await self.directory(event, page=page)
+                elif content.startswith('账户查询 '):
+                    await self.query(event, content.split(maxsplit=1)[1])
+                elif content.startswith('账户翻页 '):
+                    await self.activate_menu(event, content.split(maxsplit=1)[1])
+                elif content.startswith('账户答复 '):
+                    await self.query(event, '', rule_id=content.split(maxsplit=1)[1])
+                elif content.startswith('账户群 '):
+                    if await self.resolve_context(event, select=content.split(maxsplit=1)[1]):
+                        await self.directory(event)
+                    else:
+                        await self.deny(event)
+                else:
+                    # Identity binding is owned by the authorization module now.
+                    await self.safe_reply(event, '身份绑定已改由授权模块处理：请私聊本 Bot 发送“身份绑定 申请 <群原生ID> <成员原生ID>”，由主人核实。')
+            except PermissionError:
+                await self.deny(event)
+            except BusinessError as error:
+                if error.status == 503:
+                    await self.deny(event)
+                else:
+                    await self.safe_reply(event, str(error))
+            except (ValueError, RuntimeError, sqlite3.Error, OSError):
+                await self.deny(event)
+            return
+        if not content.startswith('账户管理'):
+            try:
+                await self.keyword_query(event)
+            except (BusinessError, RuntimeError, ValueError, sqlite3.Error, OSError):
+                await self.deny(event)
+            return
+        await self.owner_command(event, content)
+
+    async def owner_command(self, event, content):
+        bot = event.appid
+        blocked = event.user_id in get_blacklist_map(bot, 'user') or event.group_id in get_blacklist_map(bot, 'group')
+        if blocked or event.user_id not in (cfg.get_bot_config(bot) or {}).get('owner_ids', []):
+            # Group delegates of ordinary Q&A have no account management.
+            await self.deny(event)
+            return
+        try:
+            if event.is_direct and not event.is_channel:
+                await self.store.put(
+                    bot, 'owners', 'observed_c2c', {'private_id': event.raw_user_id, 'authenticated_id': event.user_id, 'source': 'observed_owner_c2c'}
+                )
+            words = content.split(maxsplit=2)
+            action = words[1] if len(words) > 1 else '帮助'
+            args = words[2] if len(words) > 2 else ''
+            detail = event.is_direct and not event.is_channel
+            if action in {'待办', '重试通知'}:
+                result = (
+                    await self.tasks(bot, json.loads(args) if args else {})
+                    if action == '待办'
+                    else await self.task_action(bot, {'operation': 'retry_notification', 'id': args})
+                )
+                await self.safe_reply(event, json.dumps(result, ensure_ascii=False) if detail else '请在主人私聊或后台查看待办和通知详情')
+                return
+            if action == '迁移':
+                result = await self.migrate(bot)
+                await self.safe_reply(event, json.dumps(result, ensure_ascii=False) if detail else '迁移已处理，详情请在主人私聊或后台查看')
+                return
+            if action == '群发':
+                result = await self.group_delivery.configure(bot, json.loads(args))
+                await self.safe_reply(event, json.dumps(result, ensure_ascii=False) if detail else '群发检查已处理，逐人原因请在主人私聊或后台查看')
+                return
+            if action == '批量账户':
+                result = await self.account_batches(bot, json.loads(args))
+                await self.safe_reply(event, json.dumps(result, ensure_ascii=False) if detail else '账户批量操作已处理，详情请在主人私聊或后台查看')
+                return
+            if action in {'规则新增', '规则修改', '规则删除', '规则列表'}:
+                if action == '规则新增':
+                    result = await self.rule_management(bot, 'create', json.loads(args))
+                elif action == '规则修改':
+                    key, payload = args.split(maxsplit=1)
+                    result = await self.rule_management(bot, 'update', json.loads(payload), key)
+                elif action == '规则删除':
+                    result = await self.rule_management(bot, 'delete', key=args)
+                else:
+                    result = await self.rule_management(bot, 'list')
+                await self.safe_reply(event, json.dumps(result, ensure_ascii=False) if detail else '规则操作已完成，详情请在主人私聊或后台查看')
+                return
+            if action == '确认绑定':
+                raise BusinessError('身份绑定确认已移至授权管理：授权管理 {"operation":"binding_confirm",...}')
+            if action == '结果':
+                results = await self.store.all(bot, 'operations')
+                await self.safe_reply(event, json.dumps(results, ensure_ascii=False) if detail else '请在主人私聊或后台查看结果')
+                return
+            if action in ACCESS_COMMANDS:
+                data = json.loads(args) if args else {}
+                if not isinstance(data, dict):
+                    raise BusinessError('授权请求须为对象')
+                data['operation'] = ACCESS_COMMANDS[action]
+                if event.is_group:
+                    data.setdefault('group', event.group_id)
+                if action == '授权' and not data.get('member'):
+                    if not event.is_group or data.get('group') != event.group_id:
+                        raise BusinessError('@成员授权须使用当前群上下文；其他群请明确填写成员原生 ID')
+                    targets = [m for m in event.mentions if isinstance(m, dict) and m.get('id') and not m.get('is_you')]
+                    if len(targets) == 1:
+                        data['member'] = targets[0]['id']
+                result = await self.access_management(bot, data, actor=event.raw_user_id)
+                await self.safe_reply(event, json.dumps(result, ensure_ascii=False) if detail else '授权操作已保存，详情请在主人私聊或后台查看')
+                return
+            if action == '预览':
+                if not detail:
+                    raise BusinessError('请在主人私聊中预览账户')
+                account = await self.manage(bot, 'preview', key=args)
+                await self.safe_reply(event, self.credentials(account))
+                return
+            if action == '新增':
+                await self.manage(bot, 'create', json.loads(args))
+            elif action == '修改':
+                key, payload = args.split(maxsplit=1)
+                await self.manage(bot, 'update', json.loads(payload), key)
+            elif action == '删除':
+                await self.manage(bot, 'delete', key=args)
+            elif action == '列表':
+                accounts = await self.accounts(bot)
+                await self.safe_reply(
+                    event,
+                    '\n'.join(f'{a["id"]} {a["name"]} {"启用" if a["enabled"] else "停用"}' for a in accounts) if detail else '请在主人私聊或后台查看账户详情',
+                )
+                return
+            else:
+                await self.safe_reply(
+                    event, '账户管理 新增 <JSON> / 修改 <ID> <JSON> / 删除 <ID> / 列表 / 预览 <ID>（仅私聊）/ 迁移 / 授权 <JSON> / 恢复来源 <JSON>'
+                )
+                return
+            await self.safe_reply(event, '账户操作已保存；可在主人私聊或后台继续查看')
+        except (ValueError, BusinessError) as error:
+            await self.safe_reply(event, str(error) if isinstance(error, BusinessError) else '命令参数无效，请检查 JSON 和账户 ID')
+        except (sqlite3.Error, OSError, RuntimeError):
+            log.error(f'[{bot}] 账户共享持久化不可用')
+            await self.safe_reply(event, UNAVAILABLE)
+
+    # ---------- HTTP ----------
 
     async def http(self, request):
         # Explicit check also protects direct consumers of this registered handler.
@@ -854,12 +877,16 @@ class AccountSharing:
                 else:
                     raise BusinessError('方法不适用', 405)
                 return web.json_response({'success': True, 'data': result})
+            if parts == ['migration'] and request.method == 'POST':
+                return web.json_response({'success': True, 'data': await self.migrate(bot)})
             if parts == ['group-delivery']:
                 if request.method == 'GET':
                     result = await self.group_delivery.list(bot)
                 elif request.method == 'POST':
                     try:
                         result = await self.group_delivery.configure(bot, await request.json())
+                    except BusinessError:
+                        raise
                     except ValueError as error:
                         raise BusinessError(str(error)) from error
                 else:
@@ -878,17 +905,12 @@ class AccountSharing:
             if parts == ['operations'] and request.method == 'GET':
                 return web.json_response({'success': True, 'data': await self.store.all(bot, 'operations')})
             if parts == ['bindings']:
-                if request.method == 'GET':
-                    result = {'requests': await self.store.all(bot, 'binding_requests'), 'bindings': await self.store.all(bot, 'bindings')}
-                elif request.method == 'POST':
-                    result = await self.binding_management(bot, await request.json())
-                else:
-                    raise BusinessError('方法不适用', 405)
-                return web.json_response({'success': True, 'data': result})
+                if request.method != 'GET':
+                    raise BusinessError('身份绑定确认已移至“授权管理”页面', 410)
+                return web.json_response({'success': True, 'data': await self.access().binding_snapshot(bot)})
             if parts == ['access']:
                 if request.method == 'GET':
-                    await self.sync_access_resources(bot)
-                    result = await self.access().snapshot(bot)
+                    result = await (await self.ensure(bot)).access_snapshot(bot, CONSUMER)
                 elif request.method == 'POST':
                     result = await self.access_management(bot, await request.json())
                 else:
@@ -905,170 +927,6 @@ class AccountSharing:
             return web.json_response({'success': True, 'data': result}, status=201 if operation == 'create' else 200)
         except (BusinessError, json.JSONDecodeError) as error:
             return web.json_response({'success': False, 'error': str(error)}, status=getattr(error, 'status', 422))
-
         except (sqlite3.Error, OSError, RuntimeError):
             log.error(f'[{bot}] 账户共享持久化不可用')
             return web.json_response({'success': False, 'error': UNAVAILABLE}, status=503)
-
-    @staticmethod
-    def credentials(account):
-        return f'{account["name"]}\n账号：{account["login"]}\n密码：{account["password"]}\n{account["description"]}\n{account["url"]}'
-
-    async def on_event(self, event):
-        content = (event.content or '').strip()
-        try:
-            await self.identities.observe_private(event)
-        except (ValueError, RuntimeError, sqlite3.Error, OSError):
-            self.identities.identity_healthy = False
-            entry = content == '账户列表' or content.startswith(('账户管理', '账户列表 ', '账户查询 ', '账户群 ', '账户绑定 ', '账户答复 ', '账户翻页 '))
-            if not entry:
-                module = self.qa_provider()
-                try:
-                    entry = bool(module and module.active and await module.match(event.appid, FUNCTION, content))
-                except (RuntimeError, ValueError, sqlite3.Error, OSError):
-                    return
-            if entry:
-                if event.user_id in (cfg.get_bot_config(event.appid) or {}).get('owner_ids', []):
-                    await event.reply(UNAVAILABLE)
-                else:
-                    await self.deny(event)
-            return
-        if content == '账户列表' or content.startswith(('账户列表 ', '账户查询 ', '账户群 ', '账户绑定 ', '账户答复 ', '账户翻页 ')):
-            try:
-                if content == '账户列表' or content.startswith('账户列表 '):
-                    page = int(content.split()[1]) - 1 if len(content.split()) > 1 else 0
-                    await self.directory(event, page=page)
-                elif content.startswith('账户查询 '):
-                    await self.query(event, content.split(maxsplit=1)[1])
-                elif content.startswith('账户翻页 '):
-                    await self.activate_menu(event, content.split(maxsplit=1)[1])
-                elif content.startswith('账户答复 '):
-                    await self.query(event, '', rule_id=content.split(maxsplit=1)[1])
-                elif content.startswith('账户群 '):
-                    if await self.resolve_context(event, select=content.split(maxsplit=1)[1]):
-                        await self.directory(event)
-                    else:
-                        await self.deny(event)
-                else:
-                    if not event.is_direct or event.is_channel or not await self.framework_event_allowed(event):
-                        await self.deny(event)
-                        return
-                    words = content.split()
-                    if len(words) != 3:
-                        raise BusinessError('请使用：账户绑定 <群原生ID> <成员原生OpenID>')
-                    request = await self.identities.request(event.appid, event.raw_user_id, words[1], words[2])
-                    await event.reply(f'绑定申请 {request["id"]} 已保存，等待主人核对群成员与本次私聊身份。申请本身不会授予资格。')
-            except PermissionError:
-                await self.deny(event)
-            except BusinessError as error:
-                if error.status == 503:
-                    await self.deny(event)
-                else:
-                    await event.reply(str(error))
-            except (ValueError, RuntimeError, sqlite3.Error, OSError):
-                await self.deny(event)
-            return
-        if not (event.content or '').startswith('账户管理'):
-            try:
-                await self.keyword_query(event)
-            except (BusinessError, RuntimeError, ValueError, sqlite3.Error, OSError):
-                await self.deny(event)
-            return
-        bot = event.appid
-        if not await self.framework_event_allowed(event) or event.user_id not in (cfg.get_bot_config(bot) or {}).get('owner_ids', []):
-            await self.deny(event)
-            return
-        try:
-            if event.is_direct and not event.is_channel:
-                await self.store.put(
-                    bot, 'owners', 'observed_c2c', {'private_id': event.raw_user_id, 'authenticated_id': event.user_id, 'source': 'observed_owner_c2c'}
-                )
-            words = event.content.split(maxsplit=2)
-            action = words[1] if len(words) > 1 else '帮助'
-            args = words[2] if len(words) > 2 else ''
-            if action in {'待办', '重试通知'}:
-                result = (
-                    await self.tasks(bot, json.loads(args) if args else {})
-                    if action == '待办'
-                    else await self.task_action(bot, {'operation': 'retry_notification', 'id': args})
-                )
-                await event.reply(json.dumps(result, ensure_ascii=False) if event.is_direct else '请在主人私聊或后台查看待办和通知详情')
-                return
-            if action == '群发':
-                result = await self.group_delivery.configure(bot, json.loads(args))
-                await event.reply(json.dumps(result, ensure_ascii=False) if event.is_direct else '群发检查已处理，逐人原因请在主人私聊或后台查看')
-                return
-            if action == '批量账户':
-                result = await self.account_batches(bot, json.loads(args))
-                await event.reply(json.dumps(result, ensure_ascii=False) if event.is_direct else '账户批量操作已处理，详情请在主人私聊或后台查看')
-                return
-            if action in {'规则新增', '规则修改', '规则删除', '规则列表'}:
-                if action == '规则新增':
-                    result = await self.rule_management(bot, 'create', json.loads(args))
-                elif action == '规则修改':
-                    key, payload = args.split(maxsplit=1)
-                    result = await self.rule_management(bot, 'update', json.loads(payload), key)
-                elif action == '规则删除':
-                    result = await self.rule_management(bot, 'delete', key=args)
-                else:
-                    result = await self.rule_management(bot, 'list')
-                await event.reply(json.dumps(result, ensure_ascii=False) if event.is_direct else '规则操作已完成，详情请在主人私聊或后台查看')
-                return
-            if action == '确认绑定':
-                data = json.loads(args)
-                if isinstance(data, dict):
-                    data.setdefault('operation', 'confirm')
-                result = await self.binding_management(bot, data, actor=event.raw_user_id)
-                await event.reply('绑定已确认，可继续私聊查询' if event.is_group else json.dumps(result, ensure_ascii=False))
-                return
-            if action == '结果':
-                results = await self.store.all(bot, 'operations')
-                await event.reply(json.dumps(results, ensure_ascii=False) if event.is_direct else '请在主人私聊或后台查看结果')
-                return
-            if action in ACCESS_COMMANDS:
-                data = json.loads(args) if args else {}
-                if not isinstance(data, dict):
-                    raise BusinessError('授权请求须为对象')
-                data['operation'] = ACCESS_COMMANDS[action]
-                if event.is_group:
-                    data.setdefault('group', event.group_id)
-                if action == '授权' and not data.get('member'):
-                    if not event.is_group or data.get('group') != event.group_id:
-                        raise BusinessError('@成员授权须使用当前群上下文；其他群请明确填写身份类型与成员标识')
-                    targets = [m for m in event.mentions if isinstance(m, dict) and m.get('id') and not m.get('is_you')]
-                    if len(targets) == 1:
-                        data['member'] = targets[0]['id']
-                        data['identity_type'] = 'group_member_openid'
-                result = await self.access_management(bot, data, actor=event.raw_user_id)
-                await event.reply(json.dumps(result, ensure_ascii=False) if event.is_direct else '授权操作已保存，详情请在主人私聊或后台查看')
-                return
-            if action == '预览':
-                if not event.is_direct or event.is_channel:
-                    raise BusinessError('请在主人私聊中预览账户')
-                account = await self.manage(bot, 'preview', key=args)
-                await event.reply(self.credentials(account))
-                return
-            if action == '新增':
-                await self.manage(bot, 'create', json.loads(args))
-            elif action == '修改':
-                key, payload = args.split(maxsplit=1)
-                await self.manage(bot, 'update', json.loads(payload), key)
-            elif action == '删除':
-                await self.manage(bot, 'delete', key=args)
-            elif action == '列表':
-                accounts = await self.accounts(bot)
-                await event.reply(
-                    '\n'.join(f'{a["id"]} {a["name"]} {"启用" if a["enabled"] else "停用"}' for a in accounts)
-                    if event.is_direct
-                    else '请在主人私聊或后台查看账户详情'
-                )
-                return
-            else:
-                await event.reply('账户管理 新增 <JSON> / 修改 <ID> <JSON> / 删除 <ID> / 列表 / 预览 <ID>（仅私聊）')
-                return
-            await event.reply('账户操作已保存；可在主人私聊或后台继续查看')
-        except (ValueError, BusinessError) as error:
-            await event.reply(str(error) if isinstance(error, BusinessError) else '命令参数无效，请检查 JSON 和账户 ID')
-        except (sqlite3.Error, OSError, RuntimeError):
-            log.error(f'[{bot}] 账户共享持久化不可用')
-            await event.reply(UNAVAILABLE)
