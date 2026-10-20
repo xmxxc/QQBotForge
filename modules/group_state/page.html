@@ -1,0 +1,31 @@
+<section style="padding:1.5rem;max-width:70rem;margin:auto;font:16px system-ui;color:var(--text-primary,inherit)">
+<h2>群状态 · 已知群</h2>
+<p>这里只展示当前 Bot 已观察或由主人刷新过的群，不代表平台全部群。历史资料、核验状态与错误分别显示；查询失败不表示退群。</p>
+<label>Bot <select id="gs-bot"></select></label>
+<button id="gs-load">查看已知群</button>
+<p><label>群原生标识 <input id="gs-group" maxlength="256"></label> <button id="gs-refresh">刷新 Bot 在群状态</button></p>
+<p>平台成员名册与角色变化的完整性尚需独立核验。普通成员无此页面管理权限。</p>
+<p id="gs-status" role="status"></p><pre id="gs-output" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
+<script>
+(()=>{
+ const bot=document.getElementById('gs-bot'), status=document.getElementById('gs-status'), output=document.getElementById('gs-output');
+ async function run(refresh=false){
+  status.textContent='正在读取…';
+  try {
+   const response=await fetch('/api/ext/group-state/'+(refresh?'refresh':'')+'?bot='+encodeURIComponent(bot.value),{
+    method:refresh?'POST':'GET',credentials:'same-origin',headers:refresh?{'Content-Type':'application/json'}:{},
+    ...(refresh?{body:JSON.stringify({group:document.getElementById('gs-group').value.trim()})}:{})});
+   const data=await response.json();
+   if(!response.ok||!data.success) throw Error(data.error||'读取失败');
+   output.textContent=JSON.stringify(data.data,null,2);status.textContent='已更新：请结合 reliable、status 和 reason 查看可信程度';
+  }catch(error){status.textContent=error.message;output.textContent='';}
+ }
+ document.getElementById('gs-load').onclick=()=>run();document.getElementById('gs-refresh').onclick=()=>run(true);
+ fetch('/api/bots',{credentials:'same-origin'}).then(r=>r.json()).then(data=>{
+  const rows=data.data?.bots||data.bots||[];
+  for(const row of rows){const option=document.createElement('option');option.value=row.appid;option.textContent=(row.name||row.appid)+' ('+row.appid+')';bot.append(option);}
+  if(bot.options.length)run();else status.textContent='请先配置 Bot';
+ }).catch(()=>{status.textContent='无法读取 Bot 列表，请检查登录状态';});
+})();
+</script>
+</section>
