@@ -1,4 +1,4 @@
-"""SQLite records bundled with the authorization extension and shared by consumers."""
+"""Bundled SQLite v1 records; independent of other extension installations."""
 
 import asyncio
 import json

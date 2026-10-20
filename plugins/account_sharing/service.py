@@ -12,7 +12,7 @@ from aiohttp import web
 from core.base.config import cfg
 from core.base.logger import PLUGIN, get_logger
 from core.plugin._blacklist import get_blacklist_map
-from modules.access_control.storage import ExtensionStore
+from .storage import ExtensionStore
 
 from .group_delivery import GroupDelivery
 from .identities import IdentityBindings

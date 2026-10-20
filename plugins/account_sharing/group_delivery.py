@@ -4,7 +4,7 @@ import asyncio
 import copy
 from urllib.parse import quote
 
-from modules.access_control.policy import identifier, identity_key
+from .validation import identifier, identity_key
 
 
 class GroupDelivery:
