@@ -112,59 +112,64 @@ class GroupState:
             group.update(version=group['version'] + 1, reliable=False, status='pending', reason='refreshing')
             state['version'] += 1
             version = group['version']
-            await self._save(bot, state)
-            sender = self.sender_provider(bot)
-            data, error, reason = None, None, ''
-            if sender is None or not hasattr(sender, 'get_group_bot_state'):
-                reason = 'unsupported'
-            else:
-                try:
-                    result = await sender.get_group_bot_state(native, return_error=True)
-                    if isinstance(result, tuple) and len(result) == 2:
-                        data, error = result
-                    else:
-                        reason = 'response_unknown'
-                except Exception:
-                    reason = 'query_failed'
-            if not self.active:
-                raise RuntimeError('群状态模块已卸载')
-            if isinstance(error, dict):
-                reason = 'permission_denied' if str(error.get('code')) == '11253' else 'query_failed'
-            valid = (not reason and error is None and isinstance(data, dict)
-                     and data.get('member_role') in {'owner', 'admin', 'member'}
-                     and isinstance(data.get('recv_msg_setting'), str) and bool(data['recv_msg_setting'])
-                     and isinstance(data.get('allow_proactive_msg'), bool))
-            async with self.write_locks.setdefault(bot, asyncio.Lock()):
+            failure_reason = 'persistence_failed'
+            try:
+                await self._save(bot, state)
+                failure_reason = 'query_failed'
+                sender = self.sender_provider(bot)
+                data, error, reason = None, None, ''
+                if sender is None or not hasattr(sender, 'get_group_bot_state'):
+                    reason = 'unsupported'
+                else:
+                    try:
+                        result = await sender.get_group_bot_state(native, return_error=True)
+                        if isinstance(result, tuple) and len(result) == 2:
+                            data, error = result
+                        else:
+                            reason = 'response_unknown'
+                    except Exception:
+                        reason = 'query_failed'
                 if not self.active:
                     raise RuntimeError('群状态模块已卸载')
-                if group['version'] != version:
-                    return copy.deepcopy({**group, 'reliable': False, 'reason': 'state_changed'})
-                # Commit a detached candidate; readers keep seeing the pending fact.
-                candidate = copy.deepcopy(state)
-                candidate['version'] += 1
-                updated = candidate['groups'][native]
-                updated['version'] += 1
-                updated.update(checked_at=self.clock(), reliable=bool(valid), status='verified' if valid else 'historical',
-                               reason='' if valid else reason or 'response_unknown')
-                if valid and isinstance(data, dict):
-                    updated.update(source='platform_bot_state', bot_state={
-                        'member_role': data['member_role'], 'recv_msg_setting': data['recv_msg_setting'],
-                        'allow_proactive_msg': data['allow_proactive_msg'], 'in_group': True,
-                    })
-                try:
+                if isinstance(error, dict):
+                    reason = 'permission_denied' if str(error.get('code')) == '11253' else 'query_failed'
+                valid = (not reason and error is None and isinstance(data, dict)
+                         and isinstance(data.get('member_role'), str)
+                         and data.get('member_role') in {'owner', 'admin', 'member'}
+                         and isinstance(data.get('recv_msg_setting'), str) and bool(data['recv_msg_setting'])
+                         and isinstance(data.get('allow_proactive_msg'), bool))
+                async with self.write_locks.setdefault(bot, asyncio.Lock()):
+                    if not self.active:
+                        raise RuntimeError('群状态模块已卸载')
+                    if group['version'] != version:
+                        return copy.deepcopy({**group, 'reliable': False, 'reason': 'state_changed'})
+                    # Commit a detached candidate; readers keep seeing the pending fact.
+                    candidate = copy.deepcopy(state)
+                    candidate['version'] += 1
+                    updated = candidate['groups'][native]
+                    updated['version'] += 1
+                    updated.update(checked_at=self.clock(), reliable=bool(valid), status='verified' if valid else 'historical',
+                                   reason='' if valid else reason or 'response_unknown')
+                    if valid and isinstance(data, dict):
+                        updated.update(source='platform_bot_state', bot_state={
+                            'member_role': data['member_role'], 'recv_msg_setting': data['recv_msg_setting'],
+                            'allow_proactive_msg': data['allow_proactive_msg'], 'in_group': True,
+                        })
+                    failure_reason = 'persistence_failed'
                     await self.store.put(bot, 'group_state', 'state', candidate)
-                except BaseException:
-                    if group['version'] == version:
-                        group.update(version=version + 1, reliable=False, status='historical', reason='persistence_failed')
-                        state['version'] += 1
-                    raise
-                if not self.active:
-                    raise RuntimeError('群状态模块已卸载')
-                if group['version'] != version:
-                    return copy.deepcopy({**group, 'reliable': False, 'reason': 'state_changed'})
-                group.update(updated)
-                state['version'] += 1
-                return copy.deepcopy(group)
+                    if not self.active:
+                        raise RuntimeError('群状态模块已卸载')
+                    if group['version'] != version:
+                        return copy.deepcopy({**group, 'reliable': False, 'reason': 'state_changed'})
+                    group.update(updated)
+                    state['version'] += 1
+                    return copy.deepcopy(group)
+            except BaseException as error:
+                if group['version'] == version:
+                    reason = 'refresh_cancelled' if isinstance(error, asyncio.CancelledError) else failure_reason
+                    group.update(version=version + 1, reliable=False, status='historical', reason=reason)
+                    state['version'] += 1
+                raise
 
     async def http(self, request):
         from web.auth import authorize_request

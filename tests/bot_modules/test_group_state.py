@@ -5,6 +5,7 @@ import importlib
 import json
 import shutil
 import sqlite3
+import subprocess
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -17,6 +18,15 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from core.base.config import cfg
 from core.message.event import Event
+
+
+def test_group_state_page_request_ordering():
+    node = shutil.which('node')
+    if node is None:
+        pytest.skip('页面脚本回归需要 Node.js；不使用额外 npm 依赖')
+    result = subprocess.run([node, '--test', str(Path(__file__).with_name('test_group_state_page.cjs'))],
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.fixture
@@ -242,6 +252,83 @@ async def test_pending_commit_does_not_publish_or_overwrite_new_observations(gro
     restored = (await (await host.api()).json())['data']
     assert [group['group'] for group in restored['groups']] == [group['group'] for group in final['groups']]
     assert all(not group['reliable'] for group in restored['groups'])
+
+
+async def test_initial_save_failure_ends_refresh_and_allows_retry(group_host):
+    host = group_host
+    previous = (await (await host.api('POST', 'refresh', body={'group': 'group-a'})).json())['data']
+    database = host.modules.get_context('group_state').get_data_path('group-state.db')
+    with sqlite3.connect(database) as connection:
+        connection.execute("""CREATE TRIGGER reject_all BEFORE INSERT ON extension_records
+            BEGIN SELECT RAISE(ABORT, 'fake disk failure'); END""")
+    try:
+        assert (await host.api('POST', 'refresh', body={'group': 'group-a'})).status == 503
+        failed = (await (await host.api()).json())['data']['groups'][0]
+        assert failed['status'] == 'historical' and failed['reason'] == 'persistence_failed'
+        assert not failed['reliable'] and failed['bot_state'] == previous['bot_state']
+        assert failed['version'] > previous['version']
+        assert (await (await host.api(bot='bot-b')).json())['data']['groups'] == []
+    finally:
+        with sqlite3.connect(database) as connection:
+            connection.execute('DROP TRIGGER reject_all')
+    retried = (await (await host.api('POST', 'refresh', body={'group': 'group-a'})).json())['data']
+    assert retried['reliable'] and retried['version'] > failed['version']
+
+
+@pytest.mark.parametrize('observed_group', ['', 'group-a', 'group-b'])
+async def test_cancelled_query_ends_refresh_without_overwriting_new_facts(group_host, observed_group):
+    host = group_host
+    previous = (await (await host.api('POST', 'refresh', body={'group': 'group-a'})).json())['data']
+    entered = asyncio.Event()
+
+    async def wait_for_cancellation():
+        entered.set()
+        await asyncio.Event().wait()
+
+    host.sender.after_query = wait_for_cancellation
+    pending = asyncio.create_task(host.state.refresh('bot-a', 'group-a'))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        during = await host.state.snapshot('bot-a')
+        if observed_group:
+            await host.event('普通消息', user='member-a', group=observed_group)
+    finally:
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+    ended = await host.state.snapshot('bot-a')
+    fact = ended['groups'][0]
+    assert not fact['reliable'] and fact['status'] == 'historical'
+    assert fact['bot_state'] == previous['bot_state']
+    assert ended['version'] > during['version']
+    if observed_group == 'group-a':
+        assert fact['reason'] == 'observed_event_requires_refresh' and fact['source'] == 'native_event'
+    else:
+        assert fact['reason'] == 'refresh_cancelled'
+    assert [group['group'] for group in ended['groups']] == (['group-a', 'group-b'] if observed_group == 'group-b' else ['group-a'])
+    assert (await host.state.snapshot('bot-b'))['groups'] == []
+    host.sender.after_query = None
+    assert (await host.state.refresh('bot-a', 'group-a'))['reliable']
+
+
+@pytest.mark.parametrize('role', [[], {}])
+@pytest.mark.parametrize('entry', ['http', 'qq'])
+async def test_malformed_platform_role_is_a_historical_error(group_host, role, entry):
+    host = group_host
+    previous = (await (await host.api('POST', 'refresh', body={'group': 'group-a'})).json())['data']
+    host.sender.response = ({'member_role': role, 'recv_msg_setting': 'all', 'allow_proactive_msg': True}, None)
+    if entry == 'http':
+        response = await host.api('POST', 'refresh', body={'group': 'group-a'})
+        assert response.status == 200
+        result = (await response.json())['data']
+    else:
+        host.sender.messages.clear()
+        await host.event('群状态 刷新 group-a')
+        assert len(host.sender.messages) == 1
+        result = json.loads(host.sender.messages[-1][2].split('\n', 1)[1])
+    assert not result['reliable'] and result['status'] == 'historical'
+    assert result['reason'] == 'response_unknown' and result['bot_state'] == previous['bot_state']
+    assert (await host.state.snapshot('bot-a'))['groups'][0] == result
 
 
 async def test_reload_during_final_commit_rejects_old_http_result(group_host, monkeypatch):
