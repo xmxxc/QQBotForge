@@ -1,5 +1,11 @@
 ## Agent skills
 
+### Branches
+
+`main` maintains the reusable framework; `personal` adds self-use extensions.
+Before choosing a worktree or branch, committing, or opening a PR, read
+the branch workflow in `docs/agents/issue-tracker.md`.
+
 ### Issue tracker
 
 Issues and specs use GitHub Issues in `xmxxc/QQBotForge`.

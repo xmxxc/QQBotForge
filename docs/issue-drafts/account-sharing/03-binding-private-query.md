@@ -1,3 +1,5 @@
+> 历史票稿：2026-10-20 已由[三模块实施清单](../../plans/bot-modules-tickets.md)中的新票替代。下文保留旧验收与实现背景，不作为当前执行清单。
+
 # 03：授权后绑定身份并完成成员私聊查询
 
 GitHub 实施票：[#5](https://github.com/xmxxc/QQBotForge/issues/5)，父规格 [#2](https://github.com/xmxxc/QQBotForge/issues/2)。
