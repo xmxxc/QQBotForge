@@ -82,6 +82,8 @@ class GroupLifecycleSubscription:
         self.timeout = timeout
         self._manager = manager
         self._callback = callback
+        self._on_prepare = None
+        self._on_result = None
         self._closed = asyncio.Event()
         self._close_status = None
         self._history: deque[GroupLifecycleResult] = deque(maxlen=100)
@@ -151,6 +153,8 @@ class GroupLifecycleSubscription:
                     task.add_done_callback(release)
         result = GroupLifecycleResult(event, self.subscription_id, self.owner, status, error, started, time.monotonic())
         self._history.append(result)
+        if self._on_result is not None:
+            self._on_result(result)
         return result
 
 
@@ -229,6 +233,9 @@ class GroupLifecycleManager:
             event.connection_context,
         )
         subscribers = tuple(s for s in self._subscriptions.values() if s.appid is None or s.appid == appid)
+        for subscriber in subscribers:
+            if subscriber._on_prepare is not None:
+                subscriber._on_prepare(notification)
         completion = asyncio.get_running_loop().create_future()
         event.group_lifecycle_delivery = GroupLifecycleDelivery(notification, completion)
         # 排空任务已等待前序事件，入口只需等待本次完成凭据。
