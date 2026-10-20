@@ -5,6 +5,8 @@ import copy
 import json
 import sqlite3
 import time
+from dataclasses import asdict
+from pathlib import Path
 from uuid import uuid4
 
 from aiohttp import web
@@ -12,6 +14,8 @@ from aiohttp import web
 from core.base.config import cfg
 from core.plugin._blacklist import get_blacklist_map
 
+from .lifecycle import LIFECYCLE, event_time
+from .notifications import Notifications
 from .reader import ROLES, MembershipReader
 from .reader import native as valid_native
 from .storage import ExtensionStore
@@ -57,6 +61,10 @@ class GroupState:
 
     def close(self):
         self.active = False
+        if hasattr(self, 'notifications'):
+            self.notifications.close()
+            self.recovery.cancel()
+            self.connection_subscription.cancel()
         self.store.close()
 
     async def _state(self, bot):
@@ -74,7 +82,7 @@ class GroupState:
                     group.setdefault('roster', {'complete': False, 'reason': 'not_verified'})
                     group['roster'].update(complete=False, reason='process_restart')
                     for member in group['members'].values():
-                        member.update(reliable=False, status='historical', reason='process_restart')
+                        member.update(reliable=False, status='left' if member.get('status') == 'left' else 'historical', reason='process_restart')
                 state['version'] += 1
                 self.states[bot] = state
         return self.states[bot]
@@ -122,12 +130,19 @@ class GroupState:
             'bot_state_query': 'framework_supported_permission_required',
             'member_roster': 'paginated_permission_required',
             'role_events': 'not_supported',
+            'recovery': 'qq_official_websocket_v1',
+            'changes': 'completion_v1',
         }
 
     def _public_group(self, bot, group):
         result = copy.deepcopy(group)
         if result['roster'].get('complete') and result['roster'].get('version') != result['version']:
             result['roster'].update(complete=False, reason='state_changed')
+        if not self._ready(bot):
+            result.update(reliable=False, continuity_reason='recovery_pending')
+            result['roster'].update(complete=False, reason='recovery_pending')
+            for member in result['members'].values():
+                member.update(reliable=False, continuity_reason='recovery_pending')
         if self.pending_writes.get(bot, 0):
             result.update(reliable=False, reason='persistence_pending')
             result['roster'].update(complete=False, reason='persistence_pending')
@@ -146,6 +161,7 @@ class GroupState:
                 'complete': False,
                 'groups': [self._public_group(bot, group) for group in state['groups'].values()],
                 'capabilities': self.capabilities(),
+                'recovery': {'ready': self._ready(bot), 'phase': self.recovery.get_status(bot).phase, 'reason': self.recovery.get_status(bot).reason},
             }
         )
 
@@ -155,6 +171,9 @@ class GroupState:
             return
         state = await self._state(event.appid)
         group = self._group(state, native)
+        observed_member = event.get('d/member_openid') or event.get('d/author/member_openid')
+        if valid_native(observed_member) and observed_member in group['members']:
+            return
         group.update(
             version=group['version'] + 1,
             source='native_event',
@@ -171,6 +190,7 @@ class GroupState:
             record.update(reliable=False, status='observed', reason='requires_verification', source='native_event', observed_at=self.clock())
         state['version'] += 1
         await self._save(event.appid, state)
+        await self._notify(event.appid, group, 'native_observation')
 
     async def refresh(self, bot, native):
         identifier(native)
@@ -227,6 +247,7 @@ class GroupState:
                     },
                 )
             await self._save(bot, state)
+            await self._notify(bot, group, 'bot_state_refreshed')
             return self._public_group(bot, group)
 
     @staticmethod
@@ -258,22 +279,30 @@ class GroupState:
             if not changed:
                 for record in report['members']:
                     reliable = record['member_role'] is not None
-                    group['members'][record['member']] = {
-                        **record,
-                        'reliable': reliable,
-                        'status': 'present' if reliable else 'pending',
-                        'reason': '' if reliable else 'role_missing',
-                        'source': 'platform_roster',
-                        'checked_at': checked,
-                    }
+                    self._merge_member(
+                        group,
+                        {
+                            **record,
+                            'reliable': reliable,
+                            'status': 'present' if reliable else 'pending',
+                            'reason': '' if reliable else 'role_missing',
+                            'source': 'platform_roster',
+                            'checked_at': checked,
+                        },
+                    )
             self._invalidate(state, group, report['reason'])
             report.update(
                 id=uuid4().hex, generation=self.generation, version=group['version'], group=native_group, source='platform_roster', checked_at=checked
             )
+            if not changed and any(not group['members'][r['member']]['reliable'] for r in report['members']):
+                report.update(complete=False, reason='stale_membership')
             group['roster'] = copy.deepcopy(report)
             await self._save(bot, state)
+            await self._notify(bot, group, 'roster_refreshed')
             if group['version'] != report['version']:
                 report.update(complete=False, reason='state_changed')
+            if not self._ready(bot):
+                report.update(complete=False, continuity_reason='recovery_pending')
             return copy.deepcopy(report)
 
     async def verify_member(self, bot, native_group, member):
@@ -284,6 +313,7 @@ class GroupState:
         self._invalidate(state, group, 'individual_verification')
         version = group['version']
         record = group['members'].setdefault(member, {'member': member, 'member_role': None, 'bot': None})
+        previous = copy.deepcopy(record)
         record.update(reliable=False, status='pending', reason='verifying')
         await self._save(bot, state)
         result = await self.reader.member(bot, native_group, member)
@@ -291,6 +321,7 @@ class GroupState:
             raise RuntimeError('群状态模块已卸载')
         if group['version'] != version:
             return {**copy.deepcopy(record), 'state': 'unknown', 'reliable': False, 'reason': 'state_changed'}
+        record = {**record}
         record.update(
             result,
             source='platform_member',
@@ -298,13 +329,12 @@ class GroupState:
             reliable=result['state'] == 'present',
             status='present' if result['state'] == 'present' else 'pending',
         )
+        record = self._merge_member(group, record, previous=previous)
         self._invalidate(state, group, 'individual_verification')
         version = group['version']
         await self._save(bot, state)
-        result = {**copy.deepcopy(record), 'group': native_group, 'version': version, 'generation': self.generation}
-        if group['version'] != version or self.pending_writes.get(bot, 0):
-            result.update(reliable=False, state='unknown', reason='state_changed')
-        return result
+        await self._notify(bot, group, 'member_verified')
+        return self._member_result(bot, group, record, version)
 
     async def confirm_member(self, bot, native_group, member, *, evidence, member_role=None):
         identifier(native_group)
@@ -316,6 +346,7 @@ class GroupState:
         state = await self._state(bot)
         group = self._group(state, native_group)
         record = group['members'].setdefault(member, {'member': member, 'bot': None})
+        record = {**record}
         record.update(
             member_role=member_role,
             reliable=True,
@@ -325,13 +356,21 @@ class GroupState:
             checked_at=self.clock(),
             evidence=evidence,
             state='present',
+            confirmation_generation=self.generation,
         )
+        record = self._merge_member(group, record, manual=True)
         self._invalidate(state, group, 'individual_verification')
         version = group['version']
         await self._save(bot, state)
-        result = {**copy.deepcopy(record), 'group': native_group, 'version': version, 'generation': self.generation}
+        await self._notify(bot, group, 'member_confirmed')
+        return self._member_result(bot, group, record, version)
+
+    def _member_result(self, bot, group, record, version):
+        result = {**copy.deepcopy(record), 'group': group['group'], 'version': version, 'generation': self.generation}
         if group['version'] != version or self.pending_writes.get(bot, 0):
             result.update(reliable=False, state='unknown', reason='state_changed')
+        if not self._ready(bot):
+            result.update(reliable=False, continuity_reason='recovery_pending')
         return result
 
     async def members(self, bot, native_group, *, cursor='', limit=30, version=None, generation=None):
@@ -356,6 +395,191 @@ class GroupState:
                 'next_cursor': str(offset + limit) if offset + limit < len(rows) else '',
             }
         )
+
+    def connect(self, ctx):
+        if ctx.recovery_api_version != 1 or ctx.group_lifecycle_api_version != 1:
+            raise RuntimeError('群状态需要恢复与群生命周期 v1 契约')
+        self.notifications = Notifications(str(Path(ctx.module_dir).parent.resolve() / Path(ctx.module_dir).name))
+        self.recovery = ctx.subscribe_recovery_events(self._lifecycle, event_types=LIFECYCLE)
+        self.connection_subscription = ctx.subscribe_connection_status(self._connection_change, replay_current=False)
+        self.rebuild_locks = {}
+
+    def subscribe(self, callback, *, timeout=5.0):
+        if not self.active:
+            raise RuntimeError('群状态已卸载')
+        return self.notifications.subscribe(callback, timeout=timeout)
+
+    def _ready(self, bot):
+        status = self.recovery.get_status(bot)
+        webhook = self.recovery.get_status(bot, transport='webhook')
+        return (
+            self.active and status.ready and not status.pending and webhook.context is None and not self.notifications.busy(bot) and bot not in self.failed_bots
+        )
+
+    async def fact(self, bot, group, member=None):
+        state = await self._state(bot)
+        record = state['groups'].get(group)
+        public = self._public_group(bot, record) if record else None
+        row = public['members'].get(member) if public and member else None
+        status = self.recovery.get_status(bot)
+        return {
+            'bot': bot,
+            'group': group,
+            'member_id': member,
+            'generation': self.generation,
+            'version': record['version'] if record else None,
+            'recovery_revision': status.revision,
+            'writer_revision': self.notifications.checkpoint(bot),
+            'usable': bool(
+                public
+                and self._ready(bot)
+                and not self.pending_writes.get(bot)
+                and (row['reliable'] if member and row else public['reliable'] if not member else False)
+            ),
+            'member': row,
+            'group_state': public,
+        }
+
+    def fact_current(self, proof):
+        if not isinstance(proof, dict) or proof.get('generation') != self.generation or not proof.get('usable'):
+            return False
+        bot = proof.get('bot')
+        if not self._ready(bot) or self.pending_writes.get(bot):
+            return False
+        state = self.states.get(bot)
+        group = state['groups'].get(proof.get('group')) if state else None
+        return bool(
+            group
+            and group['version'] == proof.get('version')
+            and self.recovery.get_status(bot).revision == proof.get('recovery_revision')
+            and self.notifications.checkpoint(bot) == proof.get('writer_revision')
+        )
+
+    async def _notify(self, bot, group, reason, *, event=None):
+        change = {'bot': bot, 'group': group['group'], 'generation': self.generation, 'version': group['version'], 'reason': reason}
+        if event is not None:
+            change['native'] = asdict(event)
+        try:
+            await self.notifications.publish(change)
+        except BaseException:
+            self.recovery.invalidate(bot, reason='consumer_failed')
+            raise
+
+    async def _connection_change(self, status):
+        # Current recovery status gates proofs synchronously, before this async
+        # notification. Do not mutate historical presence on a transport failure.
+        state = self.states.get(status.appid)
+        if state and self.active:
+            for group in tuple(state['groups'].values()):
+                await self._notify(status.appid, group, 'connection:' + status.phase)
+
+    async def _lifecycle(self, delivery):
+        event = delivery.event
+        bot = event.appid
+        state = await self._state(bot)
+        if not valid_native(event.group_openid):
+            self.recovery.invalidate(bot, reason='missing_native_group')
+            for group in state['groups'].values():
+                self._suspend(state, group, 'missing_native_group')
+            await self._save(bot, state)
+            for group in state['groups'].values():
+                await self._notify(bot, group, 'missing_native_group', event=event)
+            return
+        group = self._group(state, event.group_openid)
+        signature = [event.event_type, event.member_openid, event.op_member_openid, event.timestamp]
+        events = group.setdefault('events', {})
+        if event.event_id and event.event_id in events:
+            if events[event.event_id] == signature:
+                delivery.acknowledge()
+                return
+            reason = 'conflicting_duplicate'
+        else:
+            reason = ''
+        timestamp = event_time(event.timestamp)
+        is_member = event.event_type in {'GROUP_MEMBER_ADD', 'GROUP_MEMBER_REMOVE'}
+        target = (
+            group['members'].setdefault(event.member_openid, {'member': event.member_openid, 'member_role': None, 'bot': None, 'cycle': uuid4().hex})
+            if is_member and valid_native(event.member_openid)
+            else group
+        )
+        previous = target.get('last_transition', {})
+        if not valid_native(event.event_id) or timestamp is None or (is_member and not valid_native(event.member_openid)):
+            reason = reason or 'incomplete_event'
+        elif previous.get('time') is not None and timestamp <= previous['time']:
+            reason = reason or ('same_time_conflict' if timestamp == previous['time'] else 'late_event')
+        self._suspend(state, group, reason or 'lifecycle_changed')
+        metadata = asdict(event)
+        group.update(source='native_lifecycle', observed_at=self.clock(), event_type=event.event_type, last_native=metadata)
+        if reason:
+            # Ambiguous events never revive an earlier presence or cycle.
+            target.update(reliable=False, reason=reason)
+            self.recovery.invalidate(bot, reason=reason)
+        else:
+            added = event.event_type in {'GROUP_MEMBER_ADD', 'GROUP_ADD_ROBOT'}
+            if is_member:
+                if added:
+                    target.update(cycle=uuid4().hex, status='pending', state='unknown', reliable=False, reason='join_requires_verification')
+                else:
+                    target.update(status='left', state='left', reliable=True, reason='', left_at=timestamp)
+                target.update(source='native_lifecycle', last_transition={'time': timestamp, 'event_id': event.event_id, 'type': event.event_type})
+            else:
+                group.update(status='pending' if added else 'left', reliable=False, reason='bot_added_requires_baseline' if added else 'bot_removed')
+                group['bot_state'] = {**(group.get('bot_state') or {}), 'in_group': added}
+                group['last_transition'] = {'time': timestamp, 'event_id': event.event_id, 'type': event.event_type}
+                self.recovery.invalidate(bot, reason=group['reason'])
+        if event.event_id:
+            events[event.event_id] = signature
+            while len(events) > 256:
+                del events[next(iter(events))]
+        await self._save(bot, state)
+        await self._notify(bot, group, reason or event.event_type, event=event)
+        if not reason:
+            delivery.acknowledge()
+
+    def _suspend(self, state, group, reason):
+        self._invalidate(state, group, reason)
+        group.update(reliable=False, reason=reason)
+        for member in group['members'].values():
+            member.update(reliable=False, reason=reason)
+
+    def _merge_member(self, group, data, *, manual=False, previous=None):
+        previous = previous if previous is not None else group['members'].get(data['member'], {})
+        cycle = previous.get('cycle') or uuid4().hex
+        joined = data.get('joined_at')
+        changed = previous.get('status') == 'left' or (joined is not None and previous.get('joined_at') is not None and joined != previous['joined_at'])
+        stale = not manual and previous.get('left_at') and (joined is None or joined <= previous['left_at'])
+        already_joined = previous.get('last_transition', {}).get('type') == 'GROUP_MEMBER_ADD' and previous.get('status') == 'pending'
+        if changed and not stale and not already_joined:
+            cycle = uuid4().hex
+        result = {**copy.deepcopy(previous), **data, 'cycle': cycle}
+        if stale:
+            result.update(reliable=False, status='left' if previous.get('status') == 'left' else 'pending', state='unknown', reason='stale_membership')
+        group['members'][data['member']] = result
+        return result
+
+    async def rebuild(self, bot):
+        async with self.rebuild_locks.setdefault(bot, asyncio.Lock()):
+            if not self.active or self.notifications.busy(bot):
+                return False
+            self.recovery.invalidate(bot, reason='rebuilding')
+            checkpoint = self.recovery.get_status(bot)
+            state = await self._state(bot)
+            groups = list(state['groups'])
+            good = True
+            for native_group in groups:
+                await self.refresh(bot, native_group)
+                good = good and state['groups'][native_group]['reliable']
+                for member, record in tuple(state['groups'][native_group]['members'].items()):
+                    current_manual = (
+                        record.get('source') == 'owner_confirmed' and record.get('confirmation_generation') == self.generation and record.get('reliable')
+                    )
+                    if record.get('status') != 'left' and not current_manual:
+                        await self.verify_member(bot, native_group, member)
+                        good = good and state['groups'][native_group]['members'][member]['reliable']
+            if not good or list(state['groups']) != groups or self.pending_writes.get(bot) or self.notifications.busy(bot):
+                return False
+            # The checkpoint also rejects events/connection transitions during queries.
+            return self.recovery.establish(checkpoint)
 
     async def http(self, request):
         from web.auth import authorize_request
@@ -392,6 +616,8 @@ class GroupState:
                     result = await self.confirm_member(
                         bot, data['group'], data.get('member'), evidence=data.get('evidence'), member_role=data.get('member_role')
                     )
+            elif request.method == 'POST' and path == 'rebuild':
+                result = {'ready': await self.rebuild(bot)}
             elif request.method == 'POST' and path == 'refresh':
                 data = await request.json()
                 if not isinstance(data, dict) or set(data) != {'group'}:
@@ -407,7 +633,7 @@ class GroupState:
 
     async def on_event(self, event):
         # Facts are observed independently of plugin admission; management is owner-only.
-        if event.group_id:
+        if event.group_id and event.event_type not in LIFECYCLE:
             await self.observe(event)
         text = (event.content or '').strip()
         if event.event_type not in MESSAGE_TYPES or event.is_channel or not (text == '群状态' or text.startswith('群状态 ')):
@@ -424,7 +650,9 @@ class GroupState:
             return None
         try:
             words = text.split()
-            if len(words) == 3 and words[1] == '刷新':
+            if words == ['群状态', '恢复']:
+                result = {'ready': await self.rebuild(event.appid)}
+            elif len(words) == 3 and words[1] == '刷新':
                 result = await self.refresh(event.appid, words[2])
             elif len(words) == 3 and words[1] == '名册':
                 result = await self.sync_roster(event.appid, words[2])

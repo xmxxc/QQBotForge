@@ -62,7 +62,9 @@ async def group_host(tmp_path, monkeypatch):
             appid=bot,
             name=bot,
             sender=platform,
-            log_service=SimpleNamespace(add=AsyncMock(), add_sync=Mock(), db_queue=Mock(), group_member_touch=AsyncMock()),
+            log_service=SimpleNamespace(
+                add=AsyncMock(), add_sync=Mock(), db_queue=Mock(), group_member_touch=AsyncMock(), group_member_remove=AsyncMock(), group_member_add=AsyncMock()
+            ),
         )
     source = Path(__file__).absolute().parents[2]
     shutil.copytree(source / 'modules/group_state', tmp_path / 'modules/group_state', ignore=shutil.ignore_patterns('data', '__pycache__'))
@@ -78,6 +80,7 @@ async def group_host(tmp_path, monkeypatch):
     await client.start_server()
 
     class Host:
+        application = app
         sender = platform
         modules = manager
         http = client
@@ -107,9 +110,67 @@ async def group_host(tmp_path, monkeypatch):
             await app._on_event(event)
             return event
 
+    from socket_platform import Gateway, until
+
+    from core.network.websocket import WSClient
+
+    gateways, sockets, clients, tasks = {}, {}, [], []
+    # Drive READY and real initial baseline independently for each fake Bot.
+    for bot in ('bot-a', 'bot-b'):
+        gateway = Gateway()
+        gateways[bot] = gateway
+        monkeypatch.setattr('core.network.websocket.websockets.connect', gateway.connect)
+        client_ws = WSClient(
+            bot,
+            gateway,
+            app._on_event,
+            ack_interaction=app._on_event,
+            reconnect_interval=0,
+            connection_status=app.hook_manager.connection_status,
+            on_event_received=app._prepare_event,
+        )
+        task = asyncio.create_task(client_ws.connect())
+        clients.append(client_ws)
+        tasks.append(task)
+        socket = gateway.add()
+        sockets[bot] = socket
+        socket.feed(10, d={'heartbeat_interval': 45000})
+        await until(lambda socket=socket: any(f['op'] == 2 for f in socket.sent))
+        socket.feed(0, t='READY', s=1, d={'session_id': 'session-' + bot})
+        await until(lambda bot=bot: app.hook_manager.connection_status.get(bot).phase == 'ready')
+        assert await manager.get('group_state').rebuild(bot)
+    # The global connector dispatches by each client's token (set below).
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def choose_gateway(url, **kwargs):
+        async with gateways[connecting_bot[0]].connect(url, **kwargs) as value:
+            yield value
+
+    # Tests reconnect bot-a only; bot-b remains connected and isolated.
+    connecting_bot = ['bot-a']
+    monkeypatch.setattr('core.network.websocket.websockets.connect', choose_gateway)
+    host = Host()
+    host.gateways, host.sockets = gateways, sockets
+
+    def lifecycle(kind, *, member=None, group='group-a', sequence=2, timestamp=1000, event_id='auto', bot='bot-a'):
+        sockets[bot].feed(
+            0,
+            t=kind,
+            s=sequence,
+            event_id=f'event-{sequence}' if event_id == 'auto' else event_id,
+            d={'group_openid': group, 'member_openid': member, 'timestamp': timestamp},
+        )
+
+    host.lifecycle = lifecycle
     try:
-        yield Host()
+        yield host
     finally:
+        for client_ws in clients:
+            await client_ws.close()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await manager.shutdown()
         await client.close()
         for task in app._track_workers:
