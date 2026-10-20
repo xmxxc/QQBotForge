@@ -327,6 +327,27 @@ class Bindings:
             return {'candidates': [], 'selected': None, 'reason': 'binding_changed'}
         return {'candidates': candidates, 'selected': chosen, 'reason': 'selected' if chosen else 'choose_group' if candidates else 'no_eligible_context'}
 
+    async def member_context(self, bot, decision):
+        """Verified private identity of an allowed group-member decision, for private delivery."""
+        try:
+            state = await self.state(bot)
+        except (RuntimeError, ValueError):
+            return {'context': None, 'reason': 'binding_unavailable'}
+        version = state['version']
+        binding = state['bindings'].get(identity_key(decision['group'], decision['member']))
+        if not binding:
+            return {'context': None, 'reason': 'binding_missing'}
+        context = {
+            'group': decision['group'],
+            'member': decision['member'],
+            'private_id': binding['private_id'],
+            'binding_id': binding['id'],
+            'binding_version': version,
+            'decision': decision,
+        }
+        # Same final gate as private contexts: private denial, binding version, decision.
+        return {'context': context, 'reason': 'selected'} if self.current(bot, context) else {'context': None, 'reason': 'private_denied_or_changed'}
+
     def current(self, bot, context):
         if (
             not isinstance(context, dict)
