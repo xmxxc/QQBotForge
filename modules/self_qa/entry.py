@@ -16,6 +16,7 @@ from core.plugin._blacklist import get_blacklist_map
 from core.plugin._dispatch import _strip_leading_bot_name_at
 
 from .access import AccessBridge
+from .delivery import Delivery, outcome
 from .menus import PAGE, Menus
 
 PREFIX = '/api/ext/self-qa/'
@@ -35,6 +36,7 @@ class PublicEntry:
         self.qa = qa
         self.menus = Menus()
         self.access = AccessBridge(qa, NAMESPACE)
+        self.delivery = Delivery(self)
 
     @staticmethod
     def sender(bot):
@@ -55,7 +57,7 @@ class PublicEntry:
             return {
                 'settings': await self.qa.settings(bot, NAMESPACE),
                 'rules': await self.qa.manage(bot, NAMESPACE, 'list'),
-                'capabilities': await self.access.status(bot),
+                'capabilities': {**await self.access.status(bot), 'formats': self.delivery.capabilities(bot)},
             }
         if operation == 'settings':
             return await self.qa.save_settings(bot, NAMESPACE, values)
@@ -127,12 +129,30 @@ class PublicEntry:
         rule, decision = admitted[candidate['rule_id']]
         if rule.get('access') == 'restricted' and event.is_group and await self.access.group_view(event.appid, rule, event.group_id) is None:
             # Only send restricted content to a group whose every member may view it.
-            await self.reply(event, f'「{candidate["name"]}」仅限有权成员查看，不能在本群公开发送。')
+            await self.reply(event, f'「{rule["name"]}」仅限有权成员查看，不能在本群公开发送。')
             return
         if not self.access.current(event.appid, decision):
             await self.reply(event, '资格已变化，请重新提问。')
             return
-        await self.reply(event, candidate['target'])
+        buttons = rule.get('buttons', [])
+        token = (
+            self.menus.issue_links(event, NAMESPACE, [b['value'] if b['action'] == 'rule' else None for b in buttons])
+            if any(b['action'] == 'rule' for b in buttons)
+            else ''
+        )
+        await self.delivery.send(event, rule, token)
+
+    async def linked(self, event, rule_id):
+        """A rule button: reload the rule now and check scope and the clicker's own eligibility."""
+        group = event.group_id if event.is_group else ''
+        rule = await self.qa.manage(event.appid, NAMESPACE, 'get', key=rule_id) if rule_id else None
+        decision = None
+        if rule and rule['enabled'] and rule['kind'] == 'text' and (not rule.get('groups') or group in rule['groups']) and await self.enabled(event):
+            decision = await self.access.admit(event.appid, rule, group, event.raw_user_id or event.user_id)
+        if decision is None:
+            await self.reply(event, '该答案已失效，请重新提问。')
+            return
+        await self.deliver(event, {'rule_id': rule['id']}, {rule['id']: (rule, decision)})
 
     async def on_event(self, event):
         text = (event.content or '').strip()
@@ -182,15 +202,19 @@ class PublicEntry:
             rows.append(navigation)
         if cfg.get_bot_setting(event.appid, 'message.use_markdown', True):
             try:
-                response = await self.reply(event, text, buttons=rows)
-                if isinstance(response, tuple) and response and response[0] is True:
+                # Only a definite rejection falls back; an unknown result is not re-sent.
+                if outcome(await self.reply(event, text, buttons=rows)) != 'rejected':
                     return
-            except Exception:  # noqa: BLE001 - any platform rejection falls back to the equal text choice
+            except Exception:  # noqa: BLE001 - the menu holds only permitted titles, safe to offer again as text
                 pass
         await self.reply(event, text + '\n按钮暂不可用，请使用以上文字选择。')
 
     async def choose(self, event, menu, token, action):
         """Re-read current rules for this caller/context; stale choices answer nothing."""
+        if menu.get('kind') == 'links':
+            index = int(action[1:]) if action[:1] == 'r' and action[1:].isdecimal() else -1
+            await self.linked(event, menu['links'][index] if 0 <= index < len(menu['links']) else None)
+            return
         candidates, admitted = await self.current(event, menu)
         if action.startswith('p'):
             menu['rules'] = [c['rule_id'] for c in candidates]
@@ -216,7 +240,7 @@ class PublicEntry:
         if len(words) == 2 and words[0] == '页' and words[1].isdecimal():
             action = f'p{int(words[1]) - 1}'
         elif len(words) == 1 and words[0].isdecimal() and int(words[0]) >= 1:
-            action = str(int(words[0]) - 1)
+            action = ('r' if menu.get('kind') == 'links' else '') + str(int(words[0]) - 1)
         else:
             await self.reply(event, f'请发送：{SELECT} <序号> 或 {SELECT} 页 <页码>')
             return None
@@ -241,7 +265,7 @@ class PublicEntry:
         ):
             return event
         parts = payload[len(CALLBACK) :].split(':')
-        if len(parts) != 2 or not (parts[1].isdecimal() or parts[1][:1] == 'p' and parts[1][1:].isdecimal()):
+        if len(parts) != 2 or not (parts[1].isdecimal() or parts[1][:1] in {'p', 'r'} and parts[1][1:].isdecimal()):
             return event
         try:
             menu, reason = self.menus.resolve(event, parts[0])

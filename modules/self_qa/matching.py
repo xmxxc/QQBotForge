@@ -6,12 +6,13 @@ The ``public`` namespace belongs to the module's own message entry (entry.py).
 import asyncio
 from uuid import uuid4
 
+from .delivery import validate_rich
 from .regex_runner import RegexRunner, compile_check
 from .storage import ExtensionStore
 
 # Exact beats contains beats regex; within a mode a higher priority wins.
 MODES = {'exact': 2, 'contains': 1, 'regex': 0}
-FIELDS = {'name', 'kind', 'target', 'keywords', 'mode', 'priority', 'enabled', 'groups', 'access', 'function'}
+FIELDS = {'name', 'kind', 'target', 'keywords', 'mode', 'priority', 'enabled', 'groups', 'access', 'function', 'format', 'image', 'buttons'}
 ACCESS = {'public', 'restricted'}
 
 
@@ -76,6 +77,8 @@ def validate_rule(rule):
         if rule['mode'] == 'regex':
             compile_check(normalized[-1]['text'])
     rule['keywords'] = normalized
+    if rule['kind'] == 'text':
+        validate_rich(rule)
     return rule
 
 
