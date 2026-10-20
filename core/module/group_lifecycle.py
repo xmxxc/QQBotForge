@@ -82,6 +82,8 @@ class GroupLifecycleSubscription:
         self.timeout = timeout
         self._manager = manager
         self._callback = callback
+        self._on_prepare = None
+        self._on_result = None
         self._closed = asyncio.Event()
         self._close_status = None
         self._history: deque[GroupLifecycleResult] = deque(maxlen=100)
@@ -114,7 +116,9 @@ class GroupLifecycleSubscription:
         key = (event.appid, event.group_openid)
         if self.active:
             previous = self._running.get(key)
-            bot_busy = any(task in self._abandoned and not task.done() for (bot, _), task in self._running.items() if bot == event.appid)
+            bot_busy = bool(self._abandoned) and any(
+                task in self._abandoned and not task.done() for (bot, _), task in self._running.items() if bot == event.appid
+            )
             if bot_busy or (previous is not None and not previous.done()):
                 status = 'busy'
             else:
@@ -149,6 +153,8 @@ class GroupLifecycleSubscription:
                     task.add_done_callback(release)
         result = GroupLifecycleResult(event, self.subscription_id, self.owner, status, error, started, time.monotonic())
         self._history.append(result)
+        if self._on_result is not None:
+            self._on_result(result)
         return result
 
 
@@ -227,9 +233,13 @@ class GroupLifecycleManager:
             event.connection_context,
         )
         subscribers = tuple(s for s in self._subscriptions.values() if s.appid is None or s.appid == appid)
+        for subscriber in subscribers:
+            if subscriber._on_prepare is not None:
+                subscriber._on_prepare(notification)
         completion = asyncio.get_running_loop().create_future()
         event.group_lifecycle_delivery = GroupLifecycleDelivery(notification, completion)
-        event._group_lifecycle_barriers = (*predecessors, completion)
+        # 排空任务已等待前序事件，入口只需等待本次完成凭据。
+        event._group_lifecycle_barriers = (completion,)
         tails = self._tails.setdefault(appid, {})
         tails[group] = completion
         key = (appid, group)
@@ -249,6 +259,8 @@ class GroupLifecycleManager:
     async def _drain(self, key, pending):
         """每个 Bot／群只运行一个排空任务，队列保持接收顺序。"""
         try:
+            # 无订阅者时也可能同步排空，先让创建方登记任务。
+            await asyncio.sleep(0)
             while pending:
                 item = pending[0]
                 for previous in item.predecessors:
@@ -267,5 +279,3 @@ class GroupLifecycleManager:
         """在记录、欢迎回复及插件分发前，等待已知群变化。"""
         for previous in event._group_lifecycle_barriers:
             await asyncio.shield(previous)
-        if event.group_lifecycle_delivery is not None:
-            await event.group_lifecycle_delivery.wait()
