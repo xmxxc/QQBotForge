@@ -323,3 +323,27 @@ async def test_disconnect_notifications_queue_behind_inflight_consumer(group_hos
     await until(lambda: state.recovery.get_status('bot-a').ready or state.recovery.get_status('bot-a').failed)
     assert not state.recovery.get_status('bot-a').failed
     await until(lambda: state._ready('bot-a'))
+
+
+@pytest.mark.parametrize('native_first', [False, True])
+async def test_first_platform_query_after_manual_anchor_detects_new_cycle(group_host, native_first):
+    host, state = group_host, group_host.state
+    state.clock = lambda: 1500000000
+    if native_first:
+        host.lifecycle('GROUP_MEMBER_ADD', member='member-a', timestamp=1499999999)
+        await until(
+            lambda: (
+                state.recovery.get_status('bot-a').ready and 'member-a' in state.states.get('bot-a', {}).get('groups', {}).get('group-a', {}).get('members', {})
+            )
+        )
+    await state.confirm_member('bot-a', 'group-a', 'member-a', evidence='verified')
+    cycle = (await state.fact('bot-a', 'group-a', 'member-a'))['member']['cycle']
+    assert await host.modules.reload('group_state')
+    state = host.state
+    host.sender.json_results[('/v2/groups/group-a/members/member-a', '')] = (
+        True,
+        {'member_openid': 'member-a', 'member_role': 'admin', 'joined_at': '2020-01-01T00:00:00Z'},
+    )
+    await state.verify_member('bot-a', 'group-a', 'member-a')
+    record = (await state.fact('bot-a', 'group-a', 'member-a'))['member']
+    assert record['cycle'] != cycle

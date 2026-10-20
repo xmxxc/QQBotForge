@@ -518,7 +518,16 @@ class GroupState:
             added = event.event_type in {'GROUP_MEMBER_ADD', 'GROUP_ADD_ROBOT'}
             if is_member:
                 if added:
-                    target.update(cycle=uuid4().hex, status='pending', state='unknown', reliable=False, reason='join_requires_verification')
+                    target.update(
+                        cycle=uuid4().hex,
+                        cycle_anchor=None,
+                        checked_at=None,
+                        joined_at=None,
+                        status='pending',
+                        state='unknown',
+                        reliable=False,
+                        reason='join_requires_verification',
+                    )
                 else:
                     target.update(status='left', state='left', reliable=True, reason='', left_at=timestamp)
                 target.update(source='native_lifecycle', last_transition={'time': timestamp, 'event_id': event.event_id, 'type': event.event_type})
@@ -546,12 +555,23 @@ class GroupState:
         previous = previous if previous is not None else group['members'].get(data['member'], {})
         cycle = previous.get('cycle') or uuid4().hex
         joined = data.get('joined_at')
-        changed = previous.get('status') == 'left' or (joined is not None and previous.get('joined_at') is not None and joined != previous['joined_at'])
+        anchor = previous.get('cycle_anchor') or previous.get('checked_at')
+        changed = previous.get('status') == 'left' or (
+            joined is not None
+            and (
+                previous.get('joined_at') is not None
+                and joined != previous['joined_at']
+                or previous.get('joined_at') is None
+                and anchor is not None
+                and joined > anchor
+            )
+        )
         stale = not manual and previous.get('left_at') and (joined is None or joined <= previous['left_at'])
         already_joined = previous.get('last_transition', {}).get('type') == 'GROUP_MEMBER_ADD' and previous.get('status') == 'pending'
         if changed and not stale and not already_joined:
             cycle = uuid4().hex
         result = {**copy.deepcopy(previous), **data, 'cycle': cycle}
+        result['cycle_anchor'] = self.clock() if anchor is None or cycle != previous.get('cycle') else anchor
         if stale:
             result.update(reliable=False, status='left' if previous.get('status') == 'left' else 'pending', state='unknown', reason='stale_membership')
         group['members'][data['member']] = result
