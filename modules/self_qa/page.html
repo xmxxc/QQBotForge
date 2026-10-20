@@ -1,0 +1,36 @@
+<section style="padding:1.5rem;max-width:60rem;margin:auto;font:16px system-ui;color:var(--text-primary,inherit)">
+<h2>自助问答</h2>
+<p>公开问答只在下方启用的群或私聊中回复，无需个人授权；框架黑名单、维护模式和非 @ 群消息设置照常生效。默认不启用任何群和私聊。未命中的消息不回应。</p>
+<p><label>Bot <select id="qa-bot"></select></label> <button id="qa-load">查看范围与规则</button></p>
+<h3>启用范围</h3>
+<p><label>启用的群原生ID（每行一个）<textarea id="qa-groups" rows="3" style="width:100%"></textarea></label></p>
+<p><label><input type="checkbox" id="qa-private">启用私聊</label> <button id="qa-settings">保存启用范围</button></p>
+<h3>规则</h3>
+<p><label>规则ID（修改／删除时填写） <input id="qa-id" maxlength="64"></label> <label>名称 <input id="qa-name" maxlength="200"></label></p>
+<p><label>关键词（每行一个；行首加 # 表示停用该关键词）<textarea id="qa-keywords" rows="3" style="width:100%"></textarea></label></p>
+<p><label>回复文字 <textarea id="qa-target" rows="3" style="width:100%" maxlength="4000"></textarea></label></p>
+<p><label>匹配 <select id="qa-mode"><option value="exact">精确</option><option value="contains">包含</option></select></label> <label>适用群（逗号分隔，空为全局） <input id="qa-rule-groups" maxlength="4000"></label> <label><input type="checkbox" id="qa-enabled" checked>启用规则</label></p>
+<p><button id="qa-create">新增规则</button> <button id="qa-update">修改规则</button> <button id="qa-delete">删除规则</button></p>
+<p id="qa-status" role="status"></p><pre id="qa-output" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
+<script>
+(()=>{
+ const el=id=>document.getElementById('qa-'+id), value=id=>el(id).value.trim(), lines=id=>el(id).value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+ function rule(){return {name:value('name'),target:value('target'),mode:value('mode'),enabled:el('enabled').checked,groups:value('rule-groups').split(',').map(s=>s.trim()).filter(Boolean),keywords:lines('keywords').map(k=>k.startsWith('#')?{text:k.slice(1).trim(),enabled:false}:k)};}
+ async function run(operation){
+  el('status').textContent='处理中…';
+  try{
+   let body={operation};
+   if(operation==='settings')body={operation,groups:lines('groups'),private:el('private').checked};
+   if(operation==='create')body={operation,...rule()};
+   if(operation==='update')body={operation,id:value('id'),...rule()};
+   if(operation==='delete')body={operation,id:value('id')};
+   const response=await fetch('/api/ext/self-qa/?'+new URLSearchParams({bot:value('bot')}),{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+   const data=await response.json();if(!response.ok||!data.success)throw Error(data.error||'处理失败');
+   if(operation==='list'){el('groups').value=data.data.settings.groups.join('\n');el('private').checked=data.data.settings.private;}
+   el('output').textContent=JSON.stringify(data.data,null,2);el('status').textContent='已处理';
+  }catch(error){el('status').textContent=error.message;el('output').textContent='';}
+ }
+ for(const [button,operation] of Object.entries({load:'list',settings:'settings',create:'create',update:'update',delete:'delete'}))el(button).onclick=()=>run(operation);
+ fetch('/api/bots',{credentials:'same-origin'}).then(r=>r.json()).then(data=>{for(const row of data.data?.bots||data.bots||[]){const option=document.createElement('option');option.value=row.appid;option.textContent=(row.name||row.appid)+' ('+row.appid+')';el('bot').append(option);}}).catch(()=>{el('status').textContent='无法读取Bot，请检查登录状态';});
+})();
+</script></section>
