@@ -53,6 +53,10 @@ class GroupState:
         self.active = False
         self.store.close()
 
+    async def aclose(self):
+        self.active = False
+        await asyncio.to_thread(self.store.close)
+
     async def _state(self, bot):
         identifier(bot)
         if not self.active:
@@ -124,25 +128,43 @@ class GroupState:
                     reason = 'query_failed'
             if not self.active:
                 raise RuntimeError('群状态模块已卸载')
-            if group['version'] != version:
-                return copy.deepcopy({**group, 'reliable': False, 'reason': 'state_changed'})
             if isinstance(error, dict):
                 reason = 'permission_denied' if str(error.get('code')) == '11253' else 'query_failed'
             valid = (not reason and error is None and isinstance(data, dict)
                      and data.get('member_role') in {'owner', 'admin', 'member'}
                      and isinstance(data.get('recv_msg_setting'), str) and bool(data['recv_msg_setting'])
                      and isinstance(data.get('allow_proactive_msg'), bool))
-            state['version'] += 1
-            group['version'] += 1
-            group.update(checked_at=self.clock(), reliable=bool(valid), status='verified' if valid else 'historical',
-                         reason='' if valid else reason or 'response_unknown')
-            if valid and isinstance(data, dict):
-                group.update(source='platform_bot_state', bot_state={
-                    'member_role': data['member_role'], 'recv_msg_setting': data['recv_msg_setting'],
-                    'allow_proactive_msg': data['allow_proactive_msg'], 'in_group': True,
-                })
-            await self._save(bot, state)
-            return copy.deepcopy(group)
+            async with self.write_locks.setdefault(bot, asyncio.Lock()):
+                if not self.active:
+                    raise RuntimeError('群状态模块已卸载')
+                if group['version'] != version:
+                    return copy.deepcopy({**group, 'reliable': False, 'reason': 'state_changed'})
+                # Commit a detached candidate; readers keep seeing the pending fact.
+                candidate = copy.deepcopy(state)
+                candidate['version'] += 1
+                updated = candidate['groups'][native]
+                updated['version'] += 1
+                updated.update(checked_at=self.clock(), reliable=bool(valid), status='verified' if valid else 'historical',
+                               reason='' if valid else reason or 'response_unknown')
+                if valid and isinstance(data, dict):
+                    updated.update(source='platform_bot_state', bot_state={
+                        'member_role': data['member_role'], 'recv_msg_setting': data['recv_msg_setting'],
+                        'allow_proactive_msg': data['allow_proactive_msg'], 'in_group': True,
+                    })
+                try:
+                    await self.store.put(bot, 'group_state', 'state', candidate)
+                except BaseException:
+                    if group['version'] == version:
+                        group.update(version=version + 1, reliable=False, status='historical', reason='persistence_failed')
+                        state['version'] += 1
+                    raise
+                if not self.active:
+                    raise RuntimeError('群状态模块已卸载')
+                if group['version'] != version:
+                    return copy.deepcopy({**group, 'reliable': False, 'reason': 'state_changed'})
+                group.update(updated)
+                state['version'] += 1
+                return copy.deepcopy(group)
 
     async def http(self, request):
         from web.auth import authorize_request

@@ -2,7 +2,10 @@
 
 import asyncio
 import importlib
+import json
 import shutil
+import sqlite3
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -165,3 +168,178 @@ async def test_refresh_completion_changes_snapshot_version(group_host):
     assert pending[0]['groups'][0]['status'] == 'pending'
     assert final['version'] > pending[0]['version']
     assert final['groups'][0]['version'] > pending[0]['groups'][0]['version']
+
+
+@pytest.mark.parametrize('entry', ['http', 'qq'])
+async def test_failed_commit_keeps_previous_bot_state_untrusted_until_retry(group_host, entry):
+    host = group_host
+    host.sender.response = ({'member_role': 'member', 'recv_msg_setting': 'all', 'allow_proactive_msg': False}, None)
+    await host.api('POST', 'refresh', body={'group': 'group-a'})
+    database = host.modules.get_context('group_state').get_data_path('group-state.db')
+    with sqlite3.connect(database) as connection:
+        connection.execute("""CREATE TRIGGER reject_verified BEFORE INSERT ON extension_records
+            WHEN EXISTS (SELECT 1 FROM json_each(NEW.payload, '$.groups') WHERE json_extract(value, '$.reliable') = 1)
+            BEGIN SELECT RAISE(ABORT, 'fake disk failure'); END""")
+    host.sender.response = ({'member_role': 'admin', 'recv_msg_setting': 'all', 'allow_proactive_msg': True}, None)
+    if entry == 'http':
+        response = await host.api('POST', 'refresh', body={'group': 'group-a'})
+        assert response.status == 503
+    else:
+        await host.event('群状态 刷新 group-a')
+        assert '存储暂不可用' in host.sender.messages[-1][2]
+    failed = (await (await host.api()).json())['data']['groups'][0]
+    assert not failed['reliable']
+    assert failed['status'] == 'historical' and failed['reason'] == 'persistence_failed'
+    assert failed['bot_state']['member_role'] == 'member'
+    assert (await (await host.api(bot='bot-b')).json())['data']['groups'] == []
+    with sqlite3.connect(database) as connection:
+        connection.execute('DROP TRIGGER reject_verified')
+    result = (await (await host.api('POST', 'refresh', body={'group': 'group-a'})).json())['data']
+    assert result['reliable'] and result['bot_state']['member_role'] == 'admin'
+    assert result['version'] > failed['version']
+
+
+@pytest.mark.parametrize('observed_group', ['', 'group-a', 'group-b'])
+async def test_pending_commit_does_not_publish_or_overwrite_new_observations(group_host, observed_group):
+    host = group_host
+    entered = asyncio.Event()
+    database = host.modules.get_context('group_state').get_data_path('group-state.db')
+    blocker = sqlite3.connect(database)
+
+    async def lock_final_write():
+        blocker.execute('BEGIN IMMEDIATE')
+        entered.set()
+
+    host.sender.after_query = lock_final_write
+    pending = asyncio.create_task(host.api('POST', 'refresh', body={'group': 'group-a'}))
+    observation = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        during = (await (await host.api()).json())['data']
+        assert not during['groups'][0]['reliable'] and during['groups'][0]['status'] == 'pending'
+        if observed_group:
+            observation = asyncio.create_task(host.event('普通消息', user='member-a', group=observed_group))
+            await asyncio.sleep(0)
+            observed = (await (await host.api()).json())['data']
+            assert any(group['group'] == observed_group and group['source'] == 'native_event' for group in observed['groups'])
+    finally:
+        blocker.rollback()
+        blocker.close()
+        response = await pending
+        if observation:
+            await observation
+    result = (await response.json())['data']
+    final = (await (await host.api()).json())['data']
+    if observed_group == 'group-a':
+        assert not result['reliable'] and result['reason'] == 'state_changed'
+        assert final['groups'][0]['source'] == 'native_event' and not final['groups'][0]['reliable']
+    else:
+        assert result['reliable'] and final['version'] > during['version']
+        assert final['groups'][0]['version'] > during['groups'][0]['version']
+    if observed_group == 'group-b':
+        assert [group['group'] for group in final['groups']] == ['group-a', 'group-b']
+    assert await host.modules.reload('group_state')
+    restored = (await (await host.api()).json())['data']
+    assert [group['group'] for group in restored['groups']] == [group['group'] for group in final['groups']]
+    assert all(not group['reliable'] for group in restored['groups'])
+
+
+async def test_reload_during_final_commit_rejects_old_http_result(group_host, monkeypatch):
+    host = group_host
+    entered, release = asyncio.Event(), asyncio.Event()
+    old = host.state
+    original = old.store.put
+
+    async def delayed_return(bot, collection, key, record):
+        await original(bot, collection, key, record)
+        if record['groups']['group-a']['reliable']:
+            entered.set()
+            await release.wait()
+
+    monkeypatch.setattr(old.store, 'put', delayed_return)
+    pending = asyncio.create_task(host.api('POST', 'refresh', body={'group': 'group-a'}))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert await host.modules.reload('group_state')
+        current = (await (await host.api()).json())['data']
+        assert not current['groups'][0]['reliable'] and current['groups'][0]['reason'] == 'process_restart'
+    finally:
+        release.set()
+        response = await pending
+    assert response.status == 503
+    with pytest.raises(RuntimeError):
+        await old.snapshot('bot-a')
+
+
+async def test_disable_allows_event_loop_to_run_while_sqlite_finishes(group_host, monkeypatch):
+    host = group_host
+    entered, release = threading.Event(), threading.Event()
+    released_before_timeout = []
+    connect = sqlite3.connect
+
+    def pause_write():
+        entered.set()
+        released_before_timeout.append(release.wait(2))
+        return 1
+
+    def test_connection(*args, **kwargs):
+        connection = connect(*args, **kwargs)
+        connection.create_function('audit_pause', 0, pause_write)
+        return connection
+
+    monkeypatch.setattr(sqlite3, 'connect', test_connection)
+    assert await host.modules.reload('group_state')
+    database = host.modules.get_context('group_state').get_data_path('group-state.db')
+    with sqlite3.connect(database) as connection:
+        connection.execute("""CREATE TRIGGER delay_verified BEFORE INSERT ON extension_records
+            WHEN EXISTS (SELECT 1 FROM json_each(NEW.payload, '$.groups') WHERE json_extract(value, '$.reliable') = 1)
+            BEGIN SELECT audit_pause(); END""")
+    pending = asyncio.create_task(host.api('POST', 'refresh', body={'group': 'group-a'}))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        asyncio.get_running_loop().call_later(0.01, release.set)
+        assert await host.modules.disable('group_state', _persist=False)
+    finally:
+        release.set()
+        response = await pending
+    assert released_before_timeout == [True]
+    assert response.status == 503
+    assert (await host.api()).status == 404
+
+
+@pytest.mark.parametrize('cancellations', [1, 2])
+async def test_cancelled_refresh_finishes_its_write_before_new_facts_are_saved(group_host, monkeypatch, cancellations):
+    host = group_host
+    entered, release = threading.Event(), threading.Event()
+    original = host.state.store._run
+
+    def pause_before_database_lock(sql, params, read):
+        # Fix thread scheduling at the SQLite boundary while retaining real writes.
+        if sql.startswith('INSERT') and json.loads(params[3])['groups']['group-a']['reliable']:
+            entered.set()
+            if not release.wait(2):
+                raise RuntimeError('fake storage scheduling timeout')
+        return original(sql, params, read)
+
+    monkeypatch.setattr(host.state.store, '_run', pause_before_database_lock)
+    pending = asyncio.create_task(host.state.refresh('bot-a', 'group-a'))
+    observation = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        for _ in range(cancellations):
+            pending.cancel()
+            await asyncio.sleep(0)
+        observation = asyncio.create_task(host.event('普通消息', user='member-a', group='group-b'))
+        during = (await (await host.api()).json())['data']
+        assert not during['groups'][0]['reliable']
+        assert not pending.done()  # Cancellation must drain the underlying write.
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        if observation:
+            await observation
+    assert await host.modules.reload('group_state')
+    restored = (await (await host.api()).json())['data']
+    assert [group['group'] for group in restored['groups']] == ['group-a', 'group-b']
+    assert all(not group['reliable'] for group in restored['groups'])
