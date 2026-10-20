@@ -479,7 +479,22 @@ class AccountSharing:
 
     async def decision(self, bot, context, resource, action):
         acl = await self.ensure(bot)
-        return await acl.evaluate(bot, CONSUMER, FUNCTION, context['group'], context['member'], resource, action=action)
+        decision = await acl.evaluate(bot, CONSUMER, FUNCTION, context['group'], context['member'], resource, action=action)
+        if decision['allowed'] and decision['reason'] != 'explicit':
+            # Group admission or roles never replace an explicit account grant.
+            decision = {**decision, 'allowed': False, 'reason': 'explicit_required'}
+        return decision
+
+    async def rule_current(self, bot, via_rule):
+        """A keyword-triggered query still matches the same enabled rule revision."""
+        if via_rule is None:
+            return True
+        rule_id, revision = via_rule
+        try:
+            rule = await self.qa().manage(bot, FUNCTION, 'get', key=rule_id)
+        except (BusinessError, RuntimeError):
+            return False
+        return bool(rule and rule['enabled'] and rule.get('revision', 0) == revision)
 
     async def resolve_context(self, event, *, select=''):
         """Group: the asker's native member identity. Private: an authorization-verified group context."""
@@ -540,10 +555,17 @@ class AccountSharing:
             await self.deny(event)
         elif len(candidates) == 1:
             match = candidates[0]
-            await self.query(event, match['target'] if match['kind'] == 'resource' else '', rule_id=match['rule_id'] if match['kind'] == 'text' else None)
+            await self.query(
+                event,
+                match['target'] if match['kind'] == 'resource' else '',
+                rule_id=match['rule_id'] if match['kind'] == 'text' else None,
+                via_rule=(match['rule_id'], match['revision']),
+            )
         else:
             items = [
-                (m['name'], {'kind': 'query', 'resource': m['target']}) if m['kind'] == 'resource' else (m['name'], {'kind': 'reply', 'rule': m['rule_id']})
+                (m['name'], {'kind': 'query', 'resource': m['target'], 'via': [m['rule_id'], m['revision']]})
+                if m['kind'] == 'resource'
+                else (m['name'], {'kind': 'reply', 'rule': m['rule_id'], 'via': [m['rule_id'], m['revision']]})
                 for m in candidates
             ]
             await self.present_menu(event, {**context, 'menu': 'candidates', 'keyword': match_text}, items, page=page, title='请选择有权候选')
@@ -594,7 +616,7 @@ class AccountSharing:
             return
         await self.safe_reply(event, text + '\n按钮暂不可用，请使用以上文字命令。')
 
-    async def query(self, event, resource, *, rule_id=None):
+    async def query(self, event, resource, *, rule_id=None, via_rule=None):
         context = await self.resolve_context(event)
         if context is None:
             await self.deny(event)
@@ -607,7 +629,7 @@ class AccountSharing:
         if not decision['allowed']:
             await self.deny(event)
             return
-        if event.is_group and resource and await self.group_delivery.try_send(event, context, resource):
+        if event.is_group and resource and await self.group_delivery.try_send(event, context, resource, via_rule):
             return
         acl = self.access()
         if event.is_group:
@@ -625,8 +647,8 @@ class AccountSharing:
                 await self.deny(event)
                 return
         content = await self.query_content(bot, resource, rule_id)
-        # Final gate right before sending: binding, private denial, decision, current content.
-        if content is None or not self.active or not acl.context_current(bot, target):
+        # Final gate right before sending: rule revision, binding, private denial, decision, current content.
+        if content is None or not self.active or not await self.rule_current(bot, via_rule) or not acl.context_current(bot, target):
             await self.deny(event)
             return
         sender = self.sender_provider(bot)
@@ -688,10 +710,11 @@ class AccountSharing:
             if event.is_group and context.get('group') and (context['group'] != event.group_id or context['member'] != event.raw_user_id):
                 raise PermissionError('群上下文不匹配')
             # Every action re-resolves the clicker's own context and current eligibility.
+            via = tuple(action['via']) if action.get('via') else None
             if action['kind'] == 'query':
-                await self.query(event, action['resource'])
+                await self.query(event, action['resource'], via_rule=via)
             elif action['kind'] == 'reply':
-                await self.query(event, '', rule_id=action['rule'])
+                await self.query(event, '', rule_id=action['rule'], via_rule=via)
             elif action['kind'] == 'group':
                 if await self.resolve_context(event, select=action['group']):
                     await self.directory(event)

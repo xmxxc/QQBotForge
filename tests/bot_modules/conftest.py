@@ -69,7 +69,15 @@ async def group_host(tmp_path, monkeypatch):
             self.messages.append(('push-image', target_id, image))
             return True, {'id': 'fake-image'}
 
+        # Buttons: recorded per reply; reject_buttons simulates a platform refusal.
+        reject_buttons = False
+        keyboards = []
+
         async def reply(self, event, content=None, **kwargs):
+            if kwargs.get('buttons') is not None:
+                if self.reject_buttons:
+                    return {'code': 'fake-button-rejected', 'message': 'rejected'}
+                self.keyboards.append(kwargs['buttons'])
             self.messages.append((event.appid, event.group_id if event.is_group else event.raw_user_id, content))
             # Same shape as Sender.reply: the platform response dict.
             return {'id': 'fake-reply'}
