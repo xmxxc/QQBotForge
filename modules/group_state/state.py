@@ -102,7 +102,14 @@ class GroupState:
         group.update(version=group['version'] + 1, source='native_event', observed_at=self.clock(),
                      event_type=event.event_type, reliable=False, status='historical', reason='observed_event_requires_refresh')
         state['version'] += 1
-        await self._save(event.appid, state)
+        version = group['version']
+        try:
+            await self._save(event.appid, state)
+        except (RuntimeError, sqlite3.Error, OSError):
+            if group['version'] == version:
+                group.update(version=version + 1, reason='persistence_failed')
+                state['version'] += 1
+            raise
 
     async def refresh(self, bot, native):
         identifier(native)
@@ -199,13 +206,18 @@ class GroupState:
 
     async def on_event(self, event):
         # Facts are observed independently of plugin admission; management is owner-only.
+        observation_error = None
         if event.group_id:
-            await self.observe(event)
+            try:
+                await self.observe(event)
+            except (RuntimeError, sqlite3.Error, OSError) as error:
+                observation_error = error
         text = (event.content or '').strip()
-        if event.event_type not in MESSAGE_TYPES or event.is_channel or not (text == '群状态' or text.startswith('群状态 ')):
-            return event
         owner_ids = (cfg.get_bot_config(event.appid) or {}).get('owner_ids', [])
-        if event.user_id not in owner_ids:
+        if (event.event_type not in MESSAGE_TYPES or event.is_channel
+                or not (text == '群状态' or text.startswith('群状态 ')) or event.user_id not in owner_ids):
+            if observation_error is not None:
+                raise observation_error
             return event
         if any(identity in get_blacklist_map(event.appid, 'user') for identity in (event.user_id, event.raw_user_id)) or event.group_id in get_blacklist_map(event.appid, 'group'):
             return None
@@ -213,6 +225,8 @@ class GroupState:
         if sender is None:
             return None
         try:
+            if observation_error is not None:
+                raise observation_error
             words = text.split()
             if len(words) == 3 and words[1] == '刷新':
                 result = await self.refresh(event.appid, words[2])

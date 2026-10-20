@@ -254,6 +254,120 @@ async def test_pending_commit_does_not_publish_or_overwrite_new_observations(gro
     assert all(not group['reliable'] for group in restored['groups'])
 
 
+@pytest.mark.parametrize('command', ['群状态', '群状态 刷新 group-a'])
+async def test_group_owner_command_reports_observation_storage_failure_and_can_retry(group_host, command):
+    host = group_host
+    previous = (await (await host.api('POST', 'refresh', body={'group': 'group-a'})).json())['data']
+    other_bot = await host.state.snapshot('bot-b')
+    database = host.modules.get_context('group_state').get_data_path('group-state.db')
+    with sqlite3.connect(database) as connection:
+        connection.execute("""CREATE TRIGGER reject_observation BEFORE INSERT ON extension_records
+            WHEN NEW.bot = 'bot-a' BEGIN SELECT RAISE(ABORT, 'fake disk failure'); END""")
+    try:
+        host.sender.messages.clear()
+        await host.event(command, group='group-a')
+        assert host.sender.messages == [('bot-a', 'group-a', '群状态存储暂不可用，请检查后台')]
+        failed = (await (await host.api()).json())['data']['groups'][0]
+        assert not failed['reliable'] and failed['status'] == 'historical'
+        assert failed['reason'] == 'persistence_failed' and failed['source'] == 'native_event'
+        assert failed['bot_state'] == previous['bot_state'] and failed['version'] > previous['version']
+        assert await host.state.snapshot('bot-b') == other_bot
+    finally:
+        with sqlite3.connect(database) as connection:
+            connection.execute('DROP TRIGGER reject_observation')
+    host.sender.messages.clear()
+    await host.event('群状态 刷新 group-a', group='group-a')
+    assert len(host.sender.messages) == 1 and '已处理' in host.sender.messages[0][2]
+    assert (await host.state.snapshot('bot-a'))['groups'][0]['reliable']
+
+
+async def test_observation_storage_failure_preserves_admission_and_message_dispatch(group_host):
+    from core.application import get_app
+    from core.plugin._blacklist import get_blacklist_map, set_blacklist_map
+
+    host = group_host
+    await host.event('ordinary', group='group-a', user='member-a')
+    database = host.modules.get_context('group_state').get_data_path('group-state.db')
+    downstream = []
+
+    async def receive(event):
+        downstream.append((event.appid, event.user_id, event.content))
+        return event
+
+    get_app().hook_manager.register('before_event', receive, owner='observation-failure-test', priority=20)
+    with sqlite3.connect(database) as connection:
+        connection.execute("""CREATE TRIGGER reject_observation BEFORE INSERT ON extension_records
+            WHEN NEW.bot = 'bot-a' BEGIN SELECT RAISE(ABORT, 'fake disk failure'); END""")
+    users = get_blacklist_map('bot-a', 'user')
+    try:
+        host.sender.messages.clear()
+        await host.event('ordinary', group='group-a', user='member-a')
+        await host.event('群状态', group='group-a', user='member-a')
+        await host.event('群状态', bot='bot-b', group='group-b', user='owner-a')
+        assert downstream == [('bot-a', 'member-a', 'ordinary'), ('bot-a', 'member-a', '群状态'), ('bot-b', 'owner-a', '群状态')]
+        assert host.sender.messages == []
+        set_blacklist_map('bot-a', 'user', {**users, 'owner-a': 'test denial'})
+        await host.event('群状态', group='group-a')
+        assert len(downstream) == 3 and host.sender.messages == []
+        assert (await host.state.snapshot('bot-a'))['groups'][0]['reason'] == 'persistence_failed'
+    finally:
+        set_blacklist_map('bot-a', 'user', users)
+        get_app().hook_manager.unregister_owner('observation-failure-test')
+        with sqlite3.connect(database) as connection:
+            connection.execute('DROP TRIGGER reject_observation')
+
+
+@pytest.mark.parametrize('newer_action', ['observe', 'refresh'])
+async def test_late_observation_save_failure_preserves_newer_same_group_facts(group_host, monkeypatch, newer_action):
+    host = group_host
+    await host.api('POST', 'refresh', body={'group': 'group-a'})
+    entered, release = threading.Event(), threading.Event()
+    attempts = []
+    connect = sqlite3.connect
+
+    def fail_first_write():
+        attempts.append(True)
+        if len(attempts) == 1:
+            entered.set()
+            if not release.wait(2):
+                raise RuntimeError('fake storage scheduling timeout')
+            return 1
+        return 0
+
+    def test_connection(*args, **kwargs):
+        connection = connect(*args, **kwargs)
+        connection.create_function('audit_fail_first_write', 0, fail_first_write)
+        return connection
+
+    monkeypatch.setattr(sqlite3, 'connect', test_connection)
+    assert await host.modules.reload('group_state')
+    database = host.modules.get_context('group_state').get_data_path('group-state.db')
+    with sqlite3.connect(database) as connection:
+        connection.execute("""CREATE TRIGGER fail_first_observation BEFORE INSERT ON extension_records
+            WHEN audit_fail_first_write() = 1 BEGIN SELECT RAISE(ABORT, 'fake disk failure'); END""")
+    old = asyncio.create_task(host.event('old observation', group='group-a', user='member-a'))
+    newer = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        before = await host.state.snapshot('bot-a')
+        newer = asyncio.create_task(host.state.refresh('bot-a', 'group-a') if newer_action == 'refresh'
+                                    else host.event('new observation', group='group-a', user='member-a'))
+        await asyncio.sleep(0)
+        assert (await host.state.snapshot('bot-a'))['version'] > before['version']
+    finally:
+        release.set()
+        await old
+        if newer is not None:
+            await newer
+        with sqlite3.connect(database) as connection:
+            connection.execute('DROP TRIGGER fail_first_observation')
+    fact = (await host.state.snapshot('bot-a'))['groups'][0]
+    if newer_action == 'refresh':
+        assert fact['reliable'] and fact['status'] == 'verified' and fact['reason'] == ''
+    else:
+        assert not fact['reliable'] and fact['reason'] == 'observed_event_requires_refresh'
+
+
 async def test_initial_save_failure_ends_refresh_and_allows_retry(group_host):
     host = group_host
     previous = (await (await host.api('POST', 'refresh', body={'group': 'group-a'})).json())['data']
