@@ -518,12 +518,18 @@ def delay_queued_connection_callback(state, monkeypatch, phase='replay_complete'
     return entered, release
 
 
+async def reconnect(host, bot, sequence):
+    """One real disconnect and same-session RESUMED for `bot` (about six connection statuses)."""
+    host.connecting_bot[0] = bot
+    host.sockets[bot].frames.put_nowait(OSError('fake disconnect'))
+    socket = host.sockets[bot] = host.gateways[bot].add()
+    socket.feed(10, d={'heartbeat_interval': 45000})
+    await until(lambda: any(f['op'] == 6 for f in socket.sent))
+    socket.feed(0, t='RESUMED', s=sequence, d='')
+
+
 async def resume(host):
-    host.sockets['bot-a'].frames.put_nowait(OSError('fake disconnect'))
-    second = host.gateways['bot-a'].add()
-    second.feed(10, d={'heartbeat_interval': 45000})
-    await until(lambda: any(f['op'] == 6 for f in second.sent))
-    second.feed(0, t='RESUMED', s=2, d='')
+    await reconnect(host, 'bot-a', 2)
 
 
 @pytest.mark.parametrize('groups', [1, 3])
@@ -632,3 +638,167 @@ async def test_timed_out_connection_callback_and_skipped_statuses_need_rebuild_n
     await state.confirm_member('bot-a', 'group-a', 'member-a', evidence='verified again')
     assert await state.rebuild('bot-a')
     assert (await state.fact('bot-a', 'group-a', 'member-a'))['usable']
+
+
+async def ready_members(state, *bots, groups=('group-a', 'group-b')):
+    for bot in bots:
+        for name in groups:
+            await state.confirm_member(bot, name, 'member-a', evidence='verified')
+        await until(lambda bot=bot: state._ready(bot))
+
+
+async def churn(host, state, bot, *, cycles=20, first=2, webhook=None, webhook_bot='bot-w'):
+    """Push the framework's shared, bounded subscription history (100 results) past every older entry."""
+    for cycle in range(cycles):
+        await reconnect(host, bot, first + cycle)
+        if webhook is not None:
+            webhook.publish('unknown', reason=f'http_callback_{cycle}')
+        await until(lambda: state._ready(bot) and not (webhook and state._connection_pending(webhook_bot)))
+
+
+@pytest.mark.parametrize('quiet, noisy', [('bot-a', 'bot-b'), ('bot-b', 'bot-a')])
+async def test_other_bot_connection_traffic_cannot_strand_a_quiet_bot(group_host, quiet, noisy):
+    host, state = group_host, group_host.state
+    await ready_members(state, quiet, noisy)
+    paused_noisy, paused_quiet = [], []
+    gate, held = asyncio.Event(), asyncio.Event()
+
+    async def slow(change):
+        if change['bot'] == noisy and change['reason'].startswith('connection:'):
+            if not gate.is_set():
+                held.set()
+                await gate.wait()
+            await asyncio.sleep(0.002)  # every churned delivery is held long enough for later statuses to queue
+            paused_noisy.append(not (await state.fact(noisy, 'group-a', 'member-a'))['usable'])
+            paused_quiet.append(not (await state.fact(quiet, 'group-b', 'member-a'))['usable'])
+
+    state.subscribe(slow, timeout=30)
+    # The consumer holds the first delivery while the whole reconnect queues behind it.
+    await reconnect(host, noisy, 2)
+    await until(lambda: held.is_set() and host.application.hook_manager.connection_status.get(noisy).phase == 'replay_complete')
+    assert (await state.fact(noisy, 'group-a', 'member-a'))['reason'] == 'recovery_processing'
+    assert (await state.fact(quiet, 'group-a', 'member-a'))['usable']
+    gate.set()
+    await until(lambda: state._ready(noisy))
+    # A third source on a different transport shares the same history; the framework
+    # creates HTTP-callback sources this way (BotInstance), there is no public factory.
+    webhook = host.application.hook_manager.connection_status._register('bot-w', 'webhook')
+    await churn(host, state, noisy, first=3, webhook=webhook)
+    results = state.connection_subscription.results
+    assert len(results) == 100 and {r.status.appid for r in results} == {noisy, 'bot-w'}
+    assert {r.status.transport for r in results} == {'websocket', 'webhook'}
+    assert paused_noisy and all(paused_noisy) and not any(paused_quiet)
+    for bot in (quiet, noisy):
+        for name in ('group-a', 'group-b'):
+            fact = await state.fact(bot, name, 'member-a')
+            assert fact['usable'] and fact['reason'] == '' and state.fact_current(fact), (bot, fact)
+    # One settlement entry per Bot/transport, however many reconnects happened.
+    assert set(state.connection_settled) == {('bot-a', 'websocket'), ('bot-b', 'websocket'), ('bot-w', 'webhook')}
+    # A trusted member event on the quiet Bot still retires only that member.
+    host.lifecycle('GROUP_MEMBER_ADD', member='member-new', group='group-a', sequence=2, bot=quiet)
+    await until(lambda: 'member-new' in state.states[quiet]['groups']['group-a']['members'] and state._ready(quiet))
+    assert not (await state.fact(quiet, 'group-a', 'member-new'))['usable']
+    assert (await state.fact(quiet, 'group-a', 'member-a'))['usable']
+
+
+@pytest.mark.parametrize('mode', ['error', 'cancelled', 'consumer_timeout', 'timeout_and_skip'])
+async def test_failed_connection_delivery_is_not_settled_and_rebuild_recovers_after_other_traffic(group_host, monkeypatch, mode):
+    host, state = group_host, group_host.state
+    await ready_members(state, 'bot-a', 'bot-b')
+    release = asyncio.Event()
+
+    async def consumer(change):
+        # Fail the final status of the reconnect (or, for the framework timeout, hang
+        # from the first one so the statuses behind it are skipped as 'busy').
+        last = change['reason'] == 'connection:replay_complete'
+        if change['bot'] == 'bot-a' and (last or mode == 'timeout_and_skip' and change['reason'].startswith('connection:')):
+            if mode == 'error':
+                raise RuntimeError('consumer failed')
+            if mode == 'cancelled':
+                raise asyncio.CancelledError
+            await release.wait()
+
+    # The consumer stays subscribed: it keeps failing connection notifications but accepts the rebuild's.
+    state.subscribe(consumer, timeout=0.05 if mode == 'consumer_timeout' else 30)
+    if mode == 'timeout_and_skip':
+        # The framework stops waiting for our callback; later statuses behind it are skipped as 'busy'.
+        monkeypatch.setattr(state.connection_subscription, 'timeout', 0.05)
+    await reconnect(host, 'bot-a', 2)
+    await until(lambda: state.recovery.get_status('bot-a').failed)
+    if mode == 'timeout_and_skip':
+        await until(lambda: {'timeout', 'busy'} <= {r.outcome for r in state.connection_subscription.results if r.status.appid == 'bot-a'})
+    release.set()
+    await until(lambda: not state.notifications.busy('bot-a'))
+    failed = await state.fact('bot-a', 'group-a', 'member-a')
+    assert not failed['usable'] and failed['reason'] == 'recovery_required', failed
+    assert state._connection_pending('bot-a'), 'a failed delivery must not be recorded as settled'
+    monkeypatch.setattr(state.connection_subscription, 'timeout', 5.0)
+    await churn(host, state, 'bot-b')
+    assert not any(r.status.appid == 'bot-a' for r in state.connection_subscription.results)
+    still = await state.fact('bot-a', 'group-a', 'member-a')
+    assert not still['usable'] and still['reason'] == 'recovery_required', still
+    assert (await state.fact('bot-b', 'group-b', 'member-a'))['usable']
+    for name in ('group-a', 'group-b'):
+        await state.confirm_member('bot-a', name, 'member-a', evidence='verified again')
+    assert await state.rebuild('bot-a')
+    for name in ('group-a', 'group-b'):
+        fact = await state.fact('bot-a', name, 'member-a')
+        assert fact['usable'] and state.fact_current(fact), fact
+    assert not state._connection_pending('bot-a')
+
+
+async def test_rebuild_delivers_a_still_queued_connection_status_before_ready(group_host, monkeypatch):
+    host, state = group_host, group_host.state
+    await ready_members(state, 'bot-a')
+    seen = []
+
+    async def consumer(change):
+        if change['reason'].startswith('connection:'):
+            seen.append((change['reason'], state._ready('bot-a')))
+
+    state.subscribe(consumer, timeout=30)
+    entered, release = delay_queued_connection_callback(state, monkeypatch)
+    await reconnect(host, 'bot-a', 2)
+    await until(entered.is_set)
+    assert (await state.fact('bot-a', 'group-a', 'member-a'))['reason'] == 'recovery_processing'
+    seen.clear()
+    for name in ('group-a', 'group-b'):
+        await state.confirm_member('bot-a', name, 'member-a', evidence='verified again')
+    assert await state.rebuild('bot-a')
+    # Rebuild itself delivered the status our callback never received (once per group) before ready.
+    assert seen == [('connection:replay_complete', False)] * 2
+    assert (await state.fact('bot-a', 'group-a', 'member-a'))['usable']
+    release.set()
+    await until(lambda: len(seen) == 4)
+    # The late delivery is one more notification: older proofs retire, current facts stay usable.
+    assert (await state.fact('bot-a', 'group-a', 'member-a'))['usable']
+
+
+async def test_reload_and_late_old_callback_after_history_overflow(group_host, monkeypatch):
+    host, old = group_host, group_host.state
+    await ready_members(old, 'bot-a', 'bot-b')
+    await churn(host, old, 'bot-b')
+    entered, release = delay_queued_connection_callback(old, monkeypatch)
+    await reconnect(host, 'bot-a', 2)
+    await until(entered.is_set)
+    assert await host.modules.reload('group_state')
+    new = host.state
+    assert new is not old and not old.active
+    # While the old instance's callback is still held, the new one has no trusted baseline.
+    for bot in ('bot-a', 'bot-b'):
+        before = await new.fact(bot, 'group-a', 'member-a')
+        assert not before['usable'] and before['reason'] == 'recovery_required', before
+    facts = {}
+    for bot in ('bot-a', 'bot-b'):
+        for name in ('group-a', 'group-b'):
+            await new.confirm_member(bot, name, 'member-a', evidence='verified')
+        assert await new.rebuild(bot)
+        facts[bot] = await new.fact(bot, 'group-a', 'member-a')
+        assert facts[bot]['usable'], facts[bot]
+    release.set()
+    for _ in range(20):
+        await asyncio.sleep(0)
+    # Whatever the old instance's late callback does stays in that instance.
+    assert not old._ready('bot-a') and all(new.fact_current(fact) for fact in facts.values())
+    await churn(host, new, 'bot-b', first=30)
+    assert (await new.fact('bot-a', 'group-a', 'member-a'))['usable']
