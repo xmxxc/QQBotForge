@@ -1,0 +1,114 @@
+[
+  {
+    "pr": 42,
+    "head": "9450db57bc47c161e4a248c0a282639ad84d718e",
+    "test": "26 passed",
+    "only_change": [
+      "tests/bot_modules/test_group_lifecycle.py"
+    ]
+  },
+  {
+    "pr": 43,
+    "head": "8051d8f1f0d559e2a9826cc5a904c20c3b393ca0",
+    "test": "26 passed",
+    "only_change": [
+      "tests/bot_modules/test_group_lifecycle.py"
+    ]
+  },
+  {
+    "pr": 44,
+    "head": "3ceef4af0fafad0ed204546e5eddd70e8e50735a",
+    "test": "26 passed",
+    "only_change": [
+      "tests/bot_modules/test_group_lifecycle.py"
+    ]
+  },
+  {
+    "pr": 45,
+    "head": "9d16161eac41872affac6ead9d371167160ae279",
+    "test": "26 passed",
+    "only_change": [
+      "tests/bot_modules/test_group_lifecycle.py"
+    ]
+  },
+  {
+    "pr": 46,
+    "head": "befd36590941c1ea07eea338dd2a64cf187b6353",
+    "test": "26 passed",
+    "only_change": [
+      "tests/bot_modules/test_group_lifecycle.py"
+    ]
+  },
+  {
+    "pr": 48,
+    "head": "63b21a364efa2193d0375473247337741d5195a0",
+    "test": "26 passed",
+    "only_change": [
+      "tests/bot_modules/test_group_lifecycle.py"
+    ]
+  },
+  {
+    "pr": 49,
+    "head": "46c838696216f1e93374caa21f485a5f79c71f47",
+    "test": "26 passed",
+    "only_change": [
+      "tests/bot_modules/test_group_lifecycle.py"
+    ]
+  },
+  {
+    "pr": 50,
+    "head": "8196e6ee9a3afdf0a6d76998dd34a97d929434a6",
+    "test": "26 passed",
+    "only_change": [
+      "tests/bot_modules/test_group_lifecycle.py"
+    ]
+  },
+  {
+    "pr": 51,
+    "head": "feb8274201f71b735f441068a1d20d83c0c6ba94",
+    "test": "26 passed",
+    "only_change": [
+      "tests/bot_modules/test_group_lifecycle.py"
+    ]
+  },
+  {
+    "pr": 52,
+    "head": "c7098a76c0800481ef7dc198c8869b93bf4f1f23",
+    "test": "26 passed",
+    "only_change": [
+      "tests/bot_modules/test_group_lifecycle.py"
+    ]
+  },
+  {
+    "pr": 53,
+    "head": "aae6fadeabe93c61db2286c8d514c1613f9c3b58",
+    "test": "26 passed",
+    "only_change": [
+      "tests/bot_modules/test_group_lifecycle.py"
+    ]
+  },
+  {
+    "pr": 54,
+    "head": "848126ae09470599ab6af5f35b1ef3e226d999a4",
+    "test": "26 passed",
+    "only_change": [
+      "tests/bot_modules/test_group_lifecycle.py"
+    ]
+  },
+  {
+    "pr": 55,
+    "head": "a4daf04fc862ea494825ba9a895f83698b70db35",
+    "test": "26 passed",
+    "only_change": [
+      "tests/bot_modules/test_group_lifecycle.py"
+    ]
+  },
+  {
+    "pr": 56,
+    "head": "26ed165d20202e8453f731057499ab491dd26da6",
+    "test": "26 passed",
+    "only_change": [
+      "tests/bot_modules/test_group_lifecycle.py"
+    ]
+  }
+]

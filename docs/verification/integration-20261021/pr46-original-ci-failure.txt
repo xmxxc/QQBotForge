@@ -1,0 +1,35 @@
+Run 39541560100; unchanged original failure evidence
+=================================== FAILURES ===================================
+___________ test_consumer_failure_cannot_acknowledge_recovery[error] ___________
+
+group_host = <conftest.group_host.<locals>.Host object at 0x7f06b0553a10>
+outcome = 'error'
+
+@pytest.mark.parametrize('outcome', ['error', 'cancelled'])
+async def test_consumer_failure_cannot_acknowledge_recovery(group_host, outcome):
+host, state = group_host, group_host.state
+await state.confirm_member('bot-a', 'group-a', 'member-a', evidence='verified')
+
+async def consumer(change):
+if outcome == 'error':
+raise ValueError('fake failure')
+raise asyncio.CancelledError
+
+sub = state.subscribe(consumer)
+host.lifecycle('GROUP_MEMBER_REMOVE', member='member-a')
+await until(lambda: bool(sub.results))
+assert sub.results[-1].status == outcome
+assert not state.recovery.get_status('bot-a').ready
+sub.cancel()
+assert not sub.active
+>       assert await state.rebuild('bot-a')
+E       assert False
+
+tests/bot_modules/test_group_lifecycle.py:262: AssertionError
+---------------------------- Captured log teardown -----------------------------
+WARNING  ElainaBot.框架.连接状态:connection_status.py:131 [bot-b] 连接通知 3542920f233a408b9517cead00784655 (群状态): unloaded, None
+=========================== short test summary info ============================
+FAILED tests/bot_modules/test_group_lifecycle.py::test_consumer_failure_cannot_acknowledge_recovery[error] - assert False
+1 failed, 670 passed, 6 skipped in 34.29s
+##[error]Process completed with exit code 1.
+

@@ -1,0 +1,128 @@
+[
+  {
+    "path": "/opt/qqbot/QQBotForge",
+    "head_unchanged": true,
+    "status_unchanged": true,
+    "head": "f797eadcf6196163340e4640de11385433e1ff76",
+    "status": " M AGENTS.md\n M docs/agents/issue-tracker.md\n M docs/specs/account-sharing.md\n M pyproject.toml\n?? config/settings.yaml.bak-autoupdate-20261020\n?? docs/beginner-guide.md\n?? docs/issue-drafts/disable-last-plugin-file.md\n?? docs/specs/module-member-events-pr108-follow-up.md\n"
+  },
+  {
+    "path": "/opt/qqbot/QQBotForge-access-control-a01",
+    "head_unchanged": true,
+    "status_unchanged": true,
+    "head": "291d759911bd91a3e1f8219fca5e96fb7cb72751",
+    "status": ""
+  },
+  {
+    "path": "/opt/qqbot/QQBotForge-account-sharing",
+    "head_unchanged": true,
+    "status_unchanged": true,
+    "head": "3509cd930254e771812c8d0f41d0a34629e8546c",
+    "status": " M AGENTS.md\n M core/bot/event.py\n M core/module/group_lifecycle.py\n M core/plugin/_dispatch.py\n M docs/account-sharing-management.md\n M docs/account-sharing.md\n M docs/agents/issue-tracker.md\n M docs/issue-drafts/account-sharing/01-owner-account-preview.md\n M docs/issue-drafts/account-sharing/02-group-member-access.md\n M docs/issue-drafts/account-sharing/03-binding-private-query.md\n M docs/issue-drafts/account-sharing/04-qa-keyword-query.md\n M docs/issue-drafts/account-sharing/05-account-buttons.md\n M docs/issue-drafts/account-sharing/06-bulk-scoped-grants.md\n M docs/issue-drafts/account-sharing/07-deny-expiry-explanation.md\n M docs/issue-drafts/account-sharing/08-leave-revocation.md\n M docs/issue-drafts/account-sharing/09-membership-revalidation.md\n M docs/issue-drafts/account-sharing/10-all-members-group-delivery.md\n M docs/issue-drafts/account-sharing/11-group-mode-diagnostics.md\n M docs/issue-drafts/account-sharing/12-owner-workflow-results.md\n M docs/plans/account-sharing-extension-boundary.md\n M docs/plans/account-sharing-progress.md\n M docs/plans/account-sharing-tickets.md\n M docs/prompts/account-sharing-worker.md\n M docs/specs/account-sharing.md\n M pyproject.toml\n?? GLOSSARY.md\n?? config/settings.yaml.bak-autoupdate-20261020\n?? docs/archive/\n?? docs/issue-drafts/bot-modules/\n?? docs/module-event-hooks.md\n?? docs/plans/bot-modules-tickets.md\n?? docs/specs/bot-modules.md\n?? modules/group_lifecycle_probe\n"
+  },
+  {
+    "path": "/opt/qqbot/QQBotForge-b01-audit-fix",
+    "head_unchanged": true,
+    "status_unchanged": true,
+    "head": "50fb971424d7e4a7205adb3cbd42f6f05c8b7fbf",
+    "status": ""
+  },
+  {
+    "path": "/opt/qqbot/QQBotForge-bot-modules",
+    "head_unchanged": true,
+    "status_unchanged": true,
+    "head": "0a83634cb3864d63435c28158da315abf5838146",
+    "status": ""
+  },
+  {
+    "path": "/opt/qqbot/QQBotForge-bot-modules-framework-sync",
+    "head_unchanged": true,
+    "status_unchanged": true,
+    "head": "e501c95acd652d279912719b275f8fe66bca683f",
+    "status": ""
+  },
+  {
+    "path": "/opt/qqbot/QQBotForge-f01-test-assets",
+    "head_unchanged": true,
+    "status_unchanged": true,
+    "head": "9790d7df6a55495036e269f018ebd7d61e3fc446",
+    "status": ""
+  },
+  {
+    "path": "/opt/qqbot/QQBotForge-framework-f01",
+    "head_unchanged": true,
+    "status_unchanged": true,
+    "head": "460c8419c3b685253f8f4233e773a582da57e44c",
+    "status": ""
+  },
+  {
+    "path": "/opt/qqbot/QQBotForge-framework-handler-hook",
+    "head_unchanged": true,
+    "status_unchanged": true,
+    "head": "bf462cf97bd61049c44ae53ac207f4f22bf32f34",
+    "status": ""
+  },
+  {
+    "path": "/opt/qqbot/QQBotForge-g01-audit-fix",
+    "head_unchanged": true,
+    "status_unchanged": true,
+    "head": "09feaaa91c278fd126c9d570f9975e1df9bdeb73",
+    "status": ""
+  },
+  {
+    "path": "/opt/qqbot/QQBotForge-g01-reaudit-fix",
+    "head_unchanged": true,
+    "status_unchanged": true,
+    "head": "6c3a4f98fe0dab1dabf053a4a89fa7fe8673d2bb",
+    "status": ""
+  },
+  {
+    "path": "/opt/qqbot/QQBotForge-g02-audit-fix",
+    "head_unchanged": true,
+    "status_unchanged": true,
+    "head": "95b05058f323caaf5ff83f29a460cb2823c438a5",
+    "status": ""
+  },
+  {
+    "path": "/opt/qqbot/QQBotForge-verify",
+    "head_unchanged": true,
+    "status_unchanged": true,
+    "head": "f797eadcf6196163340e4640de11385433e1ff76",
+    "status": ""
+  },
+  {
+    "path": "/tmp/qqbot-b01-audit/base",
+    "head_unchanged": true,
+    "status_unchanged": true,
+    "head": "19e53af82fbcc69a7a54c51ac3609f8821ef56fb",
+    "status": ""
+  },
+  {
+    "path": "/tmp/qqbot-b01-audit/head",
+    "head_unchanged": true,
+    "status_unchanged": true,
+    "head": "0585773f9ae0ff1a60533d01de04f910fc6201d0",
+    "status": ""
+  },
+  {
+    "path": "/tmp/qqbot-g01-cold-read-fix-73q8a7qp/worktree",
+    "head_unchanged": true,
+    "status_unchanged": true,
+    "head": "09feaaa91c278fd126c9d570f9975e1df9bdeb73",
+    "status": ""
+  },
+  {
+    "path": "/tmp/qqbot-g01-observe-fix-cnbb12y1/worktree",
+    "head_unchanged": true,
+    "status_unchanged": true,
+    "head": "85f53f7924105b6f0a46903ce6434f9ff4aa5395",
+    "status": ""
+  },
+  {
+    "path": "/tmp/qqbot-personal-member-events-integration",
+    "head_unchanged": true,
+    "status_unchanged": true,
+    "head": "5e8cb096cfecec35f66970ddb86f3f7b45989b7c",
+    "status": ""
+  }
+]

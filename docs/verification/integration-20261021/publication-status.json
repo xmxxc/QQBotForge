@@ -1,0 +1,433 @@
+[
+  {
+    "ticket": 21,
+    "pr": 40,
+    "name": "g01",
+    "branch": "feat/group-state-g01",
+    "old": "09feaaa91c278fd126c9d570f9975e1df9bdeb73",
+    "new": "b32a00a78cd48baa343b3d37fc8bf4fee0d7bcf0",
+    "previous": "f797eadcf6196163340e4640de11385433e1ff76",
+    "old_is_ancestor": true,
+    "prerequisite_is_ancestor": true,
+    "new_unique_from_old": "b32a00a78cd48baa343b3d37fc8bf4fee0d7bcf0 merge: sync audited framework prerequisites into G01\nf797eadcf6196163340e4640de11385433e1ff76 Merge pull request #37 from xmxxc/feat/bot-modules-b01\n08b8b474a0f18441d6706cc2044ffb6d67621d7f Merge pull request #39 from xmxxc/integrate/bot-modules-framework\ne501c95acd652d279912719b275f8fe66bca683f merge: sync before_handler module hook for bot modules (#28)\nbf462cf97bd61049c44ae53ac207f4f22bf32f34 feat(module): before_handler hook after dispatch receive checks\n50fb971424d7e4a7205adb3cbd42f6f05c8b7fbf fix(account-sharing): correct storage import ordering\nb23572b04917a2891fdcce8ab33fd1ff97c931d5 merge: sync verified framework contracts for bot modules (#20)\n460c8419c3b685253f8f4233e773a582da57e44c feat(module): deliver verified local recovery contract on main (#20)\n398c6afe70055589d1f12ab35affe66ca6e2396c Merge remote-tracking branch 'upstream/main'\nb410938ed5aead906f9e5256228108057bb5dbd9 增加模块可自定义消息订阅类型（可适配自己的事件类型或内测接口）\nb557ac67fda3c0098fcbd92da39d64247993b332 feat(module): 增加连接与会话状态订阅及查询 (#110)",
+    "non_group_business_diff": "",
+    "audit": "prior independent G01 audit; fresh composition verified",
+    "merged": false,
+    "ci": [
+      {
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "url": "https://github.com/xmxxc/QQBotForge/actions/runs/39540502548/job/119026889264"
+      }
+    ],
+    "prerequisites_synced": true,
+    "next": "human review in merge order",
+    "draft": true,
+    "base_ref": "personal"
+  },
+  {
+    "ticket": 22,
+    "pr": 41,
+    "name": "g02",
+    "branch": "feat/group-state-g02",
+    "old": "95b05058f323caaf5ff83f29a460cb2823c438a5",
+    "new": "1adf415995c21da0aa40c7748ba41bf9f40a6e05",
+    "previous": "b32a00a78cd48baa343b3d37fc8bf4fee0d7bcf0",
+    "old_is_ancestor": true,
+    "prerequisite_is_ancestor": true,
+    "new_unique_from_old": "1adf415995c21da0aa40c7748ba41bf9f40a6e05 fix(group-state): retire proofs before confirmation and clean cancelled writes (#22)\n80647647436e3ffb40aa5c5bd650c7ec5e96fddc merge: sync verified personal and G01 prerequisites into G02\nb32a00a78cd48baa343b3d37fc8bf4fee0d7bcf0 merge: sync audited framework prerequisites into G01\nf797eadcf6196163340e4640de11385433e1ff76 Merge pull request #37 from xmxxc/feat/bot-modules-b01\n08b8b474a0f18441d6706cc2044ffb6d67621d7f Merge pull request #39 from xmxxc/integrate/bot-modules-framework\ne501c95acd652d279912719b275f8fe66bca683f merge: sync before_handler module hook for bot modules (#28)\nbf462cf97bd61049c44ae53ac207f4f22bf32f34 feat(module): before_handler hook after dispatch receive checks\n50fb971424d7e4a7205adb3cbd42f6f05c8b7fbf fix(account-sharing): correct storage import ordering\nb23572b04917a2891fdcce8ab33fd1ff97c931d5 merge: sync verified framework contracts for bot modules (#20)\n460c8419c3b685253f8f4233e773a582da57e44c feat(module): deliver verified local recovery contract on main (#20)\n398c6afe70055589d1f12ab35affe66ca6e2396c Merge remote-tracking branch 'upstream/main'\nb410938ed5aead906f9e5256228108057bb5dbd9 增加模块可自定义消息订阅类型（可适配自己的事件类型或内测接口）\nb557ac67fda3c0098fcbd92da39d64247993b332 feat(module): 增加连接与会话状态订阅及查询 (#110)",
+    "non_group_business_diff": "",
+    "audit": "independent Standards+Spec fix reviewed",
+    "merged": false,
+    "ci": [
+      {
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "url": "https://github.com/xmxxc/QQBotForge/actions/runs/39540506954/job/119026903404"
+      }
+    ],
+    "prerequisites_synced": true,
+    "next": "human review in merge order",
+    "draft": true,
+    "base_ref": "personal"
+  },
+  {
+    "ticket": 23,
+    "pr": 42,
+    "name": "g03",
+    "branch": "feat/group-state-g03",
+    "old": "0a83634cb3864d63435c28158da315abf5838146",
+    "new": "9450db57bc47c161e4a248c0a282639ad84d718e",
+    "previous": "1adf415995c21da0aa40c7748ba41bf9f40a6e05",
+    "old_is_ancestor": true,
+    "prerequisite_is_ancestor": true,
+    "new_unique_from_old": "9450db57bc47c161e4a248c0a282639ad84d718e test(group-state): await recovery bookkeeping before rebuilding after consumer failure (#23)\n506f1d8ab6fcb009706e6a63d3fd992815323fd2 merge: preserve G03 recovery and consumer completion with audited G01/G02 fixes\n1adf415995c21da0aa40c7748ba41bf9f40a6e05 fix(group-state): retire proofs before confirmation and clean cancelled writes (#22)\n80647647436e3ffb40aa5c5bd650c7ec5e96fddc merge: sync verified personal and G01 prerequisites into G02\nb32a00a78cd48baa343b3d37fc8bf4fee0d7bcf0 merge: sync audited framework prerequisites into G01\n95b05058f323caaf5ff83f29a460cb2823c438a5 fix(group-state): sync G01 fixes and close G02 audit gaps (#22)\nf797eadcf6196163340e4640de11385433e1ff76 Merge pull request #37 from xmxxc/feat/bot-modules-b01\n08b8b474a0f18441d6706cc2044ffb6d67621d7f Merge pull request #39 from xmxxc/integrate/bot-modules-framework\n09feaaa91c278fd126c9d570f9975e1df9bdeb73 fix(group-state): reject reads across module unload (#21)\n85f53f7924105b6f0a46903ce6434f9ff4aa5395 fix(group-state): report observation failures to group owners (#21)\ne501c95acd652d279912719b275f8fe66bca683f merge: sync before_handler module hook for bot modules (#28)\nbf462cf97bd61049c44ae53ac207f4f22bf32f34 feat(module): before_handler hook after dispatch receive checks\n6c3a4f98fe0dab1dabf053a4a89fa7fe8673d2bb fix(group-state): end failed refreshes and ignore stale page results (#21)\n3392592ff5c8d5fa8c4c60440118bd84179eb642 fix(group-state): publish committed facts and drain cancelled writes (#21)\n50fb971424d7e4a7205adb3cbd42f6f05c8b7fbf fix(account-sharing): correct storage import ordering\nb23572b04917a2891fdcce8ab33fd1ff97c931d5 merge: sync verified framework contracts for bot modules (#20)\n460c8419c3b685253f8f4233e773a582da57e44c feat(module): deliver verified local recovery contract on main (#20)\n398c6afe70055589d1f12ab35affe66ca6e2396c Merge remote-tracking branch 'upstream/main'\nb410938ed5aead906f9e5256228108057bb5dbd9 增加模块可自定义消息订阅类型（可适配自己的事件类型或内测接口）\nb557ac67fda3c0098fcbd92da39d64247993b332 feat(module): 增加连接与会话状态订阅及查询 (#110)",
+    "non_group_business_diff": "diff --git a/plugins/account_sharing/service.py b/plugins/account_sharing/service.py\nindex 60b79e8..955f4ec 100644\n--- a/plugins/account_sharing/service.py\n+++ b/plugins/account_sharing/service.py\n@@ -12,11 +12,11 @@ from aiohttp import web\n from core.base.config import cfg\n from core.base.logger import PLUGIN, get_logger\n from core.plugin._blacklist import get_blacklist_map\n-from .storage import ExtensionStore\n \n from .group_delivery import GroupDelivery\n from .identities import IdentityBindings\n from .menus import MenuSessions\n+from .storage import ExtensionStore\n \n log = get_logger(PLUGIN, '账户共享')\n PREFIX = '/api/ext/account-sharing/'",
+    "audit": "synchronization compatibility only; individual ticket audit remains",
+    "merged": false,
+    "publication1_head": "506f1d8ab6fcb009706e6a63d3fd992815323fd2",
+    "ci": [
+      {
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "url": "https://github.com/xmxxc/QQBotForge/actions/runs/39542190734/job/119032214813"
+      }
+    ],
+    "prerequisites_synced": true,
+    "next": "human review; individual independent audit still required",
+    "draft": true,
+    "base_ref": "personal"
+  },
+  {
+    "ticket": 24,
+    "pr": 43,
+    "name": "a01",
+    "branch": "feat/access-control-a01",
+    "old": "bfab97f584a2cde94b6c1013fd3ae0229af0ddc7",
+    "new": "8051d8f1f0d559e2a9826cc5a904c20c3b393ca0",
+    "previous": "9450db57bc47c161e4a248c0a282639ad84d718e",
+    "old_is_ancestor": true,
+    "prerequisite_is_ancestor": true,
+    "new_unique_from_old": "8051d8f1f0d559e2a9826cc5a904c20c3b393ca0 merge: sync deterministic recovery completion test into A01\n9450db57bc47c161e4a248c0a282639ad84d718e test(group-state): await recovery bookkeeping before rebuilding after consumer failure (#23)\n82f23c4ba58011154638ceb1bb040d195bcb0207 merge: retain A01 cycle and recovery checks with audited group-state fixes\n506f1d8ab6fcb009706e6a63d3fd992815323fd2 merge: preserve G03 recovery and consumer completion with audited G01/G02 fixes\n1adf415995c21da0aa40c7748ba41bf9f40a6e05 fix(group-state): retire proofs before confirmation and clean cancelled writes (#22)\n80647647436e3ffb40aa5c5bd650c7ec5e96fddc merge: sync verified personal and G01 prerequisites into G02\nb32a00a78cd48baa343b3d37fc8bf4fee0d7bcf0 merge: sync audited framework prerequisites into G01\n95b05058f323caaf5ff83f29a460cb2823c438a5 fix(group-state): sync G01 fixes and close G02 audit gaps (#22)\nf797eadcf6196163340e4640de11385433e1ff76 Merge pull request #37 from xmxxc/feat/bot-modules-b01\n08b8b474a0f18441d6706cc2044ffb6d67621d7f Merge pull request #39 from xmxxc/integrate/bot-modules-framework\n09feaaa91c278fd126c9d570f9975e1df9bdeb73 fix(group-state): reject reads across module unload (#21)\n85f53f7924105b6f0a46903ce6434f9ff4aa5395 fix(group-state): report observation failures to group owners (#21)\ne501c95acd652d279912719b275f8fe66bca683f merge: sync before_handler module hook for bot modules (#28)\nbf462cf97bd61049c44ae53ac207f4f22bf32f34 feat(module): before_handler hook after dispatch receive checks\n6c3a4f98fe0dab1dabf053a4a89fa7fe8673d2bb fix(group-state): end failed refreshes and ignore stale page results (#21)\n3392592ff5c8d5fa8c4c60440118bd84179eb642 fix(group-state): publish committed facts and drain cancelled writes (#21)\n50fb971424d7e4a7205adb3cbd42f6f05c8b7fbf fix(account-sharing): correct storage import ordering\nb23572b04917a2891fdcce8ab33fd1ff97c931d5 merge: sync verified framework contracts for bot modules (#20)\n460c8419c3b685253f8f4233e773a582da57e44c feat(module): deliver verified local recovery contract on main (#20)\n398c6afe70055589d1f12ab35affe66ca6e2396c Merge remote-tracking branch 'upstream/main'\nb410938ed5aead906f9e5256228108057bb5dbd9 增加模块可自定义消息订阅类型（可适配自己的事件类型或内测接口）\nb557ac67fda3c0098fcbd92da39d64247993b332 feat(module): 增加连接与会话状态订阅及查询 (#110)",
+    "non_group_business_diff": "diff --git a/plugins/account_sharing/service.py b/plugins/account_sharing/service.py\nindex 60b79e8..955f4ec 100644\n--- a/plugins/account_sharing/service.py\n+++ b/plugins/account_sharing/service.py\n@@ -12,11 +12,11 @@ from aiohttp import web\n from core.base.config import cfg\n from core.base.logger import PLUGIN, get_logger\n from core.plugin._blacklist import get_blacklist_map\n-from .storage import ExtensionStore\n \n from .group_delivery import GroupDelivery\n from .identities import IdentityBindings\n from .menus import MenuSessions\n+from .storage import ExtensionStore\n \n log = get_logger(PLUGIN, '账户共享')\n PREFIX = '/api/ext/account-sharing/'",
+    "audit": "synchronization compatibility only; individual ticket audit remains",
+    "merged": false,
+    "publication1_head": "82f23c4ba58011154638ceb1bb040d195bcb0207",
+    "ci": [
+      {
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "url": "https://github.com/xmxxc/QQBotForge/actions/runs/39542192674/job/119032221550"
+      }
+    ],
+    "prerequisites_synced": true,
+    "next": "human review; individual independent audit still required",
+    "draft": true,
+    "base_ref": "personal"
+  },
+  {
+    "ticket": 25,
+    "pr": 44,
+    "name": "a02",
+    "branch": "feat/access-control-a02",
+    "old": "57debf6d66c37d655da7d5437879881397115f20",
+    "new": "3ceef4af0fafad0ed204546e5eddd70e8e50735a",
+    "previous": "8051d8f1f0d559e2a9826cc5a904c20c3b393ca0",
+    "old_is_ancestor": true,
+    "prerequisite_is_ancestor": true,
+    "new_unique_from_old": "3ceef4af0fafad0ed204546e5eddd70e8e50735a merge: sync deterministic recovery completion test into A02\n8051d8f1f0d559e2a9826cc5a904c20c3b393ca0 merge: sync deterministic recovery completion test into A01\n9450db57bc47c161e4a248c0a282639ad84d718e test(group-state): await recovery bookkeeping before rebuilding after consumer failure (#23)\n9dbd8ddc918d67d37148a50ab7679821873d4007 merge: sync verified prerequisites into A02\n82f23c4ba58011154638ceb1bb040d195bcb0207 merge: retain A01 cycle and recovery checks with audited group-state fixes\n506f1d8ab6fcb009706e6a63d3fd992815323fd2 merge: preserve G03 recovery and consumer completion with audited G01/G02 fixes\n1adf415995c21da0aa40c7748ba41bf9f40a6e05 fix(group-state): retire proofs before confirmation and clean cancelled writes (#22)\n80647647436e3ffb40aa5c5bd650c7ec5e96fddc merge: sync verified personal and G01 prerequisites into G02\nb32a00a78cd48baa343b3d37fc8bf4fee0d7bcf0 merge: sync audited framework prerequisites into G01\n95b05058f323caaf5ff83f29a460cb2823c438a5 fix(group-state): sync G01 fixes and close G02 audit gaps (#22)\nf797eadcf6196163340e4640de11385433e1ff76 Merge pull request #37 from xmxxc/feat/bot-modules-b01\n08b8b474a0f18441d6706cc2044ffb6d67621d7f Merge pull request #39 from xmxxc/integrate/bot-modules-framework\n09feaaa91c278fd126c9d570f9975e1df9bdeb73 fix(group-state): reject reads across module unload (#21)\n85f53f7924105b6f0a46903ce6434f9ff4aa5395 fix(group-state): report observation failures to group owners (#21)\ne501c95acd652d279912719b275f8fe66bca683f merge: sync before_handler module hook for bot modules (#28)\nbf462cf97bd61049c44ae53ac207f4f22bf32f34 feat(module): before_handler hook after dispatch receive checks\n6c3a4f98fe0dab1dabf053a4a89fa7fe8673d2bb fix(group-state): end failed refreshes and ignore stale page results (#21)\n3392592ff5c8d5fa8c4c60440118bd84179eb642 fix(group-state): publish committed facts and drain cancelled writes (#21)\n50fb971424d7e4a7205adb3cbd42f6f05c8b7fbf fix(account-sharing): correct storage import ordering\nb23572b04917a2891fdcce8ab33fd1ff97c931d5 merge: sync verified framework contracts for bot modules (#20)\n460c8419c3b685253f8f4233e773a582da57e44c feat(module): deliver verified local recovery contract on main (#20)\n398c6afe70055589d1f12ab35affe66ca6e2396c Merge remote-tracking branch 'upstream/main'\nb410938ed5aead906f9e5256228108057bb5dbd9 增加模块可自定义消息订阅类型（可适配自己的事件类型或内测接口）\nb557ac67fda3c0098fcbd92da39d64247993b332 feat(module): 增加连接与会话状态订阅及查询 (#110)",
+    "non_group_business_diff": "diff --git a/plugins/account_sharing/service.py b/plugins/account_sharing/service.py\nindex 60b79e8..955f4ec 100644\n--- a/plugins/account_sharing/service.py\n+++ b/plugins/account_sharing/service.py\n@@ -12,11 +12,11 @@ from aiohttp import web\n from core.base.config import cfg\n from core.base.logger import PLUGIN, get_logger\n from core.plugin._blacklist import get_blacklist_map\n-from .storage import ExtensionStore\n \n from .group_delivery import GroupDelivery\n from .identities import IdentityBindings\n from .menus import MenuSessions\n+from .storage import ExtensionStore\n \n log = get_logger(PLUGIN, '账户共享')\n PREFIX = '/api/ext/account-sharing/'",
+    "audit": "synchronization compatibility only; individual ticket audit remains",
+    "merged": false,
+    "publication1_head": "9dbd8ddc918d67d37148a50ab7679821873d4007",
+    "ci": [
+      {
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "url": "https://github.com/xmxxc/QQBotForge/actions/runs/39542190189/job/119032212763"
+      }
+    ],
+    "prerequisites_synced": true,
+    "next": "human review; individual independent audit still required",
+    "draft": true,
+    "base_ref": "personal"
+  },
+  {
+    "ticket": 26,
+    "pr": 45,
+    "name": "a03",
+    "branch": "feat/access-control-a03",
+    "old": "7159d4c344b014b5eb025f9b4b97c7f6781a5133",
+    "new": "9d16161eac41872affac6ead9d371167160ae279",
+    "previous": "3ceef4af0fafad0ed204546e5eddd70e8e50735a",
+    "old_is_ancestor": true,
+    "prerequisite_is_ancestor": true,
+    "new_unique_from_old": "9d16161eac41872affac6ead9d371167160ae279 merge: sync deterministic recovery completion test into A03\n3ceef4af0fafad0ed204546e5eddd70e8e50735a merge: sync deterministic recovery completion test into A02\n8051d8f1f0d559e2a9826cc5a904c20c3b393ca0 merge: sync deterministic recovery completion test into A01\n9450db57bc47c161e4a248c0a282639ad84d718e test(group-state): await recovery bookkeeping before rebuilding after consumer failure (#23)\n232a4ade4ea29eee6cddbc0069b0d4bf80dcdd9d merge: sync verified prerequisites into A03\n9dbd8ddc918d67d37148a50ab7679821873d4007 merge: sync verified prerequisites into A02\n82f23c4ba58011154638ceb1bb040d195bcb0207 merge: retain A01 cycle and recovery checks with audited group-state fixes\n506f1d8ab6fcb009706e6a63d3fd992815323fd2 merge: preserve G03 recovery and consumer completion with audited G01/G02 fixes\n1adf415995c21da0aa40c7748ba41bf9f40a6e05 fix(group-state): retire proofs before confirmation and clean cancelled writes (#22)\n80647647436e3ffb40aa5c5bd650c7ec5e96fddc merge: sync verified personal and G01 prerequisites into G02\nb32a00a78cd48baa343b3d37fc8bf4fee0d7bcf0 merge: sync audited framework prerequisites into G01\n95b05058f323caaf5ff83f29a460cb2823c438a5 fix(group-state): sync G01 fixes and close G02 audit gaps (#22)\nf797eadcf6196163340e4640de11385433e1ff76 Merge pull request #37 from xmxxc/feat/bot-modules-b01\n08b8b474a0f18441d6706cc2044ffb6d67621d7f Merge pull request #39 from xmxxc/integrate/bot-modules-framework\n09feaaa91c278fd126c9d570f9975e1df9bdeb73 fix(group-state): reject reads across module unload (#21)\n85f53f7924105b6f0a46903ce6434f9ff4aa5395 fix(group-state): report observation failures to group owners (#21)\ne501c95acd652d279912719b275f8fe66bca683f merge: sync before_handler module hook for bot modules (#28)\nbf462cf97bd61049c44ae53ac207f4f22bf32f34 feat(module): before_handler hook after dispatch receive checks\n6c3a4f98fe0dab1dabf053a4a89fa7fe8673d2bb fix(group-state): end failed refreshes and ignore stale page results (#21)\n3392592ff5c8d5fa8c4c60440118bd84179eb642 fix(group-state): publish committed facts and drain cancelled writes (#21)\n50fb971424d7e4a7205adb3cbd42f6f05c8b7fbf fix(account-sharing): correct storage import ordering\nb23572b04917a2891fdcce8ab33fd1ff97c931d5 merge: sync verified framework contracts for bot modules (#20)\n460c8419c3b685253f8f4233e773a582da57e44c feat(module): deliver verified local recovery contract on main (#20)\n398c6afe70055589d1f12ab35affe66ca6e2396c Merge remote-tracking branch 'upstream/main'\nb410938ed5aead906f9e5256228108057bb5dbd9 增加模块可自定义消息订阅类型（可适配自己的事件类型或内测接口）\nb557ac67fda3c0098fcbd92da39d64247993b332 feat(module): 增加连接与会话状态订阅及查询 (#110)",
+    "non_group_business_diff": "diff --git a/plugins/account_sharing/service.py b/plugins/account_sharing/service.py\nindex 60b79e8..955f4ec 100644\n--- a/plugins/account_sharing/service.py\n+++ b/plugins/account_sharing/service.py\n@@ -12,11 +12,11 @@ from aiohttp import web\n from core.base.config import cfg\n from core.base.logger import PLUGIN, get_logger\n from core.plugin._blacklist import get_blacklist_map\n-from .storage import ExtensionStore\n \n from .group_delivery import GroupDelivery\n from .identities import IdentityBindings\n from .menus import MenuSessions\n+from .storage import ExtensionStore\n \n log = get_logger(PLUGIN, '账户共享')\n PREFIX = '/api/ext/account-sharing/'",
+    "audit": "synchronization compatibility only; individual ticket audit remains",
+    "merged": false,
+    "publication1_head": "232a4ade4ea29eee6cddbc0069b0d4bf80dcdd9d",
+    "ci": [
+      {
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "url": "https://github.com/xmxxc/QQBotForge/actions/runs/39542191914/job/119032218816"
+      }
+    ],
+    "prerequisites_synced": true,
+    "next": "human review; individual independent audit still required",
+    "draft": true,
+    "base_ref": "personal"
+  },
+  {
+    "ticket": 27,
+    "pr": 46,
+    "name": "a04",
+    "branch": "feat/access-control-a04",
+    "old": "6a73456f052c3f763e11581386306ec487283bc7",
+    "new": "befd36590941c1ea07eea338dd2a64cf187b6353",
+    "previous": "9d16161eac41872affac6ead9d371167160ae279",
+    "old_is_ancestor": true,
+    "prerequisite_is_ancestor": true,
+    "new_unique_from_old": "befd36590941c1ea07eea338dd2a64cf187b6353 merge: sync deterministic recovery completion test into A04\n9d16161eac41872affac6ead9d371167160ae279 merge: sync deterministic recovery completion test into A03\n3ceef4af0fafad0ed204546e5eddd70e8e50735a merge: sync deterministic recovery completion test into A02\n8051d8f1f0d559e2a9826cc5a904c20c3b393ca0 merge: sync deterministic recovery completion test into A01\n9450db57bc47c161e4a248c0a282639ad84d718e test(group-state): await recovery bookkeeping before rebuilding after consumer failure (#23)\n98827e71e44e459edd35244e6ecc4083c2e58b1c merge: sync verified prerequisites into A04\n232a4ade4ea29eee6cddbc0069b0d4bf80dcdd9d merge: sync verified prerequisites into A03\n9dbd8ddc918d67d37148a50ab7679821873d4007 merge: sync verified prerequisites into A02\n82f23c4ba58011154638ceb1bb040d195bcb0207 merge: retain A01 cycle and recovery checks with audited group-state fixes\n506f1d8ab6fcb009706e6a63d3fd992815323fd2 merge: preserve G03 recovery and consumer completion with audited G01/G02 fixes\n1adf415995c21da0aa40c7748ba41bf9f40a6e05 fix(group-state): retire proofs before confirmation and clean cancelled writes (#22)\n80647647436e3ffb40aa5c5bd650c7ec5e96fddc merge: sync verified personal and G01 prerequisites into G02\nb32a00a78cd48baa343b3d37fc8bf4fee0d7bcf0 merge: sync audited framework prerequisites into G01\n95b05058f323caaf5ff83f29a460cb2823c438a5 fix(group-state): sync G01 fixes and close G02 audit gaps (#22)\nf797eadcf6196163340e4640de11385433e1ff76 Merge pull request #37 from xmxxc/feat/bot-modules-b01\n08b8b474a0f18441d6706cc2044ffb6d67621d7f Merge pull request #39 from xmxxc/integrate/bot-modules-framework\n09feaaa91c278fd126c9d570f9975e1df9bdeb73 fix(group-state): reject reads across module unload (#21)\n85f53f7924105b6f0a46903ce6434f9ff4aa5395 fix(group-state): report observation failures to group owners (#21)\ne501c95acd652d279912719b275f8fe66bca683f merge: sync before_handler module hook for bot modules (#28)\nbf462cf97bd61049c44ae53ac207f4f22bf32f34 feat(module): before_handler hook after dispatch receive checks\n6c3a4f98fe0dab1dabf053a4a89fa7fe8673d2bb fix(group-state): end failed refreshes and ignore stale page results (#21)\n3392592ff5c8d5fa8c4c60440118bd84179eb642 fix(group-state): publish committed facts and drain cancelled writes (#21)\n50fb971424d7e4a7205adb3cbd42f6f05c8b7fbf fix(account-sharing): correct storage import ordering\nb23572b04917a2891fdcce8ab33fd1ff97c931d5 merge: sync verified framework contracts for bot modules (#20)\n460c8419c3b685253f8f4233e773a582da57e44c feat(module): deliver verified local recovery contract on main (#20)\n398c6afe70055589d1f12ab35affe66ca6e2396c Merge remote-tracking branch 'upstream/main'\nb410938ed5aead906f9e5256228108057bb5dbd9 增加模块可自定义消息订阅类型（可适配自己的事件类型或内测接口）\nb557ac67fda3c0098fcbd92da39d64247993b332 feat(module): 增加连接与会话状态订阅及查询 (#110)",
+    "non_group_business_diff": "diff --git a/plugins/account_sharing/service.py b/plugins/account_sharing/service.py\nindex 60b79e8..955f4ec 100644\n--- a/plugins/account_sharing/service.py\n+++ b/plugins/account_sharing/service.py\n@@ -12,11 +12,11 @@ from aiohttp import web\n from core.base.config import cfg\n from core.base.logger import PLUGIN, get_logger\n from core.plugin._blacklist import get_blacklist_map\n-from .storage import ExtensionStore\n \n from .group_delivery import GroupDelivery\n from .identities import IdentityBindings\n from .menus import MenuSessions\n+from .storage import ExtensionStore\n \n log = get_logger(PLUGIN, '账户共享')\n PREFIX = '/api/ext/account-sharing/'",
+    "audit": "synchronization compatibility only; individual ticket audit remains",
+    "merged": false,
+    "publication1_head": "98827e71e44e459edd35244e6ecc4083c2e58b1c",
+    "ci": [
+      {
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "url": "https://github.com/xmxxc/QQBotForge/actions/runs/39542190669/job/119032215506"
+      }
+    ],
+    "prerequisites_synced": true,
+    "next": "human review; individual independent audit still required",
+    "draft": true,
+    "base_ref": "personal"
+  },
+  {
+    "ticket": 28,
+    "pr": 48,
+    "name": "q01",
+    "branch": "feat/self-qa-q01",
+    "old": "a7e58746b41f91b294dee4d7477ef1e8fbd339a0",
+    "new": "63b21a364efa2193d0375473247337741d5195a0",
+    "previous": "befd36590941c1ea07eea338dd2a64cf187b6353",
+    "old_is_ancestor": true,
+    "prerequisite_is_ancestor": true,
+    "new_unique_from_old": "63b21a364efa2193d0375473247337741d5195a0 merge: sync deterministic recovery completion test into Q01\nbefd36590941c1ea07eea338dd2a64cf187b6353 merge: sync deterministic recovery completion test into A04\n9d16161eac41872affac6ead9d371167160ae279 merge: sync deterministic recovery completion test into A03\n3ceef4af0fafad0ed204546e5eddd70e8e50735a merge: sync deterministic recovery completion test into A02\n8051d8f1f0d559e2a9826cc5a904c20c3b393ca0 merge: sync deterministic recovery completion test into A01\n9450db57bc47c161e4a248c0a282639ad84d718e test(group-state): await recovery bookkeeping before rebuilding after consumer failure (#23)\n3a716c64c498d5ad9080d3d99344eb9b8ceb83ab merge: sync verified prerequisites into Q01\n98827e71e44e459edd35244e6ecc4083c2e58b1c merge: sync verified prerequisites into A04\n232a4ade4ea29eee6cddbc0069b0d4bf80dcdd9d merge: sync verified prerequisites into A03\n9dbd8ddc918d67d37148a50ab7679821873d4007 merge: sync verified prerequisites into A02\n82f23c4ba58011154638ceb1bb040d195bcb0207 merge: retain A01 cycle and recovery checks with audited group-state fixes\n506f1d8ab6fcb009706e6a63d3fd992815323fd2 merge: preserve G03 recovery and consumer completion with audited G01/G02 fixes\n1adf415995c21da0aa40c7748ba41bf9f40a6e05 fix(group-state): retire proofs before confirmation and clean cancelled writes (#22)\n80647647436e3ffb40aa5c5bd650c7ec5e96fddc merge: sync verified personal and G01 prerequisites into G02\nb32a00a78cd48baa343b3d37fc8bf4fee0d7bcf0 merge: sync audited framework prerequisites into G01\n95b05058f323caaf5ff83f29a460cb2823c438a5 fix(group-state): sync G01 fixes and close G02 audit gaps (#22)\nf797eadcf6196163340e4640de11385433e1ff76 Merge pull request #37 from xmxxc/feat/bot-modules-b01\n08b8b474a0f18441d6706cc2044ffb6d67621d7f Merge pull request #39 from xmxxc/integrate/bot-modules-framework\n09feaaa91c278fd126c9d570f9975e1df9bdeb73 fix(group-state): reject reads across module unload (#21)\n85f53f7924105b6f0a46903ce6434f9ff4aa5395 fix(group-state): report observation failures to group owners (#21)\ne501c95acd652d279912719b275f8fe66bca683f merge: sync before_handler module hook for bot modules (#28)\nbf462cf97bd61049c44ae53ac207f4f22bf32f34 feat(module): before_handler hook after dispatch receive checks\n6c3a4f98fe0dab1dabf053a4a89fa7fe8673d2bb fix(group-state): end failed refreshes and ignore stale page results (#21)\n3392592ff5c8d5fa8c4c60440118bd84179eb642 fix(group-state): publish committed facts and drain cancelled writes (#21)\n50fb971424d7e4a7205adb3cbd42f6f05c8b7fbf fix(account-sharing): correct storage import ordering\nb23572b04917a2891fdcce8ab33fd1ff97c931d5 merge: sync verified framework contracts for bot modules (#20)\n460c8419c3b685253f8f4233e773a582da57e44c feat(module): deliver verified local recovery contract on main (#20)\n398c6afe70055589d1f12ab35affe66ca6e2396c Merge remote-tracking branch 'upstream/main'\nb410938ed5aead906f9e5256228108057bb5dbd9 增加模块可自定义消息订阅类型（可适配自己的事件类型或内测接口）\nb557ac67fda3c0098fcbd92da39d64247993b332 feat(module): 增加连接与会话状态订阅及查询 (#110)",
+    "non_group_business_diff": "diff --git a/plugins/account_sharing/service.py b/plugins/account_sharing/service.py\nindex 60b79e8..955f4ec 100644\n--- a/plugins/account_sharing/service.py\n+++ b/plugins/account_sharing/service.py\n@@ -12,11 +12,11 @@ from aiohttp import web\n from core.base.config import cfg\n from core.base.logger import PLUGIN, get_logger\n from core.plugin._blacklist import get_blacklist_map\n-from .storage import ExtensionStore\n \n from .group_delivery import GroupDelivery\n from .identities import IdentityBindings\n from .menus import MenuSessions\n+from .storage import ExtensionStore\n \n log = get_logger(PLUGIN, '账户共享')\n PREFIX = '/api/ext/account-sharing/'",
+    "audit": "synchronization compatibility only; individual ticket audit remains",
+    "merged": false,
+    "publication1_head": "3a716c64c498d5ad9080d3d99344eb9b8ceb83ab",
+    "ci": [
+      {
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "url": "https://github.com/xmxxc/QQBotForge/actions/runs/39542192559/job/119032221001"
+      }
+    ],
+    "prerequisites_synced": true,
+    "next": "human review; individual independent audit still required",
+    "draft": true,
+    "base_ref": "personal"
+  },
+  {
+    "ticket": 29,
+    "pr": 49,
+    "name": "q02",
+    "branch": "feat/self-qa-q02",
+    "old": "68330979c689b5e4fed0348c1886808d87867156",
+    "new": "46c838696216f1e93374caa21f485a5f79c71f47",
+    "previous": "63b21a364efa2193d0375473247337741d5195a0",
+    "old_is_ancestor": true,
+    "prerequisite_is_ancestor": true,
+    "new_unique_from_old": "46c838696216f1e93374caa21f485a5f79c71f47 merge: sync deterministic recovery completion test into Q02\n63b21a364efa2193d0375473247337741d5195a0 merge: sync deterministic recovery completion test into Q01\nbefd36590941c1ea07eea338dd2a64cf187b6353 merge: sync deterministic recovery completion test into A04\n9d16161eac41872affac6ead9d371167160ae279 merge: sync deterministic recovery completion test into A03\n3ceef4af0fafad0ed204546e5eddd70e8e50735a merge: sync deterministic recovery completion test into A02\n8051d8f1f0d559e2a9826cc5a904c20c3b393ca0 merge: sync deterministic recovery completion test into A01\n9450db57bc47c161e4a248c0a282639ad84d718e test(group-state): await recovery bookkeeping before rebuilding after consumer failure (#23)\n706cd37f1a7c41cf51fb1aa010a5f94ee585d4d5 merge: sync verified prerequisites into Q02\n3a716c64c498d5ad9080d3d99344eb9b8ceb83ab merge: sync verified prerequisites into Q01\n98827e71e44e459edd35244e6ecc4083c2e58b1c merge: sync verified prerequisites into A04\n232a4ade4ea29eee6cddbc0069b0d4bf80dcdd9d merge: sync verified prerequisites into A03\n9dbd8ddc918d67d37148a50ab7679821873d4007 merge: sync verified prerequisites into A02\n82f23c4ba58011154638ceb1bb040d195bcb0207 merge: retain A01 cycle and recovery checks with audited group-state fixes\n506f1d8ab6fcb009706e6a63d3fd992815323fd2 merge: preserve G03 recovery and consumer completion with audited G01/G02 fixes\n1adf415995c21da0aa40c7748ba41bf9f40a6e05 fix(group-state): retire proofs before confirmation and clean cancelled writes (#22)\n80647647436e3ffb40aa5c5bd650c7ec5e96fddc merge: sync verified personal and G01 prerequisites into G02\nb32a00a78cd48baa343b3d37fc8bf4fee0d7bcf0 merge: sync audited framework prerequisites into G01\n95b05058f323caaf5ff83f29a460cb2823c438a5 fix(group-state): sync G01 fixes and close G02 audit gaps (#22)\nf797eadcf6196163340e4640de11385433e1ff76 Merge pull request #37 from xmxxc/feat/bot-modules-b01\n08b8b474a0f18441d6706cc2044ffb6d67621d7f Merge pull request #39 from xmxxc/integrate/bot-modules-framework\n09feaaa91c278fd126c9d570f9975e1df9bdeb73 fix(group-state): reject reads across module unload (#21)\n85f53f7924105b6f0a46903ce6434f9ff4aa5395 fix(group-state): report observation failures to group owners (#21)\ne501c95acd652d279912719b275f8fe66bca683f merge: sync before_handler module hook for bot modules (#28)\nbf462cf97bd61049c44ae53ac207f4f22bf32f34 feat(module): before_handler hook after dispatch receive checks\n6c3a4f98fe0dab1dabf053a4a89fa7fe8673d2bb fix(group-state): end failed refreshes and ignore stale page results (#21)\n3392592ff5c8d5fa8c4c60440118bd84179eb642 fix(group-state): publish committed facts and drain cancelled writes (#21)\n50fb971424d7e4a7205adb3cbd42f6f05c8b7fbf fix(account-sharing): correct storage import ordering\nb23572b04917a2891fdcce8ab33fd1ff97c931d5 merge: sync verified framework contracts for bot modules (#20)\n460c8419c3b685253f8f4233e773a582da57e44c feat(module): deliver verified local recovery contract on main (#20)\n398c6afe70055589d1f12ab35affe66ca6e2396c Merge remote-tracking branch 'upstream/main'\nb410938ed5aead906f9e5256228108057bb5dbd9 增加模块可自定义消息订阅类型（可适配自己的事件类型或内测接口）\nb557ac67fda3c0098fcbd92da39d64247993b332 feat(module): 增加连接与会话状态订阅及查询 (#110)",
+    "non_group_business_diff": "diff --git a/plugins/account_sharing/service.py b/plugins/account_sharing/service.py\nindex 60b79e8..955f4ec 100644\n--- a/plugins/account_sharing/service.py\n+++ b/plugins/account_sharing/service.py\n@@ -12,11 +12,11 @@ from aiohttp import web\n from core.base.config import cfg\n from core.base.logger import PLUGIN, get_logger\n from core.plugin._blacklist import get_blacklist_map\n-from .storage import ExtensionStore\n \n from .group_delivery import GroupDelivery\n from .identities import IdentityBindings\n from .menus import MenuSessions\n+from .storage import ExtensionStore\n \n log = get_logger(PLUGIN, '账户共享')\n PREFIX = '/api/ext/account-sharing/'",
+    "audit": "synchronization compatibility only; individual ticket audit remains",
+    "merged": false,
+    "publication1_head": "706cd37f1a7c41cf51fb1aa010a5f94ee585d4d5",
+    "ci": [
+      {
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "url": "https://github.com/xmxxc/QQBotForge/actions/runs/39542190306/job/119032214404"
+      }
+    ],
+    "prerequisites_synced": true,
+    "next": "human review; individual independent audit still required",
+    "draft": true,
+    "base_ref": "personal"
+  },
+  {
+    "ticket": 30,
+    "pr": 50,
+    "name": "q03",
+    "branch": "feat/self-qa-q03",
+    "old": "e33def9685bedbdae429c465147b9f875dbe9dcd",
+    "new": "8196e6ee9a3afdf0a6d76998dd34a97d929434a6",
+    "previous": "46c838696216f1e93374caa21f485a5f79c71f47",
+    "old_is_ancestor": true,
+    "prerequisite_is_ancestor": true,
+    "new_unique_from_old": "8196e6ee9a3afdf0a6d76998dd34a97d929434a6 merge: sync deterministic recovery completion test into Q03\n46c838696216f1e93374caa21f485a5f79c71f47 merge: sync deterministic recovery completion test into Q02\n63b21a364efa2193d0375473247337741d5195a0 merge: sync deterministic recovery completion test into Q01\nbefd36590941c1ea07eea338dd2a64cf187b6353 merge: sync deterministic recovery completion test into A04\n9d16161eac41872affac6ead9d371167160ae279 merge: sync deterministic recovery completion test into A03\n3ceef4af0fafad0ed204546e5eddd70e8e50735a merge: sync deterministic recovery completion test into A02\n8051d8f1f0d559e2a9826cc5a904c20c3b393ca0 merge: sync deterministic recovery completion test into A01\n9450db57bc47c161e4a248c0a282639ad84d718e test(group-state): await recovery bookkeeping before rebuilding after consumer failure (#23)\n94b5c1f89665f280a69f95a92033c11df63051be merge: sync verified prerequisites into Q03\n706cd37f1a7c41cf51fb1aa010a5f94ee585d4d5 merge: sync verified prerequisites into Q02\n3a716c64c498d5ad9080d3d99344eb9b8ceb83ab merge: sync verified prerequisites into Q01\n98827e71e44e459edd35244e6ecc4083c2e58b1c merge: sync verified prerequisites into A04\n232a4ade4ea29eee6cddbc0069b0d4bf80dcdd9d merge: sync verified prerequisites into A03\n9dbd8ddc918d67d37148a50ab7679821873d4007 merge: sync verified prerequisites into A02\n82f23c4ba58011154638ceb1bb040d195bcb0207 merge: retain A01 cycle and recovery checks with audited group-state fixes\n506f1d8ab6fcb009706e6a63d3fd992815323fd2 merge: preserve G03 recovery and consumer completion with audited G01/G02 fixes\n1adf415995c21da0aa40c7748ba41bf9f40a6e05 fix(group-state): retire proofs before confirmation and clean cancelled writes (#22)\n80647647436e3ffb40aa5c5bd650c7ec5e96fddc merge: sync verified personal and G01 prerequisites into G02\nb32a00a78cd48baa343b3d37fc8bf4fee0d7bcf0 merge: sync audited framework prerequisites into G01\n95b05058f323caaf5ff83f29a460cb2823c438a5 fix(group-state): sync G01 fixes and close G02 audit gaps (#22)\nf797eadcf6196163340e4640de11385433e1ff76 Merge pull request #37 from xmxxc/feat/bot-modules-b01\n08b8b474a0f18441d6706cc2044ffb6d67621d7f Merge pull request #39 from xmxxc/integrate/bot-modules-framework\n09feaaa91c278fd126c9d570f9975e1df9bdeb73 fix(group-state): reject reads across module unload (#21)\n85f53f7924105b6f0a46903ce6434f9ff4aa5395 fix(group-state): report observation failures to group owners (#21)\ne501c95acd652d279912719b275f8fe66bca683f merge: sync before_handler module hook for bot modules (#28)\nbf462cf97bd61049c44ae53ac207f4f22bf32f34 feat(module): before_handler hook after dispatch receive checks\n6c3a4f98fe0dab1dabf053a4a89fa7fe8673d2bb fix(group-state): end failed refreshes and ignore stale page results (#21)\n3392592ff5c8d5fa8c4c60440118bd84179eb642 fix(group-state): publish committed facts and drain cancelled writes (#21)\n50fb971424d7e4a7205adb3cbd42f6f05c8b7fbf fix(account-sharing): correct storage import ordering\nb23572b04917a2891fdcce8ab33fd1ff97c931d5 merge: sync verified framework contracts for bot modules (#20)\n460c8419c3b685253f8f4233e773a582da57e44c feat(module): deliver verified local recovery contract on main (#20)\n398c6afe70055589d1f12ab35affe66ca6e2396c Merge remote-tracking branch 'upstream/main'\nb410938ed5aead906f9e5256228108057bb5dbd9 增加模块可自定义消息订阅类型（可适配自己的事件类型或内测接口）\nb557ac67fda3c0098fcbd92da39d64247993b332 feat(module): 增加连接与会话状态订阅及查询 (#110)",
+    "non_group_business_diff": "diff --git a/plugins/account_sharing/service.py b/plugins/account_sharing/service.py\nindex 60b79e8..955f4ec 100644\n--- a/plugins/account_sharing/service.py\n+++ b/plugins/account_sharing/service.py\n@@ -12,11 +12,11 @@ from aiohttp import web\n from core.base.config import cfg\n from core.base.logger import PLUGIN, get_logger\n from core.plugin._blacklist import get_blacklist_map\n-from .storage import ExtensionStore\n \n from .group_delivery import GroupDelivery\n from .identities import IdentityBindings\n from .menus import MenuSessions\n+from .storage import ExtensionStore\n \n log = get_logger(PLUGIN, '账户共享')\n PREFIX = '/api/ext/account-sharing/'",
+    "audit": "synchronization compatibility only; individual ticket audit remains",
+    "merged": false,
+    "publication1_head": "94b5c1f89665f280a69f95a92033c11df63051be",
+    "ci": [
+      {
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "url": "https://github.com/xmxxc/QQBotForge/actions/runs/39542192059/job/119032219783"
+      }
+    ],
+    "prerequisites_synced": true,
+    "next": "human review; individual independent audit still required",
+    "draft": true,
+    "base_ref": "personal"
+  },
+  {
+    "ticket": 31,
+    "pr": 51,
+    "name": "q04",
+    "branch": "feat/self-qa-q04",
+    "old": "00be98b991d51f5060038257bfb8668a173b6acd",
+    "new": "feb8274201f71b735f441068a1d20d83c0c6ba94",
+    "previous": "8196e6ee9a3afdf0a6d76998dd34a97d929434a6",
+    "old_is_ancestor": true,
+    "prerequisite_is_ancestor": true,
+    "new_unique_from_old": "feb8274201f71b735f441068a1d20d83c0c6ba94 merge: sync deterministic recovery completion test into Q04\n8196e6ee9a3afdf0a6d76998dd34a97d929434a6 merge: sync deterministic recovery completion test into Q03\n46c838696216f1e93374caa21f485a5f79c71f47 merge: sync deterministic recovery completion test into Q02\n63b21a364efa2193d0375473247337741d5195a0 merge: sync deterministic recovery completion test into Q01\nbefd36590941c1ea07eea338dd2a64cf187b6353 merge: sync deterministic recovery completion test into A04\n9d16161eac41872affac6ead9d371167160ae279 merge: sync deterministic recovery completion test into A03\n3ceef4af0fafad0ed204546e5eddd70e8e50735a merge: sync deterministic recovery completion test into A02\n8051d8f1f0d559e2a9826cc5a904c20c3b393ca0 merge: sync deterministic recovery completion test into A01\n9450db57bc47c161e4a248c0a282639ad84d718e test(group-state): await recovery bookkeeping before rebuilding after consumer failure (#23)\na37a2cc0a5860fbefb0af8ef84e58b01b6f562f5 merge: sync verified prerequisites into Q04\n94b5c1f89665f280a69f95a92033c11df63051be merge: sync verified prerequisites into Q03\n706cd37f1a7c41cf51fb1aa010a5f94ee585d4d5 merge: sync verified prerequisites into Q02\n3a716c64c498d5ad9080d3d99344eb9b8ceb83ab merge: sync verified prerequisites into Q01\n98827e71e44e459edd35244e6ecc4083c2e58b1c merge: sync verified prerequisites into A04\n232a4ade4ea29eee6cddbc0069b0d4bf80dcdd9d merge: sync verified prerequisites into A03\n9dbd8ddc918d67d37148a50ab7679821873d4007 merge: sync verified prerequisites into A02\n82f23c4ba58011154638ceb1bb040d195bcb0207 merge: retain A01 cycle and recovery checks with audited group-state fixes\n506f1d8ab6fcb009706e6a63d3fd992815323fd2 merge: preserve G03 recovery and consumer completion with audited G01/G02 fixes\n1adf415995c21da0aa40c7748ba41bf9f40a6e05 fix(group-state): retire proofs before confirmation and clean cancelled writes (#22)\n80647647436e3ffb40aa5c5bd650c7ec5e96fddc merge: sync verified personal and G01 prerequisites into G02\nb32a00a78cd48baa343b3d37fc8bf4fee0d7bcf0 merge: sync audited framework prerequisites into G01\n95b05058f323caaf5ff83f29a460cb2823c438a5 fix(group-state): sync G01 fixes and close G02 audit gaps (#22)\nf797eadcf6196163340e4640de11385433e1ff76 Merge pull request #37 from xmxxc/feat/bot-modules-b01\n08b8b474a0f18441d6706cc2044ffb6d67621d7f Merge pull request #39 from xmxxc/integrate/bot-modules-framework\n09feaaa91c278fd126c9d570f9975e1df9bdeb73 fix(group-state): reject reads across module unload (#21)\n85f53f7924105b6f0a46903ce6434f9ff4aa5395 fix(group-state): report observation failures to group owners (#21)\ne501c95acd652d279912719b275f8fe66bca683f merge: sync before_handler module hook for bot modules (#28)\nbf462cf97bd61049c44ae53ac207f4f22bf32f34 feat(module): before_handler hook after dispatch receive checks\n6c3a4f98fe0dab1dabf053a4a89fa7fe8673d2bb fix(group-state): end failed refreshes and ignore stale page results (#21)\n3392592ff5c8d5fa8c4c60440118bd84179eb642 fix(group-state): publish committed facts and drain cancelled writes (#21)\n50fb971424d7e4a7205adb3cbd42f6f05c8b7fbf fix(account-sharing): correct storage import ordering\nb23572b04917a2891fdcce8ab33fd1ff97c931d5 merge: sync verified framework contracts for bot modules (#20)\n460c8419c3b685253f8f4233e773a582da57e44c feat(module): deliver verified local recovery contract on main (#20)\n398c6afe70055589d1f12ab35affe66ca6e2396c Merge remote-tracking branch 'upstream/main'\nb410938ed5aead906f9e5256228108057bb5dbd9 增加模块可自定义消息订阅类型（可适配自己的事件类型或内测接口）\nb557ac67fda3c0098fcbd92da39d64247993b332 feat(module): 增加连接与会话状态订阅及查询 (#110)",
+    "non_group_business_diff": "diff --git a/plugins/account_sharing/service.py b/plugins/account_sharing/service.py\nindex 60b79e8..955f4ec 100644\n--- a/plugins/account_sharing/service.py\n+++ b/plugins/account_sharing/service.py\n@@ -12,11 +12,11 @@ from aiohttp import web\n from core.base.config import cfg\n from core.base.logger import PLUGIN, get_logger\n from core.plugin._blacklist import get_blacklist_map\n-from .storage import ExtensionStore\n \n from .group_delivery import GroupDelivery\n from .identities import IdentityBindings\n from .menus import MenuSessions\n+from .storage import ExtensionStore\n \n log = get_logger(PLUGIN, '账户共享')\n PREFIX = '/api/ext/account-sharing/'",
+    "audit": "synchronization compatibility only; individual ticket audit remains",
+    "merged": false,
+    "publication1_head": "a37a2cc0a5860fbefb0af8ef84e58b01b6f562f5",
+    "ci": [
+      {
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "url": "https://github.com/xmxxc/QQBotForge/actions/runs/39542190217/job/119032213158"
+      }
+    ],
+    "prerequisites_synced": true,
+    "next": "human review; individual independent audit still required",
+    "draft": true,
+    "base_ref": "personal"
+  },
+  {
+    "ticket": 32,
+    "pr": 52,
+    "name": "q05",
+    "branch": "feat/self-qa-q05",
+    "old": "e6718346f08a1bcb523a37aa5c8e24f9ebe34297",
+    "new": "c7098a76c0800481ef7dc198c8869b93bf4f1f23",
+    "previous": "feb8274201f71b735f441068a1d20d83c0c6ba94",
+    "old_is_ancestor": true,
+    "prerequisite_is_ancestor": true,
+    "new_unique_from_old": "c7098a76c0800481ef7dc198c8869b93bf4f1f23 merge: sync deterministic recovery completion test into Q05\nfeb8274201f71b735f441068a1d20d83c0c6ba94 merge: sync deterministic recovery completion test into Q04\n8196e6ee9a3afdf0a6d76998dd34a97d929434a6 merge: sync deterministic recovery completion test into Q03\n46c838696216f1e93374caa21f485a5f79c71f47 merge: sync deterministic recovery completion test into Q02\n63b21a364efa2193d0375473247337741d5195a0 merge: sync deterministic recovery completion test into Q01\nbefd36590941c1ea07eea338dd2a64cf187b6353 merge: sync deterministic recovery completion test into A04\n9d16161eac41872affac6ead9d371167160ae279 merge: sync deterministic recovery completion test into A03\n3ceef4af0fafad0ed204546e5eddd70e8e50735a merge: sync deterministic recovery completion test into A02\n8051d8f1f0d559e2a9826cc5a904c20c3b393ca0 merge: sync deterministic recovery completion test into A01\n9450db57bc47c161e4a248c0a282639ad84d718e test(group-state): await recovery bookkeeping before rebuilding after consumer failure (#23)\nd28fe915b5bb7537828e04ea7ace201a1e39fb2b merge: sync verified prerequisites into Q05\na37a2cc0a5860fbefb0af8ef84e58b01b6f562f5 merge: sync verified prerequisites into Q04\n94b5c1f89665f280a69f95a92033c11df63051be merge: sync verified prerequisites into Q03\n706cd37f1a7c41cf51fb1aa010a5f94ee585d4d5 merge: sync verified prerequisites into Q02\n3a716c64c498d5ad9080d3d99344eb9b8ceb83ab merge: sync verified prerequisites into Q01\n98827e71e44e459edd35244e6ecc4083c2e58b1c merge: sync verified prerequisites into A04\n232a4ade4ea29eee6cddbc0069b0d4bf80dcdd9d merge: sync verified prerequisites into A03\n9dbd8ddc918d67d37148a50ab7679821873d4007 merge: sync verified prerequisites into A02\n82f23c4ba58011154638ceb1bb040d195bcb0207 merge: retain A01 cycle and recovery checks with audited group-state fixes\n506f1d8ab6fcb009706e6a63d3fd992815323fd2 merge: preserve G03 recovery and consumer completion with audited G01/G02 fixes\n1adf415995c21da0aa40c7748ba41bf9f40a6e05 fix(group-state): retire proofs before confirmation and clean cancelled writes (#22)\n80647647436e3ffb40aa5c5bd650c7ec5e96fddc merge: sync verified personal and G01 prerequisites into G02\nb32a00a78cd48baa343b3d37fc8bf4fee0d7bcf0 merge: sync audited framework prerequisites into G01\n95b05058f323caaf5ff83f29a460cb2823c438a5 fix(group-state): sync G01 fixes and close G02 audit gaps (#22)\nf797eadcf6196163340e4640de11385433e1ff76 Merge pull request #37 from xmxxc/feat/bot-modules-b01\n08b8b474a0f18441d6706cc2044ffb6d67621d7f Merge pull request #39 from xmxxc/integrate/bot-modules-framework\n09feaaa91c278fd126c9d570f9975e1df9bdeb73 fix(group-state): reject reads across module unload (#21)\n85f53f7924105b6f0a46903ce6434f9ff4aa5395 fix(group-state): report observation failures to group owners (#21)\ne501c95acd652d279912719b275f8fe66bca683f merge: sync before_handler module hook for bot modules (#28)\nbf462cf97bd61049c44ae53ac207f4f22bf32f34 feat(module): before_handler hook after dispatch receive checks\n6c3a4f98fe0dab1dabf053a4a89fa7fe8673d2bb fix(group-state): end failed refreshes and ignore stale page results (#21)\n3392592ff5c8d5fa8c4c60440118bd84179eb642 fix(group-state): publish committed facts and drain cancelled writes (#21)\n50fb971424d7e4a7205adb3cbd42f6f05c8b7fbf fix(account-sharing): correct storage import ordering\nb23572b04917a2891fdcce8ab33fd1ff97c931d5 merge: sync verified framework contracts for bot modules (#20)\n460c8419c3b685253f8f4233e773a582da57e44c feat(module): deliver verified local recovery contract on main (#20)\n398c6afe70055589d1f12ab35affe66ca6e2396c Merge remote-tracking branch 'upstream/main'\nb410938ed5aead906f9e5256228108057bb5dbd9 增加模块可自定义消息订阅类型（可适配自己的事件类型或内测接口）\nb557ac67fda3c0098fcbd92da39d64247993b332 feat(module): 增加连接与会话状态订阅及查询 (#110)",
+    "non_group_business_diff": "diff --git a/plugins/account_sharing/service.py b/plugins/account_sharing/service.py\nindex 60b79e8..955f4ec 100644\n--- a/plugins/account_sharing/service.py\n+++ b/plugins/account_sharing/service.py\n@@ -12,11 +12,11 @@ from aiohttp import web\n from core.base.config import cfg\n from core.base.logger import PLUGIN, get_logger\n from core.plugin._blacklist import get_blacklist_map\n-from .storage import ExtensionStore\n \n from .group_delivery import GroupDelivery\n from .identities import IdentityBindings\n from .menus import MenuSessions\n+from .storage import ExtensionStore\n \n log = get_logger(PLUGIN, '账户共享')\n PREFIX = '/api/ext/account-sharing/'",
+    "audit": "synchronization compatibility only; individual ticket audit remains",
+    "merged": false,
+    "publication1_head": "d28fe915b5bb7537828e04ea7ace201a1e39fb2b",
+    "ci": [
+      {
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "url": "https://github.com/xmxxc/QQBotForge/actions/runs/39542190166/job/119032212987"
+      }
+    ],
+    "prerequisites_synced": true,
+    "next": "human review; individual independent audit still required",
+    "draft": true,
+    "base_ref": "personal"
+  },
+  {
+    "ticket": 33,
+    "pr": 53,
+    "name": "c01",
+    "branch": "feat/account-sharing-c01",
+    "old": "2b99c372a725ed7e73d56a99e8f372476863d003",
+    "new": "aae6fadeabe93c61db2286c8d514c1613f9c3b58",
+    "previous": "c7098a76c0800481ef7dc198c8869b93bf4f1f23",
+    "old_is_ancestor": true,
+    "prerequisite_is_ancestor": true,
+    "new_unique_from_old": "aae6fadeabe93c61db2286c8d514c1613f9c3b58 merge: sync deterministic recovery completion test into C01\nc7098a76c0800481ef7dc198c8869b93bf4f1f23 merge: sync deterministic recovery completion test into Q05\nfeb8274201f71b735f441068a1d20d83c0c6ba94 merge: sync deterministic recovery completion test into Q04\n8196e6ee9a3afdf0a6d76998dd34a97d929434a6 merge: sync deterministic recovery completion test into Q03\n46c838696216f1e93374caa21f485a5f79c71f47 merge: sync deterministic recovery completion test into Q02\n63b21a364efa2193d0375473247337741d5195a0 merge: sync deterministic recovery completion test into Q01\nbefd36590941c1ea07eea338dd2a64cf187b6353 merge: sync deterministic recovery completion test into A04\n9d16161eac41872affac6ead9d371167160ae279 merge: sync deterministic recovery completion test into A03\n3ceef4af0fafad0ed204546e5eddd70e8e50735a merge: sync deterministic recovery completion test into A02\n8051d8f1f0d559e2a9826cc5a904c20c3b393ca0 merge: sync deterministic recovery completion test into A01\n9450db57bc47c161e4a248c0a282639ad84d718e test(group-state): await recovery bookkeeping before rebuilding after consumer failure (#23)\nf6b0cab25f6ae15442d77f528ae7bc146c1173a0 merge: sync verified prerequisites into C01\nd28fe915b5bb7537828e04ea7ace201a1e39fb2b merge: sync verified prerequisites into Q05\na37a2cc0a5860fbefb0af8ef84e58b01b6f562f5 merge: sync verified prerequisites into Q04\n94b5c1f89665f280a69f95a92033c11df63051be merge: sync verified prerequisites into Q03\n706cd37f1a7c41cf51fb1aa010a5f94ee585d4d5 merge: sync verified prerequisites into Q02\n3a716c64c498d5ad9080d3d99344eb9b8ceb83ab merge: sync verified prerequisites into Q01\n98827e71e44e459edd35244e6ecc4083c2e58b1c merge: sync verified prerequisites into A04\n232a4ade4ea29eee6cddbc0069b0d4bf80dcdd9d merge: sync verified prerequisites into A03\n9dbd8ddc918d67d37148a50ab7679821873d4007 merge: sync verified prerequisites into A02\n82f23c4ba58011154638ceb1bb040d195bcb0207 merge: retain A01 cycle and recovery checks with audited group-state fixes\n506f1d8ab6fcb009706e6a63d3fd992815323fd2 merge: preserve G03 recovery and consumer completion with audited G01/G02 fixes\n1adf415995c21da0aa40c7748ba41bf9f40a6e05 fix(group-state): retire proofs before confirmation and clean cancelled writes (#22)\n80647647436e3ffb40aa5c5bd650c7ec5e96fddc merge: sync verified personal and G01 prerequisites into G02\nb32a00a78cd48baa343b3d37fc8bf4fee0d7bcf0 merge: sync audited framework prerequisites into G01\n95b05058f323caaf5ff83f29a460cb2823c438a5 fix(group-state): sync G01 fixes and close G02 audit gaps (#22)\nf797eadcf6196163340e4640de11385433e1ff76 Merge pull request #37 from xmxxc/feat/bot-modules-b01\n08b8b474a0f18441d6706cc2044ffb6d67621d7f Merge pull request #39 from xmxxc/integrate/bot-modules-framework\n09feaaa91c278fd126c9d570f9975e1df9bdeb73 fix(group-state): reject reads across module unload (#21)\n85f53f7924105b6f0a46903ce6434f9ff4aa5395 fix(group-state): report observation failures to group owners (#21)\ne501c95acd652d279912719b275f8fe66bca683f merge: sync before_handler module hook for bot modules (#28)\nbf462cf97bd61049c44ae53ac207f4f22bf32f34 feat(module): before_handler hook after dispatch receive checks\n6c3a4f98fe0dab1dabf053a4a89fa7fe8673d2bb fix(group-state): end failed refreshes and ignore stale page results (#21)\n3392592ff5c8d5fa8c4c60440118bd84179eb642 fix(group-state): publish committed facts and drain cancelled writes (#21)\n50fb971424d7e4a7205adb3cbd42f6f05c8b7fbf fix(account-sharing): correct storage import ordering\nb23572b04917a2891fdcce8ab33fd1ff97c931d5 merge: sync verified framework contracts for bot modules (#20)\n460c8419c3b685253f8f4233e773a582da57e44c feat(module): deliver verified local recovery contract on main (#20)\n398c6afe70055589d1f12ab35affe66ca6e2396c Merge remote-tracking branch 'upstream/main'\nb410938ed5aead906f9e5256228108057bb5dbd9 增加模块可自定义消息订阅类型（可适配自己的事件类型或内测接口）\nb557ac67fda3c0098fcbd92da39d64247993b332 feat(module): 增加连接与会话状态订阅及查询 (#110)",
+    "non_group_business_diff": "",
+    "audit": "synchronization compatibility only; individual ticket audit remains",
+    "merged": false,
+    "publication1_head": "f6b0cab25f6ae15442d77f528ae7bc146c1173a0",
+    "ci": [
+      {
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "url": "https://github.com/xmxxc/QQBotForge/actions/runs/39542191140/job/119032216114"
+      }
+    ],
+    "prerequisites_synced": true,
+    "next": "human review; individual independent audit still required",
+    "draft": true,
+    "base_ref": "personal"
+  },
+  {
+    "ticket": 34,
+    "pr": 54,
+    "name": "c02",
+    "branch": "feat/account-sharing-c02",
+    "old": "6f4483768b53d83fe70e8043d297ea210c81ada0",
+    "new": "848126ae09470599ab6af5f35b1ef3e226d999a4",
+    "previous": "aae6fadeabe93c61db2286c8d514c1613f9c3b58",
+    "old_is_ancestor": true,
+    "prerequisite_is_ancestor": true,
+    "new_unique_from_old": "848126ae09470599ab6af5f35b1ef3e226d999a4 merge: sync deterministic recovery completion test into C02\naae6fadeabe93c61db2286c8d514c1613f9c3b58 merge: sync deterministic recovery completion test into C01\nc7098a76c0800481ef7dc198c8869b93bf4f1f23 merge: sync deterministic recovery completion test into Q05\nfeb8274201f71b735f441068a1d20d83c0c6ba94 merge: sync deterministic recovery completion test into Q04\n8196e6ee9a3afdf0a6d76998dd34a97d929434a6 merge: sync deterministic recovery completion test into Q03\n46c838696216f1e93374caa21f485a5f79c71f47 merge: sync deterministic recovery completion test into Q02\n63b21a364efa2193d0375473247337741d5195a0 merge: sync deterministic recovery completion test into Q01\nbefd36590941c1ea07eea338dd2a64cf187b6353 merge: sync deterministic recovery completion test into A04\n9d16161eac41872affac6ead9d371167160ae279 merge: sync deterministic recovery completion test into A03\n3ceef4af0fafad0ed204546e5eddd70e8e50735a merge: sync deterministic recovery completion test into A02\n8051d8f1f0d559e2a9826cc5a904c20c3b393ca0 merge: sync deterministic recovery completion test into A01\n9450db57bc47c161e4a248c0a282639ad84d718e test(group-state): await recovery bookkeeping before rebuilding after consumer failure (#23)\na6b6a7601fdb027a45d7cd576d66cda329132a62 merge: sync verified prerequisites into C02\nf6b0cab25f6ae15442d77f528ae7bc146c1173a0 merge: sync verified prerequisites into C01\nd28fe915b5bb7537828e04ea7ace201a1e39fb2b merge: sync verified prerequisites into Q05\na37a2cc0a5860fbefb0af8ef84e58b01b6f562f5 merge: sync verified prerequisites into Q04\n94b5c1f89665f280a69f95a92033c11df63051be merge: sync verified prerequisites into Q03\n706cd37f1a7c41cf51fb1aa010a5f94ee585d4d5 merge: sync verified prerequisites into Q02\n3a716c64c498d5ad9080d3d99344eb9b8ceb83ab merge: sync verified prerequisites into Q01\n98827e71e44e459edd35244e6ecc4083c2e58b1c merge: sync verified prerequisites into A04\n232a4ade4ea29eee6cddbc0069b0d4bf80dcdd9d merge: sync verified prerequisites into A03\n9dbd8ddc918d67d37148a50ab7679821873d4007 merge: sync verified prerequisites into A02\n82f23c4ba58011154638ceb1bb040d195bcb0207 merge: retain A01 cycle and recovery checks with audited group-state fixes\n506f1d8ab6fcb009706e6a63d3fd992815323fd2 merge: preserve G03 recovery and consumer completion with audited G01/G02 fixes\n1adf415995c21da0aa40c7748ba41bf9f40a6e05 fix(group-state): retire proofs before confirmation and clean cancelled writes (#22)\n80647647436e3ffb40aa5c5bd650c7ec5e96fddc merge: sync verified personal and G01 prerequisites into G02\nb32a00a78cd48baa343b3d37fc8bf4fee0d7bcf0 merge: sync audited framework prerequisites into G01\n95b05058f323caaf5ff83f29a460cb2823c438a5 fix(group-state): sync G01 fixes and close G02 audit gaps (#22)\nf797eadcf6196163340e4640de11385433e1ff76 Merge pull request #37 from xmxxc/feat/bot-modules-b01\n08b8b474a0f18441d6706cc2044ffb6d67621d7f Merge pull request #39 from xmxxc/integrate/bot-modules-framework\n09feaaa91c278fd126c9d570f9975e1df9bdeb73 fix(group-state): reject reads across module unload (#21)\n85f53f7924105b6f0a46903ce6434f9ff4aa5395 fix(group-state): report observation failures to group owners (#21)\ne501c95acd652d279912719b275f8fe66bca683f merge: sync before_handler module hook for bot modules (#28)\nbf462cf97bd61049c44ae53ac207f4f22bf32f34 feat(module): before_handler hook after dispatch receive checks\n6c3a4f98fe0dab1dabf053a4a89fa7fe8673d2bb fix(group-state): end failed refreshes and ignore stale page results (#21)\n3392592ff5c8d5fa8c4c60440118bd84179eb642 fix(group-state): publish committed facts and drain cancelled writes (#21)\n50fb971424d7e4a7205adb3cbd42f6f05c8b7fbf fix(account-sharing): correct storage import ordering\nb23572b04917a2891fdcce8ab33fd1ff97c931d5 merge: sync verified framework contracts for bot modules (#20)\n460c8419c3b685253f8f4233e773a582da57e44c feat(module): deliver verified local recovery contract on main (#20)\n398c6afe70055589d1f12ab35affe66ca6e2396c Merge remote-tracking branch 'upstream/main'\nb410938ed5aead906f9e5256228108057bb5dbd9 增加模块可自定义消息订阅类型（可适配自己的事件类型或内测接口）\nb557ac67fda3c0098fcbd92da39d64247993b332 feat(module): 增加连接与会话状态订阅及查询 (#110)",
+    "non_group_business_diff": "",
+    "audit": "synchronization compatibility only; individual ticket audit remains",
+    "merged": false,
+    "publication1_head": "a6b6a7601fdb027a45d7cd576d66cda329132a62",
+    "ci": [
+      {
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "url": "https://github.com/xmxxc/QQBotForge/actions/runs/39542190822/job/119032215107"
+      }
+    ],
+    "prerequisites_synced": true,
+    "next": "human review; individual independent audit still required",
+    "draft": true,
+    "base_ref": "personal"
+  },
+  {
+    "ticket": 35,
+    "pr": 55,
+    "name": "c03",
+    "branch": "feat/account-sharing-c03",
+    "old": "1fc289a44bb2254f0db7ef5ccaca375f8a9fc89c",
+    "new": "a4daf04fc862ea494825ba9a895f83698b70db35",
+    "previous": "848126ae09470599ab6af5f35b1ef3e226d999a4",
+    "old_is_ancestor": true,
+    "prerequisite_is_ancestor": true,
+    "new_unique_from_old": "a4daf04fc862ea494825ba9a895f83698b70db35 merge: sync deterministic recovery completion test into C03\n848126ae09470599ab6af5f35b1ef3e226d999a4 merge: sync deterministic recovery completion test into C02\naae6fadeabe93c61db2286c8d514c1613f9c3b58 merge: sync deterministic recovery completion test into C01\nc7098a76c0800481ef7dc198c8869b93bf4f1f23 merge: sync deterministic recovery completion test into Q05\nfeb8274201f71b735f441068a1d20d83c0c6ba94 merge: sync deterministic recovery completion test into Q04\n8196e6ee9a3afdf0a6d76998dd34a97d929434a6 merge: sync deterministic recovery completion test into Q03\n46c838696216f1e93374caa21f485a5f79c71f47 merge: sync deterministic recovery completion test into Q02\n63b21a364efa2193d0375473247337741d5195a0 merge: sync deterministic recovery completion test into Q01\nbefd36590941c1ea07eea338dd2a64cf187b6353 merge: sync deterministic recovery completion test into A04\n9d16161eac41872affac6ead9d371167160ae279 merge: sync deterministic recovery completion test into A03\n3ceef4af0fafad0ed204546e5eddd70e8e50735a merge: sync deterministic recovery completion test into A02\n8051d8f1f0d559e2a9826cc5a904c20c3b393ca0 merge: sync deterministic recovery completion test into A01\n9450db57bc47c161e4a248c0a282639ad84d718e test(group-state): await recovery bookkeeping before rebuilding after consumer failure (#23)\nb2dd971d07c5f5bf378d6233bb6ab925745f784c merge: sync verified prerequisites into C03\na6b6a7601fdb027a45d7cd576d66cda329132a62 merge: sync verified prerequisites into C02\nf6b0cab25f6ae15442d77f528ae7bc146c1173a0 merge: sync verified prerequisites into C01\nd28fe915b5bb7537828e04ea7ace201a1e39fb2b merge: sync verified prerequisites into Q05\na37a2cc0a5860fbefb0af8ef84e58b01b6f562f5 merge: sync verified prerequisites into Q04\n94b5c1f89665f280a69f95a92033c11df63051be merge: sync verified prerequisites into Q03\n706cd37f1a7c41cf51fb1aa010a5f94ee585d4d5 merge: sync verified prerequisites into Q02\n3a716c64c498d5ad9080d3d99344eb9b8ceb83ab merge: sync verified prerequisites into Q01\n98827e71e44e459edd35244e6ecc4083c2e58b1c merge: sync verified prerequisites into A04\n232a4ade4ea29eee6cddbc0069b0d4bf80dcdd9d merge: sync verified prerequisites into A03\n9dbd8ddc918d67d37148a50ab7679821873d4007 merge: sync verified prerequisites into A02\n82f23c4ba58011154638ceb1bb040d195bcb0207 merge: retain A01 cycle and recovery checks with audited group-state fixes\n506f1d8ab6fcb009706e6a63d3fd992815323fd2 merge: preserve G03 recovery and consumer completion with audited G01/G02 fixes\n1adf415995c21da0aa40c7748ba41bf9f40a6e05 fix(group-state): retire proofs before confirmation and clean cancelled writes (#22)\n80647647436e3ffb40aa5c5bd650c7ec5e96fddc merge: sync verified personal and G01 prerequisites into G02\nb32a00a78cd48baa343b3d37fc8bf4fee0d7bcf0 merge: sync audited framework prerequisites into G01\n95b05058f323caaf5ff83f29a460cb2823c438a5 fix(group-state): sync G01 fixes and close G02 audit gaps (#22)\nf797eadcf6196163340e4640de11385433e1ff76 Merge pull request #37 from xmxxc/feat/bot-modules-b01\n08b8b474a0f18441d6706cc2044ffb6d67621d7f Merge pull request #39 from xmxxc/integrate/bot-modules-framework\n09feaaa91c278fd126c9d570f9975e1df9bdeb73 fix(group-state): reject reads across module unload (#21)\n85f53f7924105b6f0a46903ce6434f9ff4aa5395 fix(group-state): report observation failures to group owners (#21)\ne501c95acd652d279912719b275f8fe66bca683f merge: sync before_handler module hook for bot modules (#28)\nbf462cf97bd61049c44ae53ac207f4f22bf32f34 feat(module): before_handler hook after dispatch receive checks\n6c3a4f98fe0dab1dabf053a4a89fa7fe8673d2bb fix(group-state): end failed refreshes and ignore stale page results (#21)\n3392592ff5c8d5fa8c4c60440118bd84179eb642 fix(group-state): publish committed facts and drain cancelled writes (#21)\n50fb971424d7e4a7205adb3cbd42f6f05c8b7fbf fix(account-sharing): correct storage import ordering\nb23572b04917a2891fdcce8ab33fd1ff97c931d5 merge: sync verified framework contracts for bot modules (#20)\n460c8419c3b685253f8f4233e773a582da57e44c feat(module): deliver verified local recovery contract on main (#20)\n398c6afe70055589d1f12ab35affe66ca6e2396c Merge remote-tracking branch 'upstream/main'\nb410938ed5aead906f9e5256228108057bb5dbd9 增加模块可自定义消息订阅类型（可适配自己的事件类型或内测接口）\nb557ac67fda3c0098fcbd92da39d64247993b332 feat(module): 增加连接与会话状态订阅及查询 (#110)",
+    "non_group_business_diff": "",
+    "audit": "synchronization compatibility only; individual ticket audit remains",
+    "merged": false,
+    "publication1_head": "b2dd971d07c5f5bf378d6233bb6ab925745f784c",
+    "ci": [
+      {
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "url": "https://github.com/xmxxc/QQBotForge/actions/runs/39542190538/job/119032214066"
+      }
+    ],
+    "prerequisites_synced": true,
+    "next": "human review; individual independent audit still required",
+    "draft": true,
+    "base_ref": "personal"
+  },
+  {
+    "ticket": 36,
+    "pr": 56,
+    "name": "c04",
+    "branch": "feat/account-sharing-c04",
+    "old": "291d759911bd91a3e1f8219fca5e96fb7cb72751",
+    "new": "285e0a482a580fe3f8ad8bbd55b80f1256d4d42f",
+    "previous": "a4daf04fc862ea494825ba9a895f83698b70db35",
+    "old_is_ancestor": true,
+    "prerequisite_is_ancestor": true,
+    "new_unique_from_old": "285e0a482a580fe3f8ad8bbd55b80f1256d4d42f docs: preserve publication CI failure and recovery test diagnosis (#18)\n26ed165d20202e8453f731057499ab491dd26da6 merge: sync deterministic recovery completion test into C04\na4daf04fc862ea494825ba9a895f83698b70db35 merge: sync deterministic recovery completion test into C03\n848126ae09470599ab6af5f35b1ef3e226d999a4 merge: sync deterministic recovery completion test into C02\naae6fadeabe93c61db2286c8d514c1613f9c3b58 merge: sync deterministic recovery completion test into C01\nc7098a76c0800481ef7dc198c8869b93bf4f1f23 merge: sync deterministic recovery completion test into Q05\nfeb8274201f71b735f441068a1d20d83c0c6ba94 merge: sync deterministic recovery completion test into Q04\n8196e6ee9a3afdf0a6d76998dd34a97d929434a6 merge: sync deterministic recovery completion test into Q03\n46c838696216f1e93374caa21f485a5f79c71f47 merge: sync deterministic recovery completion test into Q02\n63b21a364efa2193d0375473247337741d5195a0 merge: sync deterministic recovery completion test into Q01\nbefd36590941c1ea07eea338dd2a64cf187b6353 merge: sync deterministic recovery completion test into A04\n9d16161eac41872affac6ead9d371167160ae279 merge: sync deterministic recovery completion test into A03\n3ceef4af0fafad0ed204546e5eddd70e8e50735a merge: sync deterministic recovery completion test into A02\n8051d8f1f0d559e2a9826cc5a904c20c3b393ca0 merge: sync deterministic recovery completion test into A01\n9450db57bc47c161e4a248c0a282639ad84d718e test(group-state): await recovery bookkeeping before rebuilding after consumer failure (#23)\n4373711974385fb31d7e67565f9b2856146fcf74 docs: record audit corrections and verified integration status (#18)\n66856c3e15a16591b0dfb4e4c260c0a321e648ac merge: sync verified prerequisites into C04\nb2dd971d07c5f5bf378d6233bb6ab925745f784c merge: sync verified prerequisites into C03\na6b6a7601fdb027a45d7cd576d66cda329132a62 merge: sync verified prerequisites into C02\nf6b0cab25f6ae15442d77f528ae7bc146c1173a0 merge: sync verified prerequisites into C01\nd28fe915b5bb7537828e04ea7ace201a1e39fb2b merge: sync verified prerequisites into Q05\na37a2cc0a5860fbefb0af8ef84e58b01b6f562f5 merge: sync verified prerequisites into Q04\n94b5c1f89665f280a69f95a92033c11df63051be merge: sync verified prerequisites into Q03\n706cd37f1a7c41cf51fb1aa010a5f94ee585d4d5 merge: sync verified prerequisites into Q02\n3a716c64c498d5ad9080d3d99344eb9b8ceb83ab merge: sync verified prerequisites into Q01\n98827e71e44e459edd35244e6ecc4083c2e58b1c merge: sync verified prerequisites into A04\n232a4ade4ea29eee6cddbc0069b0d4bf80dcdd9d merge: sync verified prerequisites into A03\n9dbd8ddc918d67d37148a50ab7679821873d4007 merge: sync verified prerequisites into A02\n82f23c4ba58011154638ceb1bb040d195bcb0207 merge: retain A01 cycle and recovery checks with audited group-state fixes\n506f1d8ab6fcb009706e6a63d3fd992815323fd2 merge: preserve G03 recovery and consumer completion with audited G01/G02 fixes\n1adf415995c21da0aa40c7748ba41bf9f40a6e05 fix(group-state): retire proofs before confirmation and clean cancelled writes (#22)\n80647647436e3ffb40aa5c5bd650c7ec5e96fddc merge: sync verified personal and G01 prerequisites into G02\nb32a00a78cd48baa343b3d37fc8bf4fee0d7bcf0 merge: sync audited framework prerequisites into G01\n95b05058f323caaf5ff83f29a460cb2823c438a5 fix(group-state): sync G01 fixes and close G02 audit gaps (#22)\nf797eadcf6196163340e4640de11385433e1ff76 Merge pull request #37 from xmxxc/feat/bot-modules-b01\n08b8b474a0f18441d6706cc2044ffb6d67621d7f Merge pull request #39 from xmxxc/integrate/bot-modules-framework\n09feaaa91c278fd126c9d570f9975e1df9bdeb73 fix(group-state): reject reads across module unload (#21)\n85f53f7924105b6f0a46903ce6434f9ff4aa5395 fix(group-state): report observation failures to group owners (#21)\ne501c95acd652d279912719b275f8fe66bca683f merge: sync before_handler module hook for bot modules (#28)\nbf462cf97bd61049c44ae53ac207f4f22bf32f34 feat(module): before_handler hook after dispatch receive checks\n6c3a4f98fe0dab1dabf053a4a89fa7fe8673d2bb fix(group-state): end failed refreshes and ignore stale page results (#21)\n3392592ff5c8d5fa8c4c60440118bd84179eb642 fix(group-state): publish committed facts and drain cancelled writes (#21)\n50fb971424d7e4a7205adb3cbd42f6f05c8b7fbf fix(account-sharing): correct storage import ordering\nb23572b04917a2891fdcce8ab33fd1ff97c931d5 merge: sync verified framework contracts for bot modules (#20)\n460c8419c3b685253f8f4233e773a582da57e44c feat(module): deliver verified local recovery contract on main (#20)\n398c6afe70055589d1f12ab35affe66ca6e2396c Merge remote-tracking branch 'upstream/main'\nb410938ed5aead906f9e5256228108057bb5dbd9 增加模块可自定义消息订阅类型（可适配自己的事件类型或内测接口）\nb557ac67fda3c0098fcbd92da39d64247993b332 feat(module): 增加连接与会话状态订阅及查询 (#110)",
+    "non_group_business_diff": "",
+    "audit": "synchronization compatibility only; individual ticket audit remains",
+    "merged": false,
+    "tested_code_commit": "285e0a482a580fe3f8ad8bbd55b80f1256d4d42f",
+    "publication1_head": "4373711974385fb31d7e67565f9b2856146fcf74",
+    "ci": [
+      {
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "url": "https://github.com/xmxxc/QQBotForge/actions/runs/39542191294/job/119032216987"
+      }
+    ],
+    "prerequisites_synced": true,
+    "next": "human review; individual independent audit still required",
+    "draft": true,
+    "base_ref": "personal"
+  }
+]

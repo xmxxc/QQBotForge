@@ -51,22 +51,22 @@ PR API base.sha曾停留旧值，实际以fresh fetch/ls-remote固定分支和me
 |---|---|---|---|
 |G01 [#21](https://github.com/xmxxc/QQBotForge/issues/21) / [PR#40](https://github.com/xmxxc/QQBotForge/pull/40)|`b32a00a78cd48baa343b3d37fc8bf4fee0d7bcf0`|567正常目录；561+6嵌套；独立33|独立审计/新组合复核|
 |G02 [#22](https://github.com/xmxxc/QQBotForge/issues/22) / [PR#41](https://github.com/xmxxc/QQBotForge/pull/41)|`1adf415995c21da0aa40c7748ba41bf9f40a6e05`|业务160；601正常目录；595+6嵌套；独立67|独立审计/新组合复核|
-|G03 [#23](https://github.com/xmxxc/QQBotForge/issues/23) / [PR#42](https://github.com/xmxxc/QQBotForge/pull/42)|`506f1d8ab6fcb009706e6a63d3fd992815323fd2`|业务182；最终群相关93（含4类消费等待）|同步兼容，逐票独立审计保留|
-|A01 [#24](https://github.com/xmxxc/QQBotForge/issues/24) / [PR#43](https://github.com/xmxxc/QQBotForge/pull/43)|`82f23c4ba58011154638ceb1bb040d195bcb0207`|业务206|同步兼容，逐票独立审计保留|
-|A02 [#25](https://github.com/xmxxc/QQBotForge/issues/25) / [PR#44](https://github.com/xmxxc/QQBotForge/pull/44)|`9dbd8ddc918d67d37148a50ab7679821873d4007`|218 passed in 18.07s|同步兼容，逐票独立审计保留|
-|A03 [#26](https://github.com/xmxxc/QQBotForge/issues/26) / [PR#45](https://github.com/xmxxc/QQBotForge/pull/45)|`232a4ade4ea29eee6cddbc0069b0d4bf80dcdd9d`|230 passed in 17.89s|同步兼容，逐票独立审计保留|
-|A04 [#27](https://github.com/xmxxc/QQBotForge/issues/27) / [PR#46](https://github.com/xmxxc/QQBotForge/pull/46)|`98827e71e44e459edd35244e6ecc4083c2e58b1c`|236 passed in 17.94s|同步兼容，逐票独立审计保留|
-|Q01 [#28](https://github.com/xmxxc/QQBotForge/issues/28) / [PR#48](https://github.com/xmxxc/QQBotForge/pull/48)|`3a716c64c498d5ad9080d3d99344eb9b8ceb83ab`|241 passed in 18.63s|同步兼容，逐票独立审计保留|
-|Q02 [#29](https://github.com/xmxxc/QQBotForge/issues/29) / [PR#49](https://github.com/xmxxc/QQBotForge/pull/49)|`706cd37f1a7c41cf51fb1aa010a5f94ee585d4d5`|246 passed in 19.41s|同步兼容，逐票独立审计保留|
-|Q03 [#30](https://github.com/xmxxc/QQBotForge/issues/30) / [PR#50](https://github.com/xmxxc/QQBotForge/pull/50)|`94b5c1f89665f280a69f95a92033c11df63051be`|250 passed in 19.92s|同步兼容，逐票独立审计保留|
-|Q04 [#31](https://github.com/xmxxc/QQBotForge/issues/31) / [PR#51](https://github.com/xmxxc/QQBotForge/pull/51)|`a37a2cc0a5860fbefb0af8ef84e58b01b6f562f5`|254 passed in 19.72s|同步兼容，逐票独立审计保留|
-|Q05 [#32](https://github.com/xmxxc/QQBotForge/issues/32) / [PR#52](https://github.com/xmxxc/QQBotForge/pull/52)|`d28fe915b5bb7537828e04ea7ace201a1e39fb2b`|259 passed in 20.47s|同步兼容，逐票独立审计保留|
-|C01 [#33](https://github.com/xmxxc/QQBotForge/issues/33) / [PR#53](https://github.com/xmxxc/QQBotForge/pull/53)|`f6b0cab25f6ae15442d77f528ae7bc146c1173a0`|178 passed in 15.55s|同步兼容，逐票独立审计保留|
-|C02 [#34](https://github.com/xmxxc/QQBotForge/issues/34) / [PR#54](https://github.com/xmxxc/QQBotForge/pull/54)|`a6b6a7601fdb027a45d7cd576d66cda329132a62`|184 passed in 16.20s|同步兼容，逐票独立审计保留|
-|C03 [#35](https://github.com/xmxxc/QQBotForge/issues/35) / [PR#55](https://github.com/xmxxc/QQBotForge/pull/55)|`b2dd971d07c5f5bf378d6233bb6ab925745f784c`|190 passed in 18.63s|同步兼容，逐票独立审计保留|
-|C04 [#36](https://github.com/xmxxc/QQBotForge/issues/36) / [PR#56](https://github.com/xmxxc/QQBotForge/pull/56)|`4373711974385fb31d7e67565f9b2856146fcf74`|193 passed in 18.13s|同步兼容，逐票独立审计保留|
+|G03 [#23](https://github.com/xmxxc/QQBotForge/issues/23) / [PR#42](https://github.com/xmxxc/QQBotForge/pull/42)|`9450db57bc47c161e4a248c0a282639ad84d718e`|首轮业务182；最终群相关93（含4类消费等待）；末次26项生命周期通过|同步兼容，逐票独立审计保留|
+|A01 [#24](https://github.com/xmxxc/QQBotForge/issues/24) / [PR#43](https://github.com/xmxxc/QQBotForge/pull/43)|`8051d8f1f0d559e2a9826cc5a904c20c3b393ca0`|首轮业务206；末次26项生命周期通过|同步兼容，逐票独立审计保留|
+|A02 [#25](https://github.com/xmxxc/QQBotForge/issues/25) / [PR#44](https://github.com/xmxxc/QQBotForge/pull/44)|`3ceef4af0fafad0ed204546e5eddd70e8e50735a`|首轮218 passed in 18.07s；末次26项生命周期通过|同步兼容，逐票独立审计保留|
+|A03 [#26](https://github.com/xmxxc/QQBotForge/issues/26) / [PR#45](https://github.com/xmxxc/QQBotForge/pull/45)|`9d16161eac41872affac6ead9d371167160ae279`|首轮230 passed in 17.89s；末次26项生命周期通过|同步兼容，逐票独立审计保留|
+|A04 [#27](https://github.com/xmxxc/QQBotForge/issues/27) / [PR#46](https://github.com/xmxxc/QQBotForge/pull/46)|`befd36590941c1ea07eea338dd2a64cf187b6353`|首轮236 passed in 17.94s；末次26项生命周期通过|同步兼容，逐票独立审计保留|
+|Q01 [#28](https://github.com/xmxxc/QQBotForge/issues/28) / [PR#48](https://github.com/xmxxc/QQBotForge/pull/48)|`63b21a364efa2193d0375473247337741d5195a0`|首轮241 passed in 18.63s；末次26项生命周期通过|同步兼容，逐票独立审计保留|
+|Q02 [#29](https://github.com/xmxxc/QQBotForge/issues/29) / [PR#49](https://github.com/xmxxc/QQBotForge/pull/49)|`46c838696216f1e93374caa21f485a5f79c71f47`|首轮246 passed in 19.41s；末次26项生命周期通过|同步兼容，逐票独立审计保留|
+|Q03 [#30](https://github.com/xmxxc/QQBotForge/issues/30) / [PR#50](https://github.com/xmxxc/QQBotForge/pull/50)|`8196e6ee9a3afdf0a6d76998dd34a97d929434a6`|首轮250 passed in 19.92s；末次26项生命周期通过|同步兼容，逐票独立审计保留|
+|Q04 [#31](https://github.com/xmxxc/QQBotForge/issues/31) / [PR#51](https://github.com/xmxxc/QQBotForge/pull/51)|`feb8274201f71b735f441068a1d20d83c0c6ba94`|首轮254 passed in 19.72s；末次26项生命周期通过|同步兼容，逐票独立审计保留|
+|Q05 [#32](https://github.com/xmxxc/QQBotForge/issues/32) / [PR#52](https://github.com/xmxxc/QQBotForge/pull/52)|`c7098a76c0800481ef7dc198c8869b93bf4f1f23`|首轮259 passed in 20.47s；末次26项生命周期通过|同步兼容，逐票独立审计保留|
+|C01 [#33](https://github.com/xmxxc/QQBotForge/issues/33) / [PR#53](https://github.com/xmxxc/QQBotForge/pull/53)|`aae6fadeabe93c61db2286c8d514c1613f9c3b58`|首轮178 passed in 15.55s；末次26项生命周期通过|同步兼容，逐票独立审计保留|
+|C02 [#34](https://github.com/xmxxc/QQBotForge/issues/34) / [PR#54](https://github.com/xmxxc/QQBotForge/pull/54)|`848126ae09470599ab6af5f35b1ef3e226d999a4`|首轮184 passed in 16.20s；末次26项生命周期通过|同步兼容，逐票独立审计保留|
+|C03 [#35](https://github.com/xmxxc/QQBotForge/issues/35) / [PR#55](https://github.com/xmxxc/QQBotForge/pull/55)|`a4daf04fc862ea494825ba9a895f83698b70db35`|首轮190 passed in 18.63s；末次26项生命周期通过|同步兼容，逐票独立审计保留|
+|C04 [#36](https://github.com/xmxxc/QQBotForge/issues/36) / [PR#56](https://github.com/xmxxc/QQBotForge/pull/56)|`285e0a482a580fe3f8ad8bbd55b80f1256d4d42f`|首轮193 passed in 18.13s；末次26项生命周期通过|同步兼容，逐票独立审计保留|
 
-C04 `4373711` 只追加进度文档；完整运行验证的代码SHA为 `66856c3e15a16591b0dfb4e4c260c0a321e648ac`，两者代码及测试一致。
+首轮 C04 `4373711` 只追加进度文档；首轮完整运行验证的代码SHA为 `66856c3e15a16591b0dfb4e4c260c0a321e648ac`。发布后补充测试时序修正及进度记录，最终交付为 `285e0a482a580fe3f8ad8bbd55b80f1256d4d42f`；产品实现与首轮完全相同，测试仅增加公开恢复完成等待及失败断言。首轮各批全业务数字对应矩阵的 `publication1_head`；末次各批26项生命周期重跑，最终交付另作完整910组合复验。
 
 待审核顺序：框架 **#47→main** 单独交付（personal已含相同实现，#37/#38/#39已合并），业务 **personal → #40 → #41 → #42 → #43 → #44 → #45 → #46 → #48 → #49 → #50 → #51 → #52 → #53 → #54 → #55 → #56**。本报告分支为独立文档交付，不承载业务或框架补丁。
 
@@ -87,8 +87,8 @@ Python3.13.13，pytest9.1.1、pytest-asyncio1.4.0、Ruff0.15.22、mypy2.4.0。�
 |G02独立安装|67 passed|
 |personal f797ead + 9790d7d，完整框架正常目录|717 passed / 0 skipped|
 |C04代码66856c3，仅业务|193 passed|
-|C04 + 04d9017，嵌套CI复制|628 passed / 6 skipped|
-|C04 + 9790d7d，完整框架/专项+业务正常目录|910 passed / 0 skipped|
+|首轮C04 + 04d9017，嵌套CI复制|628 passed / 6 skipped|
+|首轮C04 + 9790d7d，完整框架/专项+业务正常目录|910 passed / 0 skipped|
 |Ruff，G01/G02/各同步批次及C04|全部通过|
 |mypy core web main.py，G01/G02/C04|140文件通过|
 |mypy --follow-imports=silent --check-untyped-defs，群状态G01 3/G02 4/G03及C04 6文件|通过|
@@ -123,3 +123,17 @@ PYTHONPATH=/tmp/qqbotforge-verify-source python /path/to/before_handler_probe.py
 - 未部署、合并、迁移生产数据或改变票据状态。主人保留最终审核合并顺序。
 - G01 S1—S3为非阻塞建议；G03旧进度中的RESUMED首条保守拒绝现象仍待独立诊断；查询10秒超时/1000页上限本轮静态检查，未跑满。
 - 原始工作树未执行reset/clean/stash/切分支；未提交修改保持原位。独立clone与候选树均位于/tmp，Git原工作树HEAD和状态另行记录。
+
+## 发布后 CI 时序复核与最终状态
+
+首轮业务源分支全部推送后，#46 [run 39541560100](https://github.com/xmxxc/QQBotForge/actions/runs/39541560100) 实际 **1 failed / 670 passed / 6 路径误判skip**，失败为 `test_consumer_failure_cannot_acknowledge_recovery[error]`；原失败保留。其余首轮代码PR远程CI通过。
+
+普通轮询30次未复现；仅临时传输测试副本将轮询sleep(0.001)改为每轮事件循环sleep(0)，相同断言稳定失败。失败点公开恢复状态 `pending=1/failed=True`，通知真实写入者已经退出（busy=False）：订阅结果早于框架完成投递登记，产品按契约拒绝此时重建，不能放宽屏障以迎合测试。
+
+最小修正 `9450db57bc47c161e4a248c0a282639ad84d718e` 只在原测试增加等待公开pending归零与failed断言，然后执行原重建成功断言。原断言、两种参数、超时、产品实现和skip设置全部保留。确定性快速轮询2项通过、生命周期26项通过；Standards／Spec各0必修。修正串行同步G03至C04，各批26项通过，旧分支历史继续保留，最终产品目录与首轮逐字一致。
+
+最终交付 C04 `285e0a482a580fe3f8ad8bbd55b80f1256d4d42f` + 正常目录固定F01资产 `9790d7d` 完整复验 **910 passed / 0 skipped**，Ruff通过。G01/G02没有此测试，不需改动已通过的新head。
+
+首轮实际CI源码也已核对：#40 `e9aa8c685273eac88a85e9b71d7a6df37c3b15e0`、#41 `06b4ad3687ee15dd7be587d434f91a9740f81499`、#56 `f331e739d2a629f01c5dd0d0c2c5a9b120000250` 的tree分别与当时新head完全一致。#40/#41日志实际使用workflow与测试资产04d9017，Ruff、140文件mypy和561/595项测试实际执行；6skip原因为已记录的嵌套根路径误判。
+
+第二轮发布的16个业务PR CI全部SUCCESS，#47原head的框架CI也保持SUCCESS。最终发布后的PR头、draft、合并及CI状态保存在[发布状态JSON](integration-20261021/publication-status.json)。原有18个工作树HEAD和修改状态与起点完全一致；main、personal和ci-assets未移动。只完成提交、推送和draft PR更新，没有合并或部署。
