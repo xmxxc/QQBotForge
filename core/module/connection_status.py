@@ -121,6 +121,8 @@ class ConnectionStatusSubscription:
 
     async def _drain(self, key, pending):
         try:
+            # 先登记排空任务，避免 eager 工厂同步结束后回写已完成的任务。
+            await asyncio.sleep(0)
             while pending:
                 status = pending.popleft()
                 outcome, error = await self._invoke(key, status)
@@ -175,6 +177,8 @@ class ConnectionStatusManager:
     def __init__(self):
         self.runtime_id = uuid4().hex
         self._revision = 0
+        self._observers = []
+        self._dispatch_observers = []
         self._current: dict[tuple[str, str], ConnectionStatus] = {}
         self._sources = {}
         self._session_bots = {}
@@ -268,5 +272,7 @@ class _ConnectionReporter:
         self._manager._current[key] = self._status
         if phase == 'stopped':
             self.stopped = True
+        for observer in tuple(self._manager._observers):
+            observer(self._status)
         for subscription in tuple(self._manager._subscriptions.values()):
             subscription._enqueue(self._status)
