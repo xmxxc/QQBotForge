@@ -31,9 +31,14 @@ class GroupDelivery:
             self.modes[cache_key]['actual'] = 'private'
         return self.modes[cache_key]
 
+    def send_context(self, group, resource):
+        """The exact context of an account group send: invoke and view for everyone."""
+        return dict(consumer=self.service.CONSUMER, function=self.service.FUNCTION, group=group, resource=resource, actions=['invoke', 'view'])
+
     async def report(self, bot, group, resource):
         acl = await self.service.ensure(bot)
-        return await acl.audience_report(bot, self.service.CONSUMER, self.service.FUNCTION, group, resource, actions=['invoke', 'view'])
+        context = self.send_context(group, resource)
+        return await acl.audience_report(bot, context['consumer'], context['function'], group, resource, actions=context['actions'])
 
     async def configure(self, bot, data):
         if not isinstance(data, dict) or set(data) - {'group', 'resource', 'enabled', 'auto_restore'}:
@@ -115,7 +120,7 @@ class GroupDelivery:
             and mode['actual'] == 'group'
             and report
             and report['eligible']
-            and module.report_current(bot, report)
+            and module.report_current(bot, report, **self.send_context(mode['group'], mode['resource']))
         )
 
     async def list(self, bot):
