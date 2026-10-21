@@ -250,5 +250,5 @@ class GroupState:
             await sender.reply(event, content)
         except Exception as error:
             # The command is consumed either way: the platform may have delivered it, so neither resend nor fall through.
-            log.warning(f'群状态命令回复失败，结果未知，不重发: {type(error).__name__}: {error}')
+            log.error(f'群状态命令回复失败，结果未知，不重发: {type(error).__name__}: {error}')
         return None
