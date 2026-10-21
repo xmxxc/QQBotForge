@@ -4,6 +4,7 @@ import asyncio
 import json
 
 import pytest
+from socket_platform import until
 from test_access_control import access_host as access_host
 from test_access_control import configure, request
 
@@ -357,20 +358,76 @@ async def test_binding_receipt_follows_real_sender_reply_result(access_host, mon
     assert (pending['notification'], pending['notification_error']) == (notification, error)
 
 
-async def test_cancelled_binding_receipt_is_recorded_as_unknown(access_host, monkeypatch):
+@pytest.mark.parametrize('record', ['ok', 'sqlite', 'oserror', 'cancelled_again'])
+async def test_cancelled_binding_reply_keeps_cancelling_whatever_the_receipt_write_does(access_host, monkeypatch, caplog, record):
+    """Real Application → Hook → MessageSender.reply hangs on fake HTTP, then the task is cancelled."""
+    import sqlite3
+
+    from core.message.sender import MessageSender
+
     host = access_host
     entered = asyncio.Event()
 
-    async def reply(event, content=None, **kwargs):
-        entered.set()
-        await asyncio.Event().wait()
+    class Transport:
+        is_closed = False
 
-    monkeypatch.setattr(host.sender, 'reply', reply)
+        async def request(self, method, endpoint, **kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+
+    class Tokens:
+        appid = 'bot-a'
+
+        async def get_client(self):
+            return Transport()
+
+        async def get_token(self):
+            return 'fake-token'
+
+    monkeypatch.setattr(host.application._bot_registry._bots['bot-a'], 'sender', MessageSender(Tokens()))
     task = asyncio.create_task(host.event('身份绑定 申请 group-a member-a', user='private-a'))
     await asyncio.wait_for(entered.wait(), 3)
+    store, put = host.access.store, host.access.store.put
+    if record == 'sqlite':
+        with sqlite3.connect(store.path) as db:
+            db.execute(
+                "CREATE TRIGGER receipt_fail BEFORE UPDATE ON extension_records WHEN NEW.collection='identity_state' "
+                "BEGIN SELECT RAISE(ABORT,'receipt write failed'); END"
+            )
+    elif record == 'oserror':
+
+        async def failing_put(bot, collection, key, value):
+            if collection == 'identity_state':
+                raise OSError('disk full')
+            return await put(bot, collection, key, value)
+
+        monkeypatch.setattr(store, 'put', failing_put)
+    elif record == 'cancelled_again':
+        # Hold the real SQLite worker so the receipt write is in flight when cancelled again.
+        assert store._lock.acquire(blocking=False)
     task.cancel()
+    if record == 'cancelled_again':
+        try:
+            await until(lambda: 'bot-a' in host.access.bindings.pending)
+            task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=0.2)
+            assert not done, 'cancellation waits for the SQLite worker instead of leaving it behind'
+        finally:
+            store._lock.release()
     with pytest.raises(asyncio.CancelledError):
-        await task
-    pending = (await host.access.binding_snapshot('bot-a'))['requests'][0]
-    assert pending['status'] == 'pending'
-    assert (pending['notification'], pending['notification_error']) == ('send_unknown', 'cancelled')
+        await asyncio.wait_for(task, 3)
+    if record == 'ok':
+        pending = (await host.access.binding_snapshot('bot-a'))['requests'][0]
+        assert pending['status'] == 'pending'
+        assert (pending['notification'], pending['notification_error']) == ('send_unknown', 'cancelled')
+        return
+    # A failed or interrupted receipt write fails the identity store closed; nothing reads as sent.
+    with pytest.raises(RuntimeError):
+        await host.access.binding_snapshot('bot-a')
+    if record == 'cancelled_again':
+        # The worker finished before the task ended: its unknown (never sent) receipt is on disk.
+        with sqlite3.connect(store.path) as db:
+            payload = db.execute("SELECT payload FROM extension_records WHERE collection='identity_state'").fetchone()[0]
+        assert '"send_unknown"' in payload and '"sent"' not in payload
+    else:
+        assert any('取消回执未能记录' in r.getMessage() for r in caplog.records)
