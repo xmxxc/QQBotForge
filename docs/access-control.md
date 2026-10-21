@@ -63,7 +63,7 @@ A02 自动验证使用真实独立模块／鉴权 HTTP／主人命令及临时 S
 
 ## 通用身份绑定与私聊群上下文（A03）
 
-成员在实际 QQ 私聊发送 `身份绑定 申请 <群原生ID> <成员原生ID>`。模块只从 C2C 原始 author.id 记录私聊 OpenID；union 仅作来源元数据，QQ号、union、群 ID 与私聊 ID 字符串相同均不证明关联。请求创建 pending 编号，编号只用于定位申请。申请不要求已有功能授权，也不授予任何资格，不主动联系新入群成员。申请结果回复按框架 `Sender.reply` 的真实返回分别记录，与待审状态无关：平台响应对象（含空响应体 `{}`）为 `sent`；带平台错误码（`code` 或 `err_code`）的响应为 `platform_rejected` 并保留该码（HTTP 状态码同样保留）；只有 `message`、没有消息 ID 的错误体记为 `platform_rejected/unknown`；框架网络层失败 `code=-1` 为 `send_failed/network_error`；返回 `None`（未发送，或框架按其忽略列表吞掉平台错误码）为 `send_failed/no_response`；回复抛出异常为 `send_failed/<异常类型>`；处理被取消时结果不明，记为 `send_unknown/cancelled` 并继续传播取消。任何失败都不记为已发送。
+成员在实际 QQ 私聊发送 `身份绑定 申请 <群原生ID> <成员原生ID>`。模块只从 C2C 原始 author.id 记录私聊 OpenID；union 仅作来源元数据，QQ号、union、群 ID 与私聊 ID 字符串相同均不证明关联。请求创建 pending 编号，编号只用于定位申请。申请不要求已有功能授权，也不授予任何资格，不主动联系新入群成员。申请结果回复按框架 `Sender.reply` 的真实返回分别记录，与待审状态无关：平台响应对象（含空响应体 `{}`）为 `sent`；带平台错误码（`code` 或 `err_code`）的响应为 `platform_rejected` 并保留该码（HTTP 状态码同样保留）；只有 `message`、没有消息 ID 的错误体记为 `platform_rejected/unknown`；框架网络层失败 `code=-1` 为 `send_failed/network_error`；返回 `None`（未发送，或框架按其忽略列表吞掉平台错误码）为 `send_failed/no_response`；回复抛出异常为 `send_failed/<异常类型>`；处理被取消时结果不明，尽力记为 `send_unknown/cancelled` 并继续传播取消；该记录写入失败只写错误日志（含申请编号）并使身份资料按存储失败暂停，记录期间再次取消时等待已开始的数据库写入实际结束（不留后台写入）后传播取消，二者都不覆盖原取消。任何失败都不记为已发送。
 
 主人后台“通用身份绑定”查看待审和已绑定记录，填写两侧身份核对依据并明确确认。主人 QQ 命令同用管理入口：
 
