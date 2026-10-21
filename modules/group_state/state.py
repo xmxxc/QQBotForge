@@ -62,8 +62,12 @@ class GroupState:
         if not self.active:
             raise RuntimeError('群状态模块未启用')
         async with self.load_locks.setdefault(bot, asyncio.Lock()):
+            if not self.active:
+                raise RuntimeError('群状态模块未启用')
             if bot not in self.states:
                 state = await self.store.get(bot, 'group_state', 'state') or {'schema_version': 1, 'version': 0, 'groups': {}}
+                if not self.active:
+                    raise RuntimeError('群状态模块已卸载')
                 if state.get('schema_version') != 1:
                     raise RuntimeError('群状态数据版本不兼容')
                 for group in state['groups'].values():

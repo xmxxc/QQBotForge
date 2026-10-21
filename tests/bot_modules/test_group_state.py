@@ -472,6 +472,68 @@ async def test_reload_during_final_commit_rejects_old_http_result(group_host, mo
         await old.snapshot('bot-a')
 
 
+@pytest.mark.parametrize('entry', ['http', 'snapshot'])
+@pytest.mark.parametrize('lifecycle', ['disable', 'reload'])
+async def test_cold_and_queued_reads_are_rejected_across_unload(group_host, monkeypatch, entry, lifecycle):
+    host = group_host
+    await host.state.refresh('bot-a', 'group-a')
+    entered, release = threading.Event(), threading.Event()
+    connect = sqlite3.connect
+
+    class DelayedReadConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            cursor = super().execute(sql, parameters)
+            if sql.startswith('SELECT payload') and parameters[0] == 'bot-a':
+                entered.set()
+                if not release.wait(3):
+                    raise RuntimeError('fake storage scheduling timeout')
+            return cursor
+
+    def test_connection(*args, **kwargs):
+        return connect(*args, **kwargs, factory=DelayedReadConnection)
+
+    monkeypatch.setattr(sqlite3, 'connect', test_connection)
+    assert await host.modules.reload('group_state')
+    old = host.state
+
+    async def read():
+        return await host.api() if entry == 'http' else await old.snapshot('bot-a')
+
+    first = asyncio.create_task(read())
+    queued = transition = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        queued = asyncio.create_task(old.snapshot('bot-a'))
+        await asyncio.sleep(0)
+        assert not queued.done()
+        transition = asyncio.create_task(host.modules.reload('group_state') if lifecycle == 'reload'
+                                         else host.modules.disable('group_state', _persist=False))
+        await asyncio.sleep(0)
+        assert (await host.api()).status == 404
+    finally:
+        release.set()
+        results = await asyncio.gather(first, *([queued] if queued is not None else []), return_exceptions=True)
+        if transition is not None:
+            assert await transition
+    assert len(results) == 2
+    if entry == 'http':
+        assert results[0].status == 503
+        assert (await results[0].json())['success'] is False
+    else:
+        assert isinstance(results[0], RuntimeError)
+    assert isinstance(results[1], RuntimeError)
+    with pytest.raises(RuntimeError):
+        await old.snapshot('bot-a')
+    if lifecycle == 'disable':
+        assert (await host.api()).status == 404
+        assert await host.modules.enable('group_state', _skip_deps=True, _persist=False)
+    current = await host.state.snapshot('bot-a')
+    assert current['generation'] != old.generation
+    assert current['groups'][0]['group'] == 'group-a'
+    assert not current['groups'][0]['reliable'] and current['groups'][0]['reason'] == 'process_restart'
+    assert (await host.state.refresh('bot-a', 'group-a'))['reliable']
+
+
 async def test_disable_allows_event_loop_to_run_while_sqlite_finishes(group_host, monkeypatch):
     host = group_host
     entered, release = threading.Event(), threading.Event()

@@ -15,7 +15,7 @@
 
 已知群来自实际收到的原生群事件或主人显式刷新，界面与接口始终标明 `scope=known`、`complete=false`。不把记录总数称为平台所有群。刷新复用框架 `get_group_bot_state(return_error=True)`，只接受完整可识别的平台结果。接口许可、错误、历史状态和核验时间分别显示；查询失败、空值或未获许可不表示 Bot 已离群。历史 `bot_state` 在 `reliable=false` 时只能作历史参考。重启／重载保留历史，但先标记 `process_restart`，须重新刷新。
 
-消费者从运行模块取得 `await group_state.snapshot(appid)`、`await group_state.refresh(appid, native_group)` 和 `group_state.capabilities()`，不要读取内部 SQLite。快照是独立副本，含 Bot、模块代际、版本、每群来源／核验时间和可靠性。进入核验与核验完成分别递增版本；不同模块代际的版本不能混用。刷新时收到同群新事实会拒绝旧结果；模块卸载后旧请求不能继续确认当前状态。
+消费者从运行模块取得 `await group_state.snapshot(appid)`、`await group_state.refresh(appid, native_group)` 和 `group_state.capabilities()`，不要读取内部 SQLite。快照是独立副本，含 Bot、模块代际、版本、每群来源／核验时间和可靠性。进入核验与核验完成分别递增版本；不同模块代际的版本不能混用。刷新时收到同群新事实会拒绝旧结果；模块卸载后旧请求不能继续确认当前状态。冷加载与等待读取锁的在途请求同样会失效：直接消费接口抛出 RuntimeError，已进入路由的 HTTP 读取返回 503；不会返回或缓存旧代际历史快照。重新启用后由新实例加载历史并重新核验。
 
 刷新以独立候选提交数据库，提交等待期间快照保持 `pending`、`reliable=false`。提交成功后再次检查模块是否仍启用及同群版本是否改变，再发布核验结果；提交失败保留上一份 Bot 状态并标为 `historical`、`persistence_failed`，修复存储后可重试。同群的新观察在等待写入时立即失效旧结果，其他群的新事实不会被候选覆盖。取消请求时等待其数据库线程实际结束，再释放写入顺序锁和报告取消，避免迟到写入覆盖新观察。模块停止先撤销实例有效性，再异步等待 SQLite 在途操作与关闭，避免阻塞其他 Bot 和后台请求。
 
