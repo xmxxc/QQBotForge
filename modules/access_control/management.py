@@ -7,9 +7,11 @@ import sqlite3
 from aiohttp import web
 
 from core.base.config import cfg
+from core.base.logger import EXTENSION, get_logger
 from core.plugin._blacklist import get_blacklist_map
 
 PREFIX = '/api/ext/access-control/'
+log = get_logger(EXTENSION, '黑白名单授权')
 
 
 def classify_receipt(reply):
@@ -142,8 +144,15 @@ class Management:
                 status, error = classify_receipt(await instance.sender.reply(event, content))
             except asyncio.CancelledError:
                 # The platform may or may not have received it; never record it as sent.
+                # Recording is best effort: neither its failure nor a second cancel
+                # may replace the original cancellation.
                 if result:
-                    await self.service.bindings.delivery(event.appid, result['id'], 'send_unknown', 'cancelled')
+                    try:
+                        await self.service.bindings.delivery(event.appid, result['id'], 'send_unknown', 'cancelled')
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        log.exception(f'[{event.appid}] 绑定申请 {result["id"]} 的取消回执未能记录')
                 raise
             except Exception as failure:
                 status, error = 'send_failed', type(failure).__name__[:128]
