@@ -340,3 +340,173 @@ async def test_cancelled_roster_query_ends_without_in_progress_markers(group_hos
     group = (await host.state.snapshot('bot-a'))['groups'][0]
     assert not group['roster']['complete'] and group['roster']['reason'] == 'roster_cancelled'
     assert group['members']['member-a']['reason'] == 'roster_cancelled' and not group['members']['member-a']['reliable']
+
+
+async def wait_until(predicate):
+    import asyncio
+
+    for _ in range(300):
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError('condition not reached')
+
+
+@pytest.mark.parametrize('ending', ['missing_known', 'interrupted', 'conflict', 'changed', 'cancelled_after_change'])
+async def test_finished_roster_leaves_no_in_progress_member_markers(group_host, ending):
+    import asyncio
+
+    host = group_host
+    roster_platform(host)
+    await host.event('普通聊天', user='known-member', group='group-a')
+    held = asyncio.Event()
+    if ending == 'interrupted':
+        host.sender.json_results[('/v2/groups/group-a/members', 'second')] = False, {'code': '11253'}
+    elif ending == 'conflict':
+        host.sender.json_results[('/v2/groups/group-a/members', 'second')] = page(member('member-a'))
+    elif ending in ('changed', 'cancelled_after_change'):
+
+        async def change(path, cursor):
+            if cursor:
+                await host.event('普通聊天', user='new-member', group='group-a')
+                if ending == 'cancelled_after_change':
+                    held.set()
+                    await asyncio.Event().wait()
+
+        host.sender.after_json = change
+    operation = asyncio.create_task(host.state.sync_roster('bot-a', 'group-a'))
+    if ending == 'cancelled_after_change':
+        await asyncio.wait_for(held.wait(), 3)
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+    else:
+        report = await operation
+        assert report['complete'] is False
+    group = (await host.state.snapshot('bot-a'))['groups'][0]
+    reasons = {native: record['reason'] for native, record in group['members'].items()}
+    assert 'roster_refreshing' not in reasons.values(), reasons
+    expected = {'missing_known': 'known_member_missing', 'interrupted': 'permission_denied', 'conflict': 'pagination_conflict',
+                'changed': 'state_changed', 'cancelled_after_change': 'roster_cancelled'}[ending]
+    assert reasons['known-member'] == expected
+    assert not group['members']['known-member']['reliable'] and group['members']['known-member']['status'] != 'left'
+    if ending in ('changed', 'cancelled_after_change'):
+        assert reasons['new-member'] == 'requires_verification'
+
+
+async def test_observation_write_failure_after_unpublished_roster_commit_is_marked(group_host):
+    import asyncio
+    import sqlite3
+
+    host = group_host
+    roster_platform(host)
+    path = host.modules.get_context('group_state').get_data_path('group-state.db')
+    blocker = sqlite3.connect(path)
+    entered = asyncio.Event()
+
+    async def lock_final_write(path, cursor):
+        if path.endswith('/bot_state'):
+            blocker.execute('BEGIN IMMEDIATE')
+            entered.set()
+
+    host.sender.after_json = lock_final_write
+    roster = asyncio.create_task(host.state.sync_roster('bot-a', 'group-a'))
+    observation = None
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        await wait_until(lambda: host.state.write_locks['bot-a'].locked())
+        live = host.state.states['bot-a']['groups']['group-a']
+        before = live['version']
+        observation = asyncio.create_task(host.event('普通聊天', user='member-a', group='group-a'))
+        await wait_until(lambda: live['version'] != before)
+        # Only the observation's write is rejected; the roster candidate reaches disk.
+        blocker.execute("""CREATE TRIGGER reject_observation BEFORE INSERT ON extension_records
+            WHEN json_extract(NEW.payload, '$.groups."group-a".source') = 'native_event'
+            BEGIN SELECT RAISE(ABORT, 'fake disk failure'); END""")
+    finally:
+        blocker.commit()
+        blocker.close()
+    report = await roster
+    await observation
+    assert report['complete'] is False and report['reason'] == 'state_changed'
+    group = (await host.state.snapshot('bot-a'))['groups'][0]
+    assert group['reason'] == 'persistence_failed' and not group['reliable']
+    assert not group['roster']['complete'] and group['roster']['reason'] == 'persistence_failed'
+    assert not any(record['reliable'] for record in group['members'].values())
+    assert group['members']['member-a']['reason'] == 'persistence_failed'
+    with pytest.raises(ValueError):
+        await host.state.members('bot-a', 'group-a', cursor=f'1.{host.state._page_key("bot-a", "group-a", report["version"])}',
+                                 version=report['version'], generation=report['generation'])
+
+
+@pytest.mark.parametrize('failure', ['duplicate', 'repeated_cursor', 'bot_identity_conflict', 'self_absent', 'page_limit'])
+async def test_conflicting_roster_pass_grants_no_member_reliability(group_host, failure):
+    host = group_host
+    roster_platform(host)
+    if failure == 'duplicate':
+        host.sender.json_results[('/v2/groups/group-a/members', 'second')] = page(member('other-bot', bot=True), member('member-a'))
+    elif failure == 'repeated_cursor':
+        host.sender.json_results[('/v2/groups/group-a/members', 'second')] = page(member('this-bot', 'admin', bot=True), cursor='second')
+    elif failure == 'self_absent':
+        host.sender.json_results[('/v2/groups/group-a/bot_state', '')] = (True, {'member_openid': 'absent-bot', 'member_role': 'admin'})
+    elif failure == 'page_limit':
+        # Every page names a fresh cursor, so the bounded reader never reaches a last page.
+        for index in range(1000):
+            host.sender.json_results[('/v2/groups/group-a/members', f'c{index}' if index else '')] = page(member(f'member-{index}'), cursor=f'c{index + 1}')
+    else:
+        host.sender.json_results[('/v2/groups/group-a/bot_state', '')] = (True, {'member_openid': 'this-bot', 'member_role': 'owner'})
+    await host.state.confirm_member('bot-a', 'group-a', 'member-a', evidence='fake owner checked')
+    report = await host.state.sync_roster('bot-a', 'group-a')
+    assert report['complete'] is False and report['reason'] in ('pagination_conflict', 'pagination_limit', 'bot_identity_conflict')
+    group = (await host.state.snapshot('bot-a'))['groups'][0]
+    assert set(group['members']) == {'member-a'}
+    assert not any(record['reliable'] for record in group['members'].values())
+    assert {record['status'] for record in group['members'].values()} <= {'historical', 'pending'}
+    assert all(record['reason'] == report['reason'] for record in group['members'].values())
+
+
+async def test_interrupted_roster_keeps_wellformed_rows_and_newer_single_verification(group_host):
+    import asyncio
+
+    host = group_host
+    roster_platform(host)
+    await host.state.confirm_member('bot-a', 'group-a', 'member-a', evidence='fake owner checked')
+    host.sender.json_results[('/v2/groups/group-a/members', 'second')] = False, {'code': '11253'}
+    report = await host.state.sync_roster('bot-a', 'group-a')
+    assert report['complete'] is False and report['reason'] == 'permission_denied'
+    record = (await host.state.snapshot('bot-a'))['groups'][0]['members']['member-a']
+    # A well-formed row from a pass that was only interrupted is a current per-member fact.
+    assert record['reliable'] and record['source'] == 'platform_roster' and record['status'] == 'present'
+
+    held = asyncio.Event()
+
+    async def verify_during_paging(path, cursor):
+        if cursor and not held.is_set():
+            held.set()
+            await host.state.verify_member('bot-a', 'group-a', 'member-a')
+
+    host.sender.after_json = verify_during_paging
+    report = await host.state.sync_roster('bot-a', 'group-a')
+    assert report['reason'] == 'state_changed'
+    record = (await host.state.snapshot('bot-a'))['groups'][0]['members']['member-a']
+    assert record['reliable'] and record['source'] == 'platform_member' and record['reason'] == ''
+
+
+@pytest.mark.parametrize('pass_result', ['complete', 'conflict'])
+async def test_roster_pass_keeps_departed_member_history(group_host, pass_result):
+    from socket_platform import until
+
+    host = group_host
+    state = host.state
+    roster_platform(host)
+    await state.confirm_member('bot-a', 'group-a', 'member-a', evidence='verified')
+    host.lifecycle('GROUP_MEMBER_REMOVE', member='member-a')
+    await until(lambda: state.recovery.get_status('bot-a').ready and state.states['bot-a']['groups']['group-a']['members']['member-a']['status'] == 'left')
+    host.sender.json_results[('/v2/groups/group-a/members', '')] = page(member('member-b'), cursor='second')
+    if pass_result == 'conflict':
+        host.sender.json_results[('/v2/groups/group-a/members', 'second')] = page(member('member-b'))
+    report = await state.sync_roster('bot-a', 'group-a')
+    assert report['complete'] is (pass_result == 'complete')
+    departed = (await state.snapshot('bot-a'))['groups'][0]['members']['member-a']
+    assert departed['status'] == 'left' and not departed['reliable']
+    assert departed['reason'] != 'roster_refreshing'

@@ -89,8 +89,12 @@ class MembershipReader:
                     break
                 bot_state, error = await self.request(bot, f'/v2/groups/{quote(group, safe="")}/bot_state')
                 own = bot_state.get('member_openid') if bot_state else None
-                if error or not native(own) or own not in members:
+                if error or not native(own):
                     result['reason'] = error or 'bot_identity_unknown'
+                    break
+                if own not in members:
+                    # A fully read roster without the Bot named by bot_state contradicts the platform's own answer.
+                    result['reason'] = 'bot_identity_conflict'
                     break
                 if bot_state.get('member_role') != members[own]['member_role'] or members[own]['bot'] is False:
                     result['reason'] = 'bot_identity_conflict'
