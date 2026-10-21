@@ -31,9 +31,14 @@ class GroupDelivery:
             self.modes[cache_key]['actual'] = 'private'
         return self.modes[cache_key]
 
+    def send_context(self, group, resource):
+        """The exact context of an account group send: invoke and view for everyone."""
+        return dict(consumer=self.service.CONSUMER, function=self.service.FUNCTION, group=group, resource=resource, actions=['invoke', 'view'])
+
     async def report(self, bot, group, resource):
         acl = await self.service.ensure(bot)
-        report = await acl.audience_report(bot, self.service.CONSUMER, self.service.FUNCTION, group, resource, actions=['invoke', 'view'])
+        context = self.send_context(group, resource)
+        report = await acl.audience_report(bot, context['consumer'], context['function'], group, resource, actions=context['actions'])
         # Accounts need explicit grants for everyone; admission or roles never count.
         implicit = [row['member'] for row in report['members'] if any(a['allowed'] and a['reason'] != 'explicit' for a in row['actions'].values())]
         if implicit:
@@ -55,7 +60,7 @@ class GroupDelivery:
             mode = await self.mode(bot, group, resource)
             key = (bot, mode['id'])
             previous = self.reports.get(key)
-            if mode['actual'] == 'group' and previous and not self.service.access().report_facts_current(bot, previous):
+            if mode['actual'] == 'group' and previous and not self.service.access().report_facts_current(bot, previous, **self.send_context(group, resource)):
                 # Group facts changed since the last passing check (member, role, roster or
                 # connection): drop to private; restoring needs the owner or auto-restore.
                 mode['actual'] = 'private'
@@ -121,7 +126,7 @@ class GroupDelivery:
             and mode['actual'] == 'group'
             and report
             and report['eligible']
-            and module.report_current(bot, report)
+            and module.report_current(bot, report, **self.send_context(mode['group'], mode['resource']))
         )
 
     async def list(self, bot):

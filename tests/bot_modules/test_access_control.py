@@ -349,3 +349,207 @@ async def test_manual_current_presence_after_restart_does_not_restore_old_grant(
     assert not after['allowed']
     snapshot = await acl.access_snapshot('bot-a', 'reports')
     assert not snapshot['grants'] and snapshot['revocations'][-1]['id'] == old['id']
+
+
+def platform_member(host, *members, group='group-a'):
+    from test_group_roster import member
+
+    for native in members:
+        host.sender.json_results[(f'/v2/groups/{group}/members/{native}', '')] = (True, member(native))
+
+
+async def lifecycle_done(host, sequence):
+    state = host.state
+    await until(lambda: state.states['bot-a']['groups']['group-a'].get('last_native', {}).get('sequence') == sequence)
+    await until(lambda: not state.recovery.get_status('bot-a').pending and not state.notifications.busy('bot-a'))
+
+
+@pytest.mark.parametrize('event', ['GROUP_DEL_ROBOT', 'GROUP_ADD_ROBOT'])
+async def test_bot_join_or_removal_pauses_explicit_sources_until_verified(access_host, event):
+    host = access_host
+    acl, state = await configure(host), host.state
+    for member in ('member-a', 'member-b', 'member-c'):
+        await state.confirm_member('bot-a', 'group-a', member, evidence='owner verified', member_role='member')
+    grants = {
+        member: await acl.manage_access('bot-a', 'reports', 'grant', function='read', group='group-a', member=member, resources=['report-r'])
+        for member in ('member-a', 'member-b', 'member-c')
+    }
+    await acl.manage_access('bot-a', 'reports', 'revoke', function='read', group='group-a', member='member-b')
+    host.lifecycle(event, sequence=2, timestamp=1000)
+    await lifecycle_done(host, 2)
+    snapshot = await acl.access_snapshot('bot-a', 'reports')
+    assert {g['id'] for g in snapshot['grants']} == {grants['member-a']['id'], grants['member-c']['id']}
+    assert [r['reason'] for r in snapshot['revocations']] == ['owner_revoked']
+    paused = await acl.evaluate('bot-a', 'reports', 'read', 'group-a', 'member-a', 'report-r')
+    assert not paused['allowed'] and paused['reason'] == 'group_facts_recovery_required' and not paused['retryable']
+    # member-c is no longer in the group according to the platform; member-a and member-b still are.
+    platform_member(host, 'member-a', 'member-b')
+    assert not await state.rebuild('bot-a')
+    platform_member(host, 'member-c')
+    host.sender.json_results.pop(('/v2/groups/group-a/members/member-c', ''))
+    await state.verify_member('bot-a', 'group-a', 'member-c')
+    restored = await acl.evaluate('bot-a', 'reports', 'read', 'group-a', 'member-a', 'report-r')
+    assert not restored['allowed']
+    platform_member(host, 'member-c')
+    assert await state.rebuild('bot-a')
+    restored = await acl.evaluate('bot-a', 'reports', 'read', 'group-a', 'member-a', 'report-r')
+    assert restored['allowed'] and [s['id'] for s in restored['sources']] == [grants['member-a']['id']]
+    assert not (await acl.evaluate('bot-a', 'reports', 'read', 'group-a', 'member-b', 'report-r'))['allowed']
+    assert (await acl.evaluate('bot-a', 'reports', 'read', 'group-a', 'member-c', 'report-r'))['allowed']
+
+
+@pytest.mark.parametrize('stale', ['late', 'same_time', 'conflict', 'incomplete', 'replay'])
+async def test_rejected_native_event_cannot_revoke_new_cycle_grant(access_host, stale):
+    host = access_host
+    acl, state = await configure(host), host.state
+    await configure(host, 'other')
+    await state.confirm_member('bot-a', 'group-a', 'member-a', evidence='owner verified', member_role='member')
+    first = await acl.manage_access('bot-a', 'reports', 'grant', function='read', group='group-a', member='member-a', resources=['report-r'])
+    host.lifecycle('GROUP_MEMBER_REMOVE', member='member-a', sequence=2, timestamp=1000)
+    await lifecycle_done(host, 2)
+    assert (await acl.access_snapshot('bot-a', 'reports'))['revocations'][-1]['id'] == first['id']
+    host.lifecycle('GROUP_MEMBER_ADD', member='member-a', sequence=3, timestamp=1001)
+    await lifecycle_done(host, 3)
+    await state.confirm_member('bot-a', 'group-a', 'member-a', evidence='rejoined', member_role='member')
+    renewed = {
+        consumer: await acl.manage_access('bot-a', consumer, 'grant', function='read', group='group-a', member='member-a', resources=['report-r'])
+        for consumer in ('reports', 'other')
+    }
+    assert (await acl.evaluate('bot-a', 'reports', 'read', 'group-a', 'member-a', 'report-r'))['allowed']
+    options = {
+        'late': {'event_id': 'event-late', 'timestamp': 1000},
+        'same_time': {'event_id': 'event-same', 'timestamp': 1001},
+        'conflict': {'event_id': 'event-3', 'timestamp': 1002},
+        'incomplete': {'event_id': None, 'timestamp': 1002},
+        'replay': {'event_id': 'event-2', 'timestamp': 1000},
+    }[stale]
+    host.lifecycle('GROUP_MEMBER_REMOVE', member='member-a', sequence=4, **options)
+    await until(lambda: not state.recovery.get_status('bot-a').pending)
+    await asyncio.sleep(0.05)
+    for consumer, grant in renewed.items():
+        assert [g['id'] for g in (await acl.access_snapshot('bot-a', consumer))['grants']] == [grant['id']]
+    if stale != 'replay':
+        paused = await acl.evaluate('bot-a', 'reports', 'read', 'group-a', 'member-a', 'report-r')
+        assert not paused['allowed'] and paused['reason'] == 'group_facts_recovery_required'
+        platform_member(host, 'member-a')
+        assert await state.rebuild('bot-a')
+    assert (await acl.evaluate('bot-a', 'reports', 'read', 'group-a', 'member-a', 'report-r'))['allowed']
+    # A real, ordered departure still revokes every explicit source of that member in that group.
+    host.lifecycle('GROUP_MEMBER_REMOVE', member='member-a', sequence=5, event_id='event-real', timestamp=1003)
+    await lifecycle_done(host, 5)
+    for consumer, grant in renewed.items():
+        snapshot = await acl.access_snapshot('bot-a', consumer)
+        assert not snapshot['grants'] and snapshot['revocations'][-1]['id'] == grant['id']
+    left = await acl.evaluate('bot-a', 'reports', 'read', 'group-a', 'member-a', 'report-r')
+    assert not left['allowed'] and left['reason'] == 'member_left'
+
+
+async def test_unaffected_member_keeps_grant_after_trusted_member_events(access_host):
+    host = access_host
+    acl, state = await configure(host), host.state
+    await state.confirm_member('bot-a', 'group-a', 'member-b', evidence='owner verified', member_role='member')
+    grant = await acl.manage_access('bot-a', 'reports', 'grant', function='read', group='group-a', member='member-b', resources=['report-r'])
+    before = await acl.evaluate('bot-a', 'reports', 'read', 'group-a', 'member-b', 'report-r')
+    host.lifecycle('GROUP_MEMBER_ADD', member='member-c', sequence=2, timestamp=1000)
+    await lifecycle_done(host, 2)
+    assert not acl.decision_current('bot-a', before)
+    newcomer = await acl.evaluate('bot-a', 'reports', 'read', 'group-a', 'member-c', 'report-r')
+    assert not newcomer['allowed'] and newcomer['reason'] == 'membership_unverified'
+    host.lifecycle('GROUP_MEMBER_REMOVE', member='member-c', sequence=3, timestamp=1001)
+    await lifecycle_done(host, 3)
+    after = await acl.evaluate('bot-a', 'reports', 'read', 'group-a', 'member-b', 'report-r')
+    assert after['allowed'] and acl.decision_current('bot-a', after) and after['sources'][0]['id'] == grant['id']
+    assert (await acl.evaluate('bot-a', 'reports', 'read', 'group-a', 'member-c', 'report-r'))['reason'] == 'member_left'
+    assert host.sender.messages == []
+
+
+@pytest.mark.parametrize('groups', [1, 3])
+async def test_first_message_after_trusted_resume_is_retryable_then_allowed(access_host, groups):
+    host = access_host
+    acl, state = await configure(host, kind='group'), host.state
+    names = ['group-' + letter for letter in 'abc'[:groups]]
+    await acl.manage_access('bot-a', 'reports', 'policy', function='read', policy={'kind': 'group', 'groups': names})
+    for name in names:
+        await state.confirm_member('bot-a', name, 'member-a', evidence='owner verified', member_role='member')
+    await until(lambda: state._ready('bot-a'))
+    release = asyncio.Event()
+
+    async def slow(change):
+        await release.wait()
+
+    state.subscribe(slow, timeout=30)
+    host.sockets['bot-a'].frames.put_nowait(OSError('fake disconnect'))
+    second = host.gateways['bot-a'].add()
+    second.feed(10, d={'heartbeat_interval': 45000})
+    await until(lambda: any(f['op'] == 6 for f in second.sent))
+    second.feed(0, t='RESUMED', s=2, d='')
+    await until(lambda: state.recovery.get_status('bot-a').ready)
+    for name in names:
+        first = await acl.evaluate('bot-a', 'reports', 'read', name, 'member-a', 'report-r')
+        assert not first['allowed'] and first['reason'] == 'group_facts_processing' and first['retryable']
+    release.set()
+    await until(lambda: state._ready('bot-a'))
+    for name in names:
+        later = await acl.evaluate('bot-a', 'reports', 'read', name, 'member-a', 'report-r')
+        assert later['allowed'] and acl.decision_current('bot-a', later)
+
+
+@pytest.mark.parametrize('failure', ['page', 'route', 'cancel'])
+async def test_failed_setup_releases_only_its_own_entries(access_host, monkeypatch, failure):
+    from core.application import get_app
+    from core.plugin import web_pages
+
+    host = access_host
+    hook_manager = get_app().hook_manager
+    assert await host.modules.disable('access_control', _persist=False)
+    other, newer = object(), object()
+    web_pages.register_route('GET', '/api/ext/other-module/', other, auth=True)
+    web_pages.register_page('other-module', 'Other', source='module', source_name='other')
+    register_page, register_route = web_pages.register_page, web_pages.register_route
+
+    def failing_page(key, *args, **kwargs):
+        if key != 'access-control':
+            return register_page(key, *args, **kwargs)
+        if failure == 'cancel':
+            raise asyncio.CancelledError
+        # A newer instance replaced the shared route before this failed attempt unwinds.
+        register_route('*', '/api/ext/access-control/*', newer, auth=True)
+        raise RuntimeError('fake page failure')
+
+    def failing_route(method, path, handler=None, **kwargs):
+        if path.startswith('/api/ext/access-control/'):
+            raise ValueError('fake route failure')
+        return register_route(method, path, handler, **kwargs)
+
+    if failure == 'route':
+        monkeypatch.setattr(web_pages, 'register_route', failing_route)
+    else:
+        monkeypatch.setattr(web_pages, 'register_page', failing_page)
+    try:
+        if failure == 'cancel':
+            with pytest.raises(asyncio.CancelledError):
+                await host.modules.enable('access_control', _skip_deps=True, _persist=False)
+        else:
+            assert not await host.modules.enable('access_control', _skip_deps=True, _persist=False)
+        hooks = hook_manager.list_hooks()
+        assert [e for name in ('before_event', 'group_state_available') for e in hooks.get(name, []) if e['owner'] == '黑白名单授权'] == []
+        route = web_pages.match_route('POST', '/api/ext/access-control/')
+        assert (route['handler'] is newer) if failure == 'page' else (route is None)
+        assert web_pages.get_page_html('access-control') is None
+        assert web_pages.match_route('GET', '/api/ext/other-module/')['handler'] is other
+        assert web_pages.get_page_html('other-module') is not None
+        assert host.modules.get('access_control') is None
+        assert [e for e in hooks.get('before_event', []) if e['owner'] == '群状态']
+    finally:
+        web_pages.unregister_route('GET', '/api/ext/other-module/')
+        web_pages.unregister_page('other-module')
+        web_pages.unregister_route('*', '/api/ext/access-control/*')
+    monkeypatch.setattr(web_pages, 'register_page', register_page)
+    monkeypatch.setattr(web_pages, 'register_route', register_route)
+    assert await host.modules.enable('access_control', _skip_deps=True, _persist=False)
+    hooks = hook_manager.list_hooks()
+    assert len([e for e in hooks.get('before_event', []) if e['owner'] == '黑白名单授权']) == 1
+    assert len([e for e in hooks.get('group_state_available', []) if e['owner'] == '黑白名单授权']) == 1
+    host.sender.messages.clear()
+    await host.event('授权管理 {"consumer":"reports","operation":"snapshot"}', user='owner-a')
+    assert len(host.sender.messages) == 1
