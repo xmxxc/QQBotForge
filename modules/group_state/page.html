@@ -4,28 +4,63 @@
 <label>Bot <select id="gs-bot"></select></label>
 <button id="gs-load">查看已知群</button>
 <p><label>群原生标识 <input id="gs-group" maxlength="256"></label> <button id="gs-refresh">刷新 Bot 在群状态</button></p>
-<p>平台成员名册与角色变化的完整性尚需独立核验。普通成员无此页面管理权限。</p>
+<h3>成员与角色核验</h3>
+<p>名册按平台分页核验，包含本 Bot 及其他 Bot。缺页、冲突、缺少角色、许可不足或核验期间变化都不能证明完整。人工核验一个人不会证明全群完整。</p>
+<p><button id="gs-roster">刷新完整分页名册</button> <button id="gs-members">查看已知成员</button> <button id="gs-next" disabled>下一页成员</button></p>
+<p><label>成员原生标识 <input id="gs-member" maxlength="256"></label> <button id="gs-verify">自动核验单人</button></p>
+<p><label>主人核验依据 <input id="gs-evidence" maxlength="1000"></label> <label>已核实角色 <select id="gs-role"><option value="">角色未知</option><option value="member">普通成员</option><option value="admin">管理员</option><option value="owner">群主</option></select></label> <button id="gs-confirm">记录单人事实</button></p>
+<p>以上仅记录群事实，不授予功能资格。错误结果保留历史，不能直接认定成员离群。普通成员无此页面管理权限。</p>
 <p id="gs-status" role="status"></p><pre id="gs-output" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
 <script>
 (()=>{
  const bot=document.getElementById('gs-bot'), status=document.getElementById('gs-status'), output=document.getElementById('gs-output');
- let latestRequest=0;
- async function run(refresh=false){
-  const request=++latestRequest, appid=bot.value;
-  const isCurrent=()=>request===latestRequest&&appid===bot.value;
-  output.textContent='';
-  status.textContent='正在读取…';
+ const groupInput=document.getElementById('gs-group'), next=document.getElementById('gs-next');
+ let latestRequest=0, memberPage=null;
+ // Pagination belongs to one Bot and group; any newer selection or request retires it.
+ function clearPage(){memberPage=null;next.disabled=true;}
+ // A plain label per fact, so history, unknown, in-progress and complete are not read from raw JSON alone.
+ function label(fact){
+  const reason=fact?.reason||'';
+  if(fact?.complete===true)return '完整';
+  if(fact?.reliable===true)return '已核验';
+  if(/refreshing|verifying|confirming/.test(reason))return '进行中';
+  if(!fact||fact.state==='unknown'||!reason||reason==='not_verified'||reason==='unknown_group')return '未知'+(reason?'（'+reason+'）':'');
+  return (fact.status==='pending'?'待核验':'历史')+'（'+reason+'）';
+ }
+ function summary(data){
+  if(Array.isArray(data?.groups))return '已知群（非全部）：'+(data.groups.map(g=>g.group+' '+label(g)+'，名册'+label(g.roster)).join('；')||'暂无');
+  if(data?.roster)return '名册'+label(data.roster)+'，本页成员见下方';
+  return ('complete' in (data||{})?'名册本次结果':'结果')+label(data);
+ }
+ async function run(action='', nextPage=false){
+  const request=++latestRequest, appid=bot.value, group=groupInput.value.trim(), page=nextPage?memberPage:null;
+  const isCurrent=()=>request===latestRequest&&appid===bot.value&&(!action||group===groupInput.value.trim());
+  clearPage();output.textContent='';status.textContent='正在读取…';
   try {
-   const response=await fetch('/api/ext/group-state/'+(refresh?'refresh':'')+'?bot='+encodeURIComponent(appid),{
-    method:refresh?'POST':'GET',credentials:'same-origin',headers:refresh?{'Content-Type':'application/json'}:{},
-    ...(refresh?{body:JSON.stringify({group:document.getElementById('gs-group').value.trim()})}:{})});
+   const query=new URLSearchParams({bot:appid});
+   if(action==='members'){
+    query.set('group',group);query.set('limit','30');
+    if(page){for(const key of ['generation','version'])query.set(key,page[key]);query.set('cursor',page.next_cursor);}
+   }
+   let body={group};
+   if(action==='member'||action==='confirm-member')body.member=document.getElementById('gs-member').value.trim();
+   if(action==='confirm-member'){body.evidence=document.getElementById('gs-evidence').value.trim();body.member_role=document.getElementById('gs-role').value||null;}
+   const writing=action&&action!=='members';
+   const response=await fetch('/api/ext/group-state/'+action+'?'+query,{
+    method:writing?'POST':'GET',credentials:'same-origin',headers:writing?{'Content-Type':'application/json'}:{},
+    ...(writing?{body:JSON.stringify(body)}:{})});
    const data=await response.json();
    if(!isCurrent())return;
-   if(!response.ok||!data.success) throw Error(data.error||'读取失败');
-   output.textContent=JSON.stringify(data.data,null,2);status.textContent='已更新：请结合 reliable、status 和 reason 查看可信程度';
+   if(!response.ok||!data.success)throw Error(data.error||data.message||'读取失败');
+   if(action==='members'&&data.data?.group===group){memberPage=data.data;next.disabled=!memberPage.next_cursor;}
+   output.textContent=JSON.stringify(data.data,null,2);status.textContent='已更新：'+summary(data.data);
   }catch(error){if(isCurrent()){status.textContent=error.message;output.textContent='';}}
  }
- document.getElementById('gs-load').onclick=()=>run();document.getElementById('gs-refresh').onclick=()=>run(true);
+ document.getElementById('gs-load').onclick=()=>run();document.getElementById('gs-refresh').onclick=()=>run('refresh');
+ document.getElementById('gs-roster').onclick=()=>run('roster');document.getElementById('gs-members').onclick=()=>run('members');
+ next.onclick=()=>run('members',true);document.getElementById('gs-verify').onclick=()=>run('member');
+ document.getElementById('gs-confirm').onclick=()=>run('confirm-member');
+ groupInput.oninput=()=>{++latestRequest;clearPage();output.textContent='';status.textContent='请选择操作读取当前群';};
  bot.onchange=()=>run();
  fetch('/api/bots',{credentials:'same-origin'}).then(r=>r.json()).then(data=>{
   const rows=data.data?.bots||data.bots||[];

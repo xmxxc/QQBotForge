@@ -7,10 +7,11 @@ const {setImmediate: tick} = require('node:timers/promises');
 
 // Run the shipped page script, replacing only the DOM and network boundaries.
 async function page() {
+    const html = fs.readFileSync(path.join(__dirname, '../../modules/group_state/page.html'), 'utf8');
     const nodes = {};
-    for (const id of ['gs-bot', 'gs-status', 'gs-output', 'gs-group', 'gs-load', 'gs-refresh']) {
+    for (const [, id] of html.matchAll(/id="([^"]+)"/g)) {
         nodes[id] = {
-            value: id === 'gs-group' ? 'group-a' : '', textContent: '', options: [],
+            value: id === 'gs-group' ? 'group-a' : '', textContent: '', disabled: false, options: [],
             append(option) {
                 this.options.push(option);
                 if (!this.value) this.value = option.value;
@@ -18,9 +19,8 @@ async function page() {
         };
     }
     const requests = [];
-    const html = fs.readFileSync(path.join(__dirname, '../../modules/group_state/page.html'), 'utf8');
     vm.runInNewContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], {
-        document: {getElementById: id => nodes[id], createElement: () => ({})},
+        document: {getElementById: id => nodes[id], createElement: () => ({})}, URLSearchParams,
         fetch: (url, options) => url === '/api/bots'
             ? Promise.resolve({json: async () => ({data: {bots: [{appid: 'bot-a'}, {appid: 'bot-b'}]}})})
             : new Promise((resolve, reject) => requests.push({url, options, resolve, reject})),
@@ -111,4 +111,93 @@ test('starting a request clears old verified facts and current errors remain vis
     await tick();
     assert.equal(host.output(), '');
     assert.equal(host.nodes['gs-status'].textContent, 'current network failure');
+});
+
+test('a late complete roster cannot overwrite a newer failed member verification', async () => {
+    const host = await page();
+    host.nodes['gs-roster'].onclick();
+    const earlier = host.requests.at(-1);
+    host.nodes['gs-verify'].onclick();
+    const latest = {group: 'group-a', reliable: false, state: 'unknown', reason: 'permission_denied'};
+    await host.reply(host.requests.at(-1), latest);
+    await host.reply(earlier, {group: 'group-a', complete: true, version: 3});
+    assert.deepEqual(JSON.parse(host.output()), latest);
+});
+
+test('a late member page from an earlier Bot cannot enable the next page', async () => {
+    const host = await page();
+    host.nodes['gs-members'].onclick();
+    const earlier = host.requests.at(-1);
+    host.nodes['gs-bot'].value = 'bot-b';
+    host.nodes['gs-bot'].onchange();
+    await host.reply(host.requests.at(-1), {bot: 'bot-b', groups: []});
+    await host.reply(earlier, {group: 'group-a', version: 2, generation: 'g', members: [{member: 'old'}], next_cursor: '1.key'});
+    assert.equal(host.nodes['gs-next'].disabled, true);
+    assert.deepEqual(JSON.parse(host.output()), {bot: 'bot-b', groups: []});
+});
+
+test('editing the group retires the earlier member page and its late response', async () => {
+    const host = await page();
+    host.nodes['gs-members'].onclick();
+    await host.reply(host.requests.at(-1), {group: 'group-a', version: 2, generation: 'g', members: [], next_cursor: '1.key'});
+    assert.equal(host.nodes['gs-next'].disabled, false);
+    host.nodes['gs-members'].onclick();
+    const earlier = host.requests.at(-1);
+    host.nodes['gs-group'].value = 'group-b';
+    host.nodes['gs-group'].oninput();
+    assert.equal(host.nodes['gs-next'].disabled, true);
+    await host.reply(earlier, {group: 'group-a', version: 2, generation: 'g', members: [], next_cursor: '1.key'});
+    assert.equal(host.nodes['gs-next'].disabled, true);
+    assert.equal(host.output(), '');
+});
+
+test('the next page carries the cursor, version and generation of the current group page', async () => {
+    const host = await page();
+    host.nodes['gs-members'].onclick();
+    await host.reply(host.requests.at(-1), {group: 'group-a', version: 2, generation: 'g', members: [], next_cursor: '1.key'});
+    host.nodes['gs-next'].onclick();
+    const query = new URL(host.requests.at(-1).url, 'http://host').searchParams;
+    assert.deepEqual(Object.fromEntries(query), {bot: 'bot-a', group: 'group-a', limit: '30', generation: 'g', version: '2', cursor: '1.key'});
+});
+
+test('editing a group clears already displayed results immediately', async () => {
+    const host = await page();
+    host.nodes['gs-members'].onclick();
+    await host.reply(host.requests.at(-1), {group: 'group-a', members: [{member: 'old'}], next_cursor: '1.key'});
+    host.nodes['gs-group'].value = 'group-b';
+    host.nodes['gs-group'].oninput();
+    assert.equal(host.output(), '');
+    assert.equal(host.nodes['gs-next'].disabled, true);
+});
+
+test('returning to a group cannot restore a request from its earlier selection', async () => {
+    const host = await page();
+    host.nodes['gs-members'].onclick();
+    const earlier = host.requests.at(-1);
+    host.nodes['gs-group'].value = 'group-b';
+    host.nodes['gs-group'].oninput();
+    host.nodes['gs-group'].value = 'group-a';
+    host.nodes['gs-group'].oninput();
+    await host.reply(earlier, {group: 'group-a', members: [{member: 'old'}], next_cursor: '1.key'});
+    assert.equal(host.output(), '');
+    assert.equal(host.nodes['gs-next'].disabled, true);
+});
+
+test('the status line names complete, in-progress, unknown and historical facts', async () => {
+    const host = await page();
+    await host.reply(host.requests[0], {bot: 'bot-a', groups: [
+        {group: 'g1', reliable: true, status: 'verified', reason: '', roster: {complete: true, reason: ''}},
+        {group: 'g2', reliable: false, status: 'pending', reason: 'refreshing', roster: {complete: false, reason: 'roster_refreshing'}},
+        {group: 'g3', reliable: false, status: 'historical', reason: 'process_restart', roster: {complete: false, reason: 'not_verified'}},
+    ]});
+    const status = host.nodes['gs-status'].textContent;
+    assert.match(status, /g1 已核验，名册完整/);
+    assert.match(status, /g2 进行中，名册进行中/);
+    assert.match(status, /g3 历史（process_restart），名册未知（not_verified）/);
+    host.nodes['gs-roster'].onclick();
+    await host.reply(host.requests.at(-1), {complete: false, reason: 'timeout', members: []});
+    assert.equal(host.nodes['gs-status'].textContent, '已更新：名册本次结果历史（timeout）');
+    host.nodes['gs-verify'].onclick();
+    await host.reply(host.requests.at(-1), {state: 'unknown', reliable: false, status: 'pending', reason: 'permission_denied'});
+    assert.equal(host.nodes['gs-status'].textContent, '已更新：结果未知（permission_denied）');
 });
