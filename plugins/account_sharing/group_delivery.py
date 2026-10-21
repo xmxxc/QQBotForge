@@ -11,6 +11,8 @@ import copy
 
 from .validation import identifier, identity_key
 
+ACCOUNT_CHANGED = '账户信息刚更新，请重新查询。'
+
 
 class GroupDelivery:
     def __init__(self, service):
@@ -141,15 +143,23 @@ class GroupDelivery:
             return False
         await self.configure(bot, {'group': group, 'resource': resource})
         decision = await self.service.decision(bot, context, resource, 'view')
+        version = self.service.account_version(bot, resource)
         content = await self.service.query_content(bot, resource, None)
+        if not content or not await self.service.rule_current(bot, via_rule):
+            return False
+        # Every read is done: check the account content, the whole-group report and the
+        # asker's decision synchronously, and send with nothing awaited in between.
+        # Report or decision no longer current: go private, where the asker is evaluated again.
         if (
-            not content
-            or not self.can_send(bot, mode)
+            not self.can_send(bot, mode)
             or not decision['allowed']
             or not self.service.access().decision_current(bot, decision)
-            or not await self.service.rule_current(bot, via_rule)
         ):
             return False
+        if not self.service.account_unchanged(bot, resource, version):
+            # Edited while being read: send neither the old content nor a private downgrade.
+            await self.service.safe_reply(event, ACCOUNT_CHANGED)
+            return True
         state = self.service.reply_outcome(await self.service.safe_reply(event, content))
         await self.service.operation(bot, 'delivery', group=group, member=context['member'], resource=resource, delivery=state, target='group')
         # A failed or unknown public send is never retried elsewhere.

@@ -500,3 +500,135 @@ async def test_trusted_resume_waits_for_consumers_before_facts_return(group_host
         assert fact['usable'] and fact['reason'] == '' and state.fact_current(fact)
     assert not state.fact_current(before)
     assert len([reason for reason in seen if reason.startswith('connection:')]) >= 2 * groups
+
+
+def delay_queued_connection_callback(state, monkeypatch, phase='replay_complete'):
+    """Hold the framework-queued connection callback before it enters group state;
+    statuses and recovery stay real, only the dispatch is late."""
+    original = state.connection_subscription._callback
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def delayed(status):
+        if status.appid == 'bot-a' and status.phase == phase:
+            entered.set()
+            await release.wait()
+        return await original(status)
+
+    monkeypatch.setattr(state.connection_subscription, '_callback', delayed)
+    return entered, release
+
+
+async def resume(host):
+    host.sockets['bot-a'].frames.put_nowait(OSError('fake disconnect'))
+    second = host.gateways['bot-a'].add()
+    second.feed(10, d={'heartbeat_interval': 45000})
+    await until(lambda: any(f['op'] == 6 for f in second.sent))
+    second.feed(0, t='RESUMED', s=2, d='')
+
+
+@pytest.mark.parametrize('groups', [1, 3])
+async def test_queued_connection_notification_holds_facts_until_consumers_finish(group_host, monkeypatch, groups):
+    host, state = group_host, group_host.state
+    names = ['group-' + letter for letter in 'abc'[:groups]]
+    for name in names:
+        await state.confirm_member('bot-a', name, 'member-a', evidence='verified')
+    await until(lambda: state._ready('bot-a'))
+    before = await state.fact('bot-a', names[-1], 'member-a')
+    consumer_entered, consumer_release = asyncio.Event(), asyncio.Event()
+
+    async def consumer(change):
+        if change['reason'] == 'connection:replay_complete':
+            consumer_entered.set()
+            await consumer_release.wait()
+
+    state.subscribe(consumer, timeout=30)
+    entered, release = delay_queued_connection_callback(state, monkeypatch)
+    await resume(host)
+    await until(entered.is_set)
+    assert state.recovery.get_status('bot-a').ready  # the framework side is done
+    assert not (await state.snapshot('bot-a'))['recovery']['ready']
+    for name in names:
+        queued = await state.fact('bot-a', name, 'member-a')
+        assert not queued['usable'] and queued['reason'] == 'recovery_processing'
+        assert not state.fact_current(queued)
+    assert not state.fact_current(before)
+    release.set()
+    await until(consumer_entered.is_set)
+    during = await state.fact('bot-a', names[0], 'member-a')
+    assert not during['usable'] and during['reason'] == 'recovery_processing'
+    consumer_release.set()
+    await until(lambda: state._ready('bot-a'))
+    for name in names:
+        fact = await state.fact('bot-a', name, 'member-a')
+        assert fact['usable'] and state.fact_current(fact)
+    assert not state.fact_current(before)
+
+
+async def test_queued_connection_notification_failure_needs_rebuild_not_forever(group_host, monkeypatch):
+    host, state = group_host, group_host.state
+    await state.confirm_member('bot-a', 'group-a', 'member-a', evidence='verified')
+    await until(lambda: state._ready('bot-a'))
+
+    async def failing(change):
+        if change['reason'] == 'connection:replay_complete':
+            raise RuntimeError('consumer failed')
+
+    sub = state.subscribe(failing)
+    entered, release = delay_queued_connection_callback(state, monkeypatch)
+    await resume(host)
+    await until(entered.is_set)
+    assert (await state.fact('bot-a', 'group-a', 'member-a'))['reason'] == 'recovery_processing'
+    release.set()
+    await until(lambda: any(r.status.phase == 'replay_complete' and r.outcome == 'error' for r in state.connection_subscription.results))
+    failed = await state.fact('bot-a', 'group-a', 'member-a')
+    assert not failed['usable'] and failed['reason'] == 'recovery_required'
+    sub.cancel()
+    # A new baseline (current owner confirmation + rebuild) restores use; no permanent pause.
+    await state.confirm_member('bot-a', 'group-a', 'member-a', evidence='verified again')
+    assert await state.rebuild('bot-a')
+    assert (await state.fact('bot-a', 'group-a', 'member-a'))['usable']
+
+
+async def test_reload_with_queued_connection_notification_cannot_mark_new_instance(group_host, monkeypatch):
+    host, old = group_host, group_host.state
+    await old.confirm_member('bot-a', 'group-a', 'member-a', evidence='verified')
+    await until(lambda: old._ready('bot-a'))
+    entered, release = delay_queued_connection_callback(old, monkeypatch)
+    await resume(host)
+    await until(entered.is_set)
+    assert await host.modules.reload('group_state')
+    new = host.state
+    assert new is not old and not old.active
+    await new.confirm_member('bot-a', 'group-a', 'member-a', evidence='verified')
+    assert await new.rebuild('bot-a')
+    fact = await new.fact('bot-a', 'group-a', 'member-a')
+    assert fact['usable']
+    release.set()
+    await until(lambda: any(r.status.phase == 'replay_complete' for r in old.connection_subscription.results))
+    # The old instance's late callback neither marks nor pauses the new instance.
+    assert new.fact_current(fact) and not old._ready('bot-a')
+
+
+async def test_timed_out_connection_callback_and_skipped_statuses_need_rebuild_not_forever(group_host, monkeypatch):
+    host, state = group_host, group_host.state
+    await state.confirm_member('bot-a', 'group-a', 'member-a', evidence='verified')
+    await until(lambda: state._ready('bot-a'))
+    release = asyncio.Event()
+
+    async def slow(change):
+        if change['reason'].startswith('connection:'):
+            await release.wait()
+
+    sub = state.subscribe(slow, timeout=30)
+    # The framework stops waiting for our callback; statuses queued behind it are skipped as 'busy'.
+    monkeypatch.setattr(state.connection_subscription, 'timeout', 0.05)
+    await resume(host)
+    await until(lambda: {'timeout', 'busy'} <= {r.outcome for r in state.connection_subscription.results})
+    await until(lambda: not state.notifications.busy('bot-a'))
+    paused = await state.fact('bot-a', 'group-a', 'member-a')
+    assert not paused['usable'] and paused['reason'] == 'recovery_required'
+    release.set()
+    sub.cancel()
+    await state.confirm_member('bot-a', 'group-a', 'member-a', evidence='verified again')
+    assert await state.rebuild('bot-a')
+    assert (await state.fact('bot-a', 'group-a', 'member-a'))['usable']

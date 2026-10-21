@@ -19,7 +19,7 @@ from core.base.config import cfg
 from core.base.logger import PLUGIN, get_logger
 from core.plugin._blacklist import get_blacklist_map
 
-from .group_delivery import GroupDelivery
+from .group_delivery import ACCOUNT_CHANGED, GroupDelivery
 from .menus import MenuSessions
 from .storage import ExtensionStore
 
@@ -95,6 +95,8 @@ class AccountSharing:
         self.notification_locks = {}
         self.declared = {}
         self.inventory_version = {}
+        self.account_versions = {}
+        self.account_writes = set()
         self.clock = clock
         self.menus = MenuSessions(self.store, lambda: self.clock())
         self.group_delivery = GroupDelivery(self)
@@ -142,8 +144,17 @@ class AccountSharing:
             self.declared[bot] = key
         return acl
 
-    def accounts_changed(self, bot):
+    def accounts_changed(self, bot, resource):
         self.inventory_version[bot] = self.inventory_version.get(bot, 0) + 1
+        self.account_versions[bot, resource] = self.account_version(bot, resource) + 1
+
+    def account_version(self, bot, resource):
+        """Bumped after each save or delete of this account; sends compare it after their last await."""
+        return self.account_versions.get((bot, resource), 0)
+
+    def account_unchanged(self, bot, resource, version):
+        # A write in flight may already be committed before its version bump.
+        return (bot, resource) not in self.account_writes and self.account_version(bot, resource) == version
 
     # ---------- reply results ----------
 
@@ -195,8 +206,12 @@ class AccountSharing:
                     raise BusinessError('账户已停用', 409)
                 return old
             if operation == 'delete':
-                await self.store.delete(bot, 'accounts', key)
-                self.accounts_changed(bot)
+                self.account_writes.add((bot, key))
+                try:
+                    await self.store.delete(bot, 'accounts', key)
+                finally:
+                    self.account_writes.discard((bot, key))
+                    self.accounts_changed(bot, key)
                 await self._sync_resources(bot)
                 log.info(f'[{bot}] 删除账户 {key}')
                 return {'id': key}
@@ -205,8 +220,12 @@ class AccountSharing:
             validate_account(data, create=operation == 'create')
             account = old or {'id': uuid4().hex, 'enabled': True, 'description': '', 'url': '', 'groups': []}
             account.update(data)
-            await self.store.put(bot, 'accounts', account['id'], account)
-            self.accounts_changed(bot)
+            self.account_writes.add((bot, account['id']))
+            try:
+                await self.store.put(bot, 'accounts', account['id'], account)
+            finally:
+                self.account_writes.discard((bot, account['id']))
+                self.accounts_changed(bot, account['id'])
             await self._sync_resources(bot)
             log.info(f'[{bot}] 保存账户 {account["id"]}')
             return account
@@ -660,10 +679,18 @@ class AccountSharing:
             if not target or target['group'] != group:
                 await self.deny(event)
                 return
+        version = self.account_version(bot, resource)
         content = await self.query_content(bot, resource, rule_id)
-        # Final gate right before sending: rule revision, binding, private denial, decision, current content.
-        if content is None or not self.active or not await self.rule_current(bot, via_rule) or not acl.context_current(bot, target):
+        if content is None or not await self.rule_current(bot, via_rule):
             await self.deny(event)
+            return
+        # Final gate right before sending, after the last await: unchanged account content,
+        # binding, private denial and an explicit (never admission/role) current decision.
+        if not self.active or target['decision'].get('reason') != 'explicit' or not acl.context_current(bot, target):
+            await self.deny(event)
+            return
+        if not self.account_unchanged(bot, resource, version):
+            await self.safe_reply(event, ACCOUNT_CHANGED)
             return
         sender = self.sender_provider(bot)
         try:
