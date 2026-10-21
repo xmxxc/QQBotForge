@@ -439,7 +439,7 @@ async def test_observation_write_failure_after_unpublished_roster_commit_is_mark
                                  version=report['version'], generation=report['generation'])
 
 
-@pytest.mark.parametrize('failure', ['duplicate', 'repeated_cursor', 'bot_identity_conflict'])
+@pytest.mark.parametrize('failure', ['duplicate', 'repeated_cursor', 'bot_identity_conflict', 'self_absent', 'page_limit'])
 async def test_conflicting_roster_pass_grants_no_member_reliability(group_host, failure):
     host = group_host
     roster_platform(host)
@@ -447,11 +447,17 @@ async def test_conflicting_roster_pass_grants_no_member_reliability(group_host, 
         host.sender.json_results[('/v2/groups/group-a/members', 'second')] = page(member('other-bot', bot=True), member('member-a'))
     elif failure == 'repeated_cursor':
         host.sender.json_results[('/v2/groups/group-a/members', 'second')] = page(member('this-bot', 'admin', bot=True), cursor='second')
+    elif failure == 'self_absent':
+        host.sender.json_results[('/v2/groups/group-a/bot_state', '')] = (True, {'member_openid': 'absent-bot', 'member_role': 'admin'})
+    elif failure == 'page_limit':
+        # Every page names a fresh cursor, so the bounded reader never reaches a last page.
+        for index in range(1000):
+            host.sender.json_results[('/v2/groups/group-a/members', f'c{index}' if index else '')] = page(member(f'member-{index}'), cursor=f'c{index + 1}')
     else:
         host.sender.json_results[('/v2/groups/group-a/bot_state', '')] = (True, {'member_openid': 'this-bot', 'member_role': 'owner'})
     await host.state.confirm_member('bot-a', 'group-a', 'member-a', evidence='fake owner checked')
     report = await host.state.sync_roster('bot-a', 'group-a')
-    assert report['complete'] is False and report['reason'] in ('pagination_conflict', 'bot_identity_conflict')
+    assert report['complete'] is False and report['reason'] in ('pagination_conflict', 'pagination_limit', 'bot_identity_conflict')
     group = (await host.state.snapshot('bot-a'))['groups'][0]
     assert set(group['members']) == {'member-a'}
     assert not any(record['reliable'] for record in group['members'].values())

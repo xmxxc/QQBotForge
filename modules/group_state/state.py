@@ -339,8 +339,8 @@ class GroupState:
                     report.update(complete=False, reason='known_member_missing', missing_known_members=sorted(known - {r['member'] for r in report['members']}))
                 checked = self.clock()
 
-                # Duplicates, cursor loops and identity contradictions make the whole pass unusable as member proof.
-                conflict = report['reason'] in ('pagination_conflict', 'bot_identity_conflict')
+                # Duplicates, cursor loops (an unending cursor chain included) and identity contradictions make the whole pass unusable as member proof.
+                conflict = report['reason'] in ('pagination_conflict', 'pagination_limit', 'bot_identity_conflict')
 
                 def apply(candidate, updated):
                     for record in [] if conflict else report['members']:

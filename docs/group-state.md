@@ -53,8 +53,8 @@ G01 提供已知群概览与 Bot 状态，G02（#22）补充分页名册及单�
 ### 字段可信度与部分结果
 
 - 只有 `roster.complete=true` 且其 `version` 与群当前版本一致时，`roster.members` 才可作为全群接收者名单；否则 `roster.members` 只是本轮观察，用于展示和排查。
-- 成员记录的 `reliable=true` 是唯一允许单独使用的成员事实。单纯中断（超时、无许可、查询失败、不可识别页、分页上限、本 Bot 身份未知）时，已读到且格式完整、角色可识别的行与完整名册中的同一行同等可信，记为 `platform_roster`；未读到的已知成员转为历史。
-- 数据冲突（重复成员、游标循环或空页续页、本 Bot 身份或角色矛盾，原因 `pagination_conflict`／`bot_identity_conflict`）使整轮结果不能作为任何成员的资格依据：不写入本轮成员行，已知成员转为历史，原有可靠事实不恢复，需重新核验。
+- 成员记录的 `reliable=true` 是唯一允许单独使用的成员事实。单纯中断（超时、无许可、查询失败、不可识别页、本 Bot 身份查询失败或无效）时，已读到且格式完整、角色可识别的行与完整名册中的同一行同等可信，记为 `platform_roster`；未读到的已知成员转为历史。
+- 数据冲突（重复成员、游标循环或空页续页、达到 1000 页上限仍未结束、`bot_state` 所指本 Bot 不在完整读取的名册中或角色矛盾，原因 `pagination_conflict`／`pagination_limit`／`bot_identity_conflict`）使整轮结果不能作为任何成员的资格依据：不写入本轮成员行，已知成员转为历史，原有可靠事实不恢复，需重新核验。
 - `reliable=false` 的 `member_role`、`bot`、`joined_at` 只作历史参考。授权消费者（A01 起的受众核验）在名册不完整时只使用 `reliable=true` 且 `status=present` 的成员，并经 G03 提供的 `fact_current` 复核版本后使用。
 
 ### 局部重试、分页失效与 G03 依赖
