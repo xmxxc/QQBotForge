@@ -347,3 +347,41 @@ async def test_first_platform_query_after_manual_anchor_detects_new_cycle(group_
     await state.verify_member('bot-a', 'group-a', 'member-a')
     record = (await state.fact('bot-a', 'group-a', 'member-a'))['member']
     assert record['cycle'] != cycle
+
+
+@pytest.mark.parametrize('operation', ['refresh', 'roster', 'member', 'confirm'])
+async def test_candidate_commits_wait_for_consumer_completion(group_host, operation):
+    from test_group_roster import roster_platform
+
+    host = group_host
+    state = host.state
+    roster_platform(host)
+    await state.confirm_member('bot-a', 'group-a', 'member-a', evidence='主人已核验')
+    proof = await state.fact('bot-a', 'group-a', 'member-a')
+    assert state.fact_current(proof)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def consumer(change):
+        assert not state.fact_current(proof)
+        entered.set()
+        await release.wait()
+
+    sub = state.subscribe(consumer)
+    actions = {
+        'refresh': lambda: state.refresh('bot-a', 'group-a'),
+        'roster': lambda: state.sync_roster('bot-a', 'group-a'),
+        'member': lambda: state.verify_member('bot-a', 'group-a', 'member-a'),
+        'confirm': lambda: state.confirm_member('bot-a', 'group-a', 'member-a', evidence='主人重新核验'),
+    }
+    pending = asyncio.create_task(actions[operation]())
+    try:
+        await until(entered.is_set)
+        assert not pending.done()
+        assert not (await state.fact('bot-a', 'group-a', 'member-a'))['usable']
+    finally:
+        release.set()
+    result = await pending
+    assert sub.results[-1].status == 'success'
+    assert result['complete'] if operation == 'roster' else result['reliable']
+    assert (await state.fact('bot-a', 'group-a', 'member-a'))['usable']
+    assert not state.fact_current(proof)
