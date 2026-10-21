@@ -42,3 +42,21 @@ async def on_custom_task(event, match):
 ```
 
 Hook 和分发能力不包含任何具体业务事件、接口路径或业务参数。
+
+## 插件处理器之前的模块消息 Hook
+
+普通消息由模块应答时使用 `before_handler` 管道，而不是 `before_event`。它在插件分发内部执行：消息记录、用户追踪、全量群记录、黑名单、维护模式、非@群消息权限（含忽略仅@其他 Bot／用户）和插件拦截器都已完成，随后才轮到插件处理器。不满足这些接收条件的消息不会进入此 Hook。
+
+回调接收 `Event`，原样返回则继续匹配插件处理器及默认回复；返回 `None` 表示模块已处理，后续插件处理器和默认回复不再执行。异常、优先级和按 owner 自动注销规则与其他 Hook 相同。`non_at_message.strip_bot_name_at` 只影响插件正则匹配，模块需要时自行处理 `event.content`。
+
+```python
+async def setup(ctx):
+    @ctx.hook('before_handler', priority=100)
+    async def answer(event):
+        if not await my_rules_match(event):
+            return event
+        await reply(event)
+        return None
+```
+
+非消息事件和没有插件管理器的进程不会触发此 Hook。
