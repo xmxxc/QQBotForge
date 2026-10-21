@@ -23,7 +23,7 @@ async def setup(ctx):
     except BaseException:
         unregister_route('*', PREFIX + '*')
         unregister_page('group-state')
-        candidate.close()
+        await candidate.aclose()
         raise
     _instance = candidate
     return candidate
@@ -33,6 +33,6 @@ async def teardown():
     global _instance
     unregister_route('*', PREFIX + '*')
     unregister_page('group-state')
-    if _instance is not None:
-        _instance.close()
-        _instance = None
+    instance, _instance = _instance, None
+    if instance is not None:
+        await instance.aclose()
