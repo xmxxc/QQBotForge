@@ -379,6 +379,11 @@ class WSClient:
         if self._closed:
             return
         event_type = payload.get('t', '')
+        if not isinstance(event_type, str) or not event_type:
+            # 必须在解析器将假值归一为空事件名之前关闭该来源的连续性信任。
+            self._resume_provable = False
+            self._status.publish('unknown', reason='invalid_dispatch_type')
+            return
         if event_type == 'READY':
             if self._ready_seen:
                 return
@@ -422,9 +427,16 @@ class WSClient:
             return
         try:
             event = Event.from_websocket(self._appid, payload)
+            if event.event_type != event_type:
+                # 兼容适配器可以推导事件名，但不能改变 WS 协议声明的处理范围。
+                self._resume_provable = False
+                self._status.publish('unknown', reason='dispatch_type_mismatch')
+                return
             event.connection_context = self._status.context
             if self._on_event_received is not None:
                 self._on_event_received(event, transport='websocket', session_id=self._session_id)
+            for observer in tuple(self.connection_status._dispatch_observers):
+                observer(event)
             log.debug(f'[{self._appid}] WS事件: {event}')
             if event_type == 'INTERACTION_CREATE':
                 # 分发插件后用其 code 回复交互回调 (独立任务等待, 不阻塞读取循环)
@@ -436,6 +448,8 @@ class WSClient:
                 self._ensure_event_workers()
                 await self._event_queue.put(event)
         except Exception as e:
+            self._resume_provable = False
+            self._status.publish('unknown', reason='event_dispatch_failed')
             log.error(f'[{self._appid}] 事件处理异常: {e}')
 
     def _start_interaction_task(self, coro, event):
