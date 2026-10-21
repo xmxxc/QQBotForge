@@ -1,7 +1,9 @@
 """Observed native C2C identities, owner-reviewed binding and scoped contexts."""
 
+import asyncio
 import json
 
+import pytest
 from test_access_control import access_host as access_host
 from test_access_control import configure, request
 
@@ -290,20 +292,85 @@ async def test_explicit_new_owner_confirmation_after_revoke_keeps_old_import_blo
     assert {row['id'] for row in snapshot['revocations']} == {first['id'], second['id']}
 
 
-async def test_platform_rejected_binding_receipt_preserves_error_code(access_host, monkeypatch):
-    host = access_host
+@pytest.mark.parametrize(
+    'outcome, notification, error',
+    [
+        ('platform_ok', 'sent', None),
+        ('empty_body', 'sent', None),
+        ('platform_error', 'platform_rejected', '11253'),
+        ('http_status', 'platform_rejected', '502'),
+        ('err_code_only', 'platform_rejected', '40054010'),
+        ('message_only', 'platform_rejected', 'unknown'),
+        ('network', 'send_failed', 'network_error'),
+        ('suppressed', 'send_failed', 'no_response'),
+        ('raises', 'send_failed', 'RuntimeError'),
+    ],
+)
+async def test_binding_receipt_follows_real_sender_reply_result(access_host, monkeypatch, outcome, notification, error):
+    """The real MessageSender.reply runs over a fake HTTP transport, so receipts see its actual return shapes."""
+    import core.message._http as http
+    from core.message.sender import MessageSender
 
-    # Sender.reply returns the platform response dict, never a (success, data) tuple.
-    responses = [{'id': 'fake-reply', 'timestamp': 1}, {'code': 11253, 'message': 'denied'}, {'code': -1, 'message': '框架网络层请求超时'}]
+    host = access_host
+    monkeypatch.setattr(http, '_NET_RETRY_DELAY', 0)
+
+    class Response:
+        def __init__(self, status, body):
+            self.status_code, self.content, self.headers = status, body, {}
+
+    class Transport:
+        is_closed = False
+
+        async def request(self, method, endpoint, **kwargs):
+            if outcome == 'network':
+                raise ConnectionError('fake connection reset')
+            return {
+                'platform_ok': Response(200, b'{"id": "msg-1", "timestamp": "1"}'),
+                'empty_body': Response(200, b''),
+                'platform_error': Response(400, b'{"code": 11253, "message": "denied"}'),
+                'http_status': Response(502, b'bad gateway'),
+                'err_code_only': Response(400, b'{"err_code": 40054010, "message": "denied"}'),
+                'message_only': Response(400, b'{"message": "denied"}'),
+                'suppressed': Response(400, b'{"code": 11293, "message": "ignored by framework"}'),
+            }[outcome]
+
+    class Tokens:
+        appid = 'bot-a'
+
+        async def get_client(self):
+            return Transport()
+
+        async def get_token(self):
+            return 'fake-token'
+
+    sender = MessageSender(Tokens())
+    if outcome == 'raises':
+        # Transport exceptions become code -1 inside the sender; only a local defect raises out of reply.
+        async def broken(self, event, content=None, **kwargs):
+            raise RuntimeError('unexpected local failure')
+
+        monkeypatch.setattr(MessageSender, 'reply', broken)
+    monkeypatch.setattr(host.application._bot_registry._bots['bot-a'], 'sender', sender)
+    await host.event('身份绑定 申请 group-a member-a', user='private-a')
+    pending = (await host.access.binding_snapshot('bot-a'))['requests'][0]
+    assert pending['status'] == 'pending'
+    assert (pending['notification'], pending['notification_error']) == (notification, error)
+
+
+async def test_cancelled_binding_receipt_is_recorded_as_unknown(access_host, monkeypatch):
+    host = access_host
+    entered = asyncio.Event()
 
     async def reply(event, content=None, **kwargs):
-        return responses.pop(0)
+        entered.set()
+        await asyncio.Event().wait()
 
     monkeypatch.setattr(host.sender, 'reply', reply)
-    for index, native in enumerate(('member-a', 'member-b', 'member-c')):
-        await host.event(f'身份绑定 申请 group-a {native}', user=f'private-{index}')
-    sent, rejected, unknown = (await host.access.binding_snapshot('bot-a'))['requests']
-    assert sent['notification'] == 'sent'
-    assert rejected['status'] == 'pending'
-    assert rejected['notification'] == 'platform_rejected' and rejected['notification_error'] == '11253'
-    assert unknown['notification'] == 'send_failed' and unknown['notification_error'] == 'network_error'
+    task = asyncio.create_task(host.event('身份绑定 申请 group-a member-a', user='private-a'))
+    await asyncio.wait_for(entered.wait(), 3)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    pending = (await host.access.binding_snapshot('bot-a'))['requests'][0]
+    assert pending['status'] == 'pending'
+    assert (pending['notification'], pending['notification_error']) == ('send_unknown', 'cancelled')
