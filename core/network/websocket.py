@@ -127,10 +127,26 @@ class WSClient:
             return
         if self._session_id is None:
             self._status.update_context(session_id=None, session_generation=None, resume_attempt_id=None)
-        self._connect_task = asyncio.current_task()
         self._closed = False
         self._ensure_event_workers()
+        # close 只取消客户端拥有的连接循环，不取消 await connect() 的调用者。
+        connecting = self._connect_task = asyncio.create_task(self._run_connection())
         try:
+            await connecting
+        except asyncio.CancelledError:
+            # 主动关闭允许调用者正常继续；调用者自身的取消仍须向外传播。
+            if stop_generation == self._stop_generation:
+                # 连接循环尚未开始就被取消时，其 finally 不会运行。
+                if self._connect_task is connecting:
+                    await self.close(reason='connect_cancelled')
+                raise
+            if asyncio.current_task().cancelling():
+                raise
+
+    async def _run_connection(self):
+        try:
+            # 先让创建方登记任务，兼容 eager 工厂在 create_task 内立即执行协程。
+            await asyncio.sleep(0)
             while not self._closed:
                 opened, failed = False, False
                 reason = 'socket_eof'
@@ -232,6 +248,8 @@ class WSClient:
             await self._ws.close()
         if connecting is not None and connecting is not asyncio.current_task():
             await asyncio.gather(connecting, return_exceptions=True)
+            if self._connect_task is connecting:
+                self._connect_task = None
 
     def _ensure_event_workers(self):
         if any(not worker.done() for worker in self._event_workers):
@@ -258,11 +276,13 @@ class WSClient:
         scope = event._group_lifecycle_scope
         waiting = self._deferred_events.get(scope)
         if waiting is None:
-            waiting = self._deferred_events[scope] = deque()
+            # eager 工厂可能立即开始排空，创建任务前先保存首条事件。
+            waiting = self._deferred_events[scope] = deque([event])
             task = spawn(self._resume_deferred(scope, waiting))
             self._deferred_tasks.add(task)
             task.add_done_callback(self._deferred_tasks.discard)
-        waiting.append(event)
+        else:
+            waiting.append(event)
         return True
 
     async def _resume_deferred(self, scope, waiting):
@@ -359,6 +379,11 @@ class WSClient:
         if self._closed:
             return
         event_type = payload.get('t', '')
+        if not isinstance(event_type, str) or not event_type:
+            # 必须在解析器将假值归一为空事件名之前关闭该来源的连续性信任。
+            self._resume_provable = False
+            self._status.publish('unknown', reason='invalid_dispatch_type')
+            return
         if event_type == 'READY':
             if self._ready_seen:
                 return
@@ -402,9 +427,16 @@ class WSClient:
             return
         try:
             event = Event.from_websocket(self._appid, payload)
+            if event.event_type != event_type:
+                # 兼容适配器可以推导事件名，但不能改变 WS 协议声明的处理范围。
+                self._resume_provable = False
+                self._status.publish('unknown', reason='dispatch_type_mismatch')
+                return
             event.connection_context = self._status.context
             if self._on_event_received is not None:
                 self._on_event_received(event, transport='websocket', session_id=self._session_id)
+            for observer in tuple(self.connection_status._dispatch_observers):
+                observer(event)
             log.debug(f'[{self._appid}] WS事件: {event}')
             if event_type == 'INTERACTION_CREATE':
                 # 分发插件后用其 code 回复交互回调 (独立任务等待, 不阻塞读取循环)
@@ -416,6 +448,8 @@ class WSClient:
                 self._ensure_event_workers()
                 await self._event_queue.put(event)
         except Exception as e:
+            self._resume_provable = False
+            self._status.publish('unknown', reason='event_dispatch_failed')
             log.error(f'[{self._appid}] 事件处理异常: {e}')
 
     def _start_interaction_task(self, coro, event):
@@ -463,7 +497,7 @@ class WSClient:
         token = await self._tm.get_token()
         self._auth_mode = 'resume'
         self._resume_pending = True
-        self._resume_from_sequence = self._seq
+        self._resume_from_sequence = self._seq if type(self._seq) is int else None
         self._resume_provable = (
             self._status.capabilities.replay_boundary and self._status.context.session_generation is not None and type(self._seq) is int and self._seq >= 0
         )
@@ -474,7 +508,7 @@ class WSClient:
             reason='resume',
             continuity='pending' if self._resume_provable else 'unknown',
             login_kind='resume',
-            resume_from_sequence=self._seq,
+            resume_from_sequence=self._resume_from_sequence,
         )
         await self._send_op(
             _OP_RESUME,
