@@ -554,6 +554,7 @@ class GroupState:
         # Statuses before subscribing are never delivered (replay_current=False).
         # One entry per Bot/transport, so it does not grow with reconnects.
         self.current_connection_statuses = lambda: ctx.connection_statuses
+        self.webhook_status = lambda bot: ctx.get_connection_status(bot, transport='webhook')
         self.connection_baseline = {(status.appid, status.transport): status.revision for status in ctx.connection_statuses}
         self.connection_settled = dict(self.connection_baseline)
         # Highest status our callback started for, whatever its outcome.
@@ -568,12 +569,11 @@ class GroupState:
 
     def _ready(self, bot):
         status = self.recovery.get_status(bot)
-        webhook = self.recovery.get_status(bot, transport='webhook')
         return (
             self.active
             and status.ready
             and not status.pending
-            and webhook.context is None
+            and not self._webhook_delivered(bot)
             and not self.notifications.busy(bot)
             and not self._connection_pending(bot)
         )
@@ -586,6 +586,14 @@ class GroupState:
             status.revision > self.connection_settled.get((bot, status.transport), 0) for status in self.current_connection_statuses() if status.appid == bot
         )
 
+    def _webhook_delivered(self, bot):
+        # Every BotInstance registers, starts and stops an HTTP callback source; those statuses
+        # carry no event and settle like any connection status. receive_index counts callbacks
+        # this Bot instance actually read (updated without a new revision). HTTP has no
+        # continuity proof, so once it delivered anything this Bot instance stays untrusted.
+        status = self.webhook_status(bot)
+        return status is not None and status.context.receive_index > 0
+
     def _pause_reason(self, bot):
         """Why this Bot's facts are paused: '' when ready; 'recovery_processing' while a
         trusted boundary or consumer notification is still finishing and
@@ -594,7 +602,7 @@ class GroupState:
         if self._ready(bot):
             return 'persistence_pending' if self.pending_writes.get(bot) else ''
         status = self.recovery.get_status(bot)
-        if self.active and self.recovery.get_status(bot, transport='webhook').context is None and status.phase in {'ready', 'processing', 'recovering'}:
+        if self.active and not self._webhook_delivered(bot) and status.phase in {'ready', 'processing', 'recovering'}:
             return 'recovery_processing'
         return 'recovery_required'
 
@@ -830,8 +838,9 @@ class GroupState:
                     failed.append(status)
             if not good or list(state['groups']) != groups or self.pending_writes.get(bot) or self.notifications.busy(bot):
                 return False
-            # The checkpoint also rejects events/connection transitions during queries.
-            if not self.recovery.establish(checkpoint):
+            # The checkpoint also rejects events/connection transitions during queries; an HTTP
+            # receipt bumps no revision, so check it in the same step as establishing.
+            if self._webhook_delivered(bot) or not self.recovery.establish(checkpoint):
                 return False
             for status in failed:
                 self._settle_connection(status)
