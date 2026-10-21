@@ -259,6 +259,9 @@ async def test_consumer_failure_cannot_acknowledge_recovery(group_host, outcome)
     assert not state.recovery.get_status('bot-a').ready
     sub.cancel()
     assert not sub.active
+    # Consumer results precede the framework's final delivery bookkeeping.
+    await until(lambda: not state.recovery.get_status('bot-a').pending)
+    assert state.recovery.get_status('bot-a').failed
     assert await state.rebuild('bot-a')
 
 
