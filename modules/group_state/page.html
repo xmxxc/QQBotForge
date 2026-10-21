@@ -14,15 +14,19 @@
 <script>
 (()=>{
  const bot=document.getElementById('gs-bot'), status=document.getElementById('gs-status'), output=document.getElementById('gs-output');
- let memberPage=null;
- async function run(action='', next=false){
-  status.textContent='正在读取…';
+ const groupInput=document.getElementById('gs-group'), next=document.getElementById('gs-next');
+ let latestRequest=0, memberPage=null;
+ // Pagination belongs to one Bot and group; any newer selection or request retires it.
+ function clearPage(){memberPage=null;next.disabled=true;}
+ async function run(action='', nextPage=false){
+  const request=++latestRequest, appid=bot.value, group=groupInput.value.trim(), page=nextPage?memberPage:null;
+  const isCurrent=()=>request===latestRequest&&appid===bot.value&&(!action||group===groupInput.value.trim());
+  clearPage();output.textContent='';status.textContent='正在读取…';
   try {
-   const group=document.getElementById('gs-group').value.trim();
-   const query=new URLSearchParams({bot:bot.value});
+   const query=new URLSearchParams({bot:appid});
    if(action==='members'){
     query.set('group',group);query.set('limit','30');
-    if(next&&memberPage){for(const key of ['generation','version'])query.set(key,memberPage[key]);query.set('cursor',memberPage.next_cursor);}
+    if(page){for(const key of ['generation','version'])query.set(key,page[key]);query.set('cursor',page.next_cursor);}
    }
    let body={group};
    if(action==='member'||action==='confirm-member')body.member=document.getElementById('gs-member').value.trim();
@@ -32,16 +36,17 @@
     method:writing?'POST':'GET',credentials:'same-origin',headers:writing?{'Content-Type':'application/json'}:{},
     ...(writing?{body:JSON.stringify(body)}:{})});
    const data=await response.json();
+   if(!isCurrent())return;
    if(!response.ok||!data.success)throw Error(data.error||data.message||'读取失败');
-   if(action==='members')memberPage=data.data;else memberPage=null;
-   document.getElementById('gs-next').disabled=!memberPage?.next_cursor;
+   if(action==='members'&&data.data?.group===group){memberPage=data.data;next.disabled=!memberPage.next_cursor;}
    output.textContent=JSON.stringify(data.data,null,2);status.textContent='已更新：请结合完整性、来源与历史标记查看核验结果';
-  }catch(error){status.textContent=error.message;output.textContent='';memberPage=null;document.getElementById('gs-next').disabled=true;}
+  }catch(error){if(isCurrent()){status.textContent=error.message;output.textContent='';}}
  }
  document.getElementById('gs-load').onclick=()=>run();document.getElementById('gs-refresh').onclick=()=>run('refresh');
  document.getElementById('gs-roster').onclick=()=>run('roster');document.getElementById('gs-members').onclick=()=>run('members');
- document.getElementById('gs-next').onclick=()=>run('members',true);document.getElementById('gs-verify').onclick=()=>run('member');
+ next.onclick=()=>run('members',true);document.getElementById('gs-verify').onclick=()=>run('member');
  document.getElementById('gs-confirm').onclick=()=>run('confirm-member');
+ groupInput.oninput=clearPage;
  bot.onchange=()=>run();
  fetch('/api/bots',{credentials:'same-origin'}).then(r=>r.json()).then(data=>{
   const rows=data.data?.bots||data.bots||[];

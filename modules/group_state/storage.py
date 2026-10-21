@@ -45,7 +45,22 @@ class ExtensionStore:
                 return [json.loads(row[0]) for row in cursor.fetchall()] if read else None
 
     async def _execute(self, sql, params, read=False):
-        return await asyncio.to_thread(self._run, sql, params, read)
+        operation = asyncio.create_task(asyncio.to_thread(self._run, sql, params, read))
+        cancellation: asyncio.CancelledError | None = None
+        # Cancellation cannot stop SQLite's worker. Drain it before callers release
+        # their ordering locks, including when the caller is cancelled repeatedly.
+        while not operation.done():
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError as error:
+                cancellation = error
+            except Exception:
+                break
+        if cancellation is not None:
+            if not operation.cancelled():
+                operation.exception()
+            raise cancellation
+        return operation.result()
 
     async def ready(self):
         await self._execute('SELECT 1', ())

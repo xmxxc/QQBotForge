@@ -19,7 +19,7 @@ async def setup(ctx):
         register_route('*', PREFIX + '*', candidate.http, auth=True)
         register_page('group-state', '群状态', source='module', source_name='group_state', html_file=str(Path(__file__).with_name('page.html')))
     except BaseException:
-        candidate.close()
+        await candidate.aclose()
         raise
     _instance = candidate
     return candidate
@@ -29,6 +29,6 @@ async def teardown():
     global _instance
     unregister_route('*', PREFIX + '*')
     unregister_page('group-state')
-    if _instance is not None:
-        _instance.close()
-        _instance = None
+    instance, _instance = _instance, None
+    if instance is not None:
+        await instance.aclose()
