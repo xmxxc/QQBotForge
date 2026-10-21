@@ -109,7 +109,11 @@ class GroupState:
                 candidate = copy.deepcopy(state)
                 apply(candidate, candidate['groups'][native])
                 await self.store.put(bot, 'group_state', 'state', candidate)
-                self.durable[bot] = {key: value['version'] for key, value in candidate['groups'].items()}
+                durable = {key: value['version'] for key, value in candidate['groups'].items()}
+                if group['version'] != version:
+                    # The candidate's version number can equal a newer live observation's; that fact is not on disk.
+                    durable[native] = None
+                self.durable[bot] = durable
                 if not self.active:
                     raise RuntimeError('群状态模块已卸载')
                 if group['version'] != version:
@@ -121,16 +125,17 @@ class GroupState:
         finally:
             self.pending_writes[bot] -= 1
 
+    @staticmethod
+    def _failure(error, label):
+        if isinstance(error, asyncio.CancelledError):
+            return label + '_cancelled'
+        return 'persistence_failed' if isinstance(error, (sqlite3.Error, OSError)) else label + '_failed'
+
     def _abandon(self, state, group, version, error, label):
         # An interrupted operation must not leave its in-progress marker as the latest fact.
         if group['version'] != version:
             return None
-        if isinstance(error, asyncio.CancelledError):
-            reason = label + '_cancelled'
-        elif isinstance(error, (sqlite3.Error, OSError)):
-            reason = 'persistence_failed'
-        else:
-            reason = label + '_failed'
+        reason = self._failure(error, label)
         self._invalidate(state, group, reason)
         if reason == 'persistence_failed':
             group.update(reliable=False, status='historical', reason=reason)
@@ -299,6 +304,13 @@ class GroupState:
                 raise
 
     @staticmethod
+    def _settle_roster(group, reason):
+        # The roster lock serialises passes per group, so remaining markers are this pass's; newer facts already replaced theirs.
+        for record in group['members'].values():
+            if record.get('reason') == 'roster_refreshing':
+                record.update(reliable=False, status='historical', reason=reason)
+
+    @staticmethod
     def _invalidate(state, group, reason):
         state['version'] += 1
         group['version'] += 1
@@ -321,13 +333,17 @@ class GroupState:
                     raise RuntimeError('群状态模块已卸载')
                 if group['version'] != version:
                     report.update(complete=False, reason='state_changed')
+                    self._settle_roster(group, 'state_changed')
                     return copy.deepcopy(report)
                 if report['complete'] and known - {r['member'] for r in report['members']}:
                     report.update(complete=False, reason='known_member_missing', missing_known_members=sorted(known - {r['member'] for r in report['members']}))
                 checked = self.clock()
 
+                # Duplicates, cursor loops and identity contradictions make the whole pass unusable as member proof.
+                conflict = report['reason'] in ('pagination_conflict', 'bot_identity_conflict')
+
                 def apply(candidate, updated):
-                    for record in report['members']:
+                    for record in [] if conflict else report['members']:
                         reliable = record['member_role'] is not None
                         updated['members'][record['member']] = {
                             **record,
@@ -337,6 +353,7 @@ class GroupState:
                             'source': 'platform_roster',
                             'checked_at': checked,
                         }
+                    self._settle_roster(updated, report['reason'] or 'roster_refreshed')
                     self._invalidate(candidate, updated, report['reason'])
                     report.update(
                         id=uuid4().hex, generation=self.generation, version=updated['version'], group=native_group, source='platform_roster', checked_at=checked
@@ -345,11 +362,13 @@ class GroupState:
 
                 if not await self._commit(bot, state, native_group, apply):
                     report.update(complete=False, reason='state_changed')
+                    self._settle_roster(group, 'state_changed')
                 return copy.deepcopy(report)
             except BaseException as error:
                 if reason := self._abandon(state, group, version, error, 'roster'):
                     for record in group['members'].values():
                         record.update(reason=reason)
+                self._settle_roster(group, self._failure(error, 'roster'))
                 raise
 
     async def verify_member(self, bot, native_group, member):

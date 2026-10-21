@@ -18,6 +18,20 @@
  let latestRequest=0, memberPage=null;
  // Pagination belongs to one Bot and group; any newer selection or request retires it.
  function clearPage(){memberPage=null;next.disabled=true;}
+ // A plain label per fact, so history, unknown, in-progress and complete are not read from raw JSON alone.
+ function label(fact){
+  const reason=fact?.reason||'';
+  if(fact?.complete===true)return '完整';
+  if(fact?.reliable===true)return '已核验';
+  if(/refreshing|verifying|confirming/.test(reason))return '进行中';
+  if(!fact||fact.state==='unknown'||!reason||reason==='not_verified'||reason==='unknown_group')return '未知'+(reason?'（'+reason+'）':'');
+  return (fact.status==='pending'?'待核验':'历史')+'（'+reason+'）';
+ }
+ function summary(data){
+  if(Array.isArray(data?.groups))return '已知群（非全部）：'+(data.groups.map(g=>g.group+' '+label(g)+'，名册'+label(g.roster)).join('；')||'暂无');
+  if(data?.roster)return '名册'+label(data.roster)+'，本页成员见下方';
+  return ('complete' in (data||{})?'名册本次结果':'结果')+label(data);
+ }
  async function run(action='', nextPage=false){
   const request=++latestRequest, appid=bot.value, group=groupInput.value.trim(), page=nextPage?memberPage:null;
   const isCurrent=()=>request===latestRequest&&appid===bot.value&&(!action||group===groupInput.value.trim());
@@ -39,7 +53,7 @@
    if(!isCurrent())return;
    if(!response.ok||!data.success)throw Error(data.error||data.message||'读取失败');
    if(action==='members'&&data.data?.group===group){memberPage=data.data;next.disabled=!memberPage.next_cursor;}
-   output.textContent=JSON.stringify(data.data,null,2);status.textContent='已更新：请结合完整性、来源与历史标记查看核验结果';
+   output.textContent=JSON.stringify(data.data,null,2);status.textContent='已更新：'+summary(data.data);
   }catch(error){if(isCurrent()){status.textContent=error.message;output.textContent='';}}
  }
  document.getElementById('gs-load').onclick=()=>run();document.getElementById('gs-refresh').onclick=()=>run('refresh');

@@ -182,3 +182,22 @@ test('returning to a group cannot restore a request from its earlier selection',
     assert.equal(host.output(), '');
     assert.equal(host.nodes['gs-next'].disabled, true);
 });
+
+test('the status line names complete, in-progress, unknown and historical facts', async () => {
+    const host = await page();
+    await host.reply(host.requests[0], {bot: 'bot-a', groups: [
+        {group: 'g1', reliable: true, status: 'verified', reason: '', roster: {complete: true, reason: ''}},
+        {group: 'g2', reliable: false, status: 'pending', reason: 'refreshing', roster: {complete: false, reason: 'roster_refreshing'}},
+        {group: 'g3', reliable: false, status: 'historical', reason: 'process_restart', roster: {complete: false, reason: 'not_verified'}},
+    ]});
+    const status = host.nodes['gs-status'].textContent;
+    assert.match(status, /g1 已核验，名册完整/);
+    assert.match(status, /g2 进行中，名册进行中/);
+    assert.match(status, /g3 历史（process_restart），名册未知（not_verified）/);
+    host.nodes['gs-roster'].onclick();
+    await host.reply(host.requests.at(-1), {complete: false, reason: 'timeout', members: []});
+    assert.equal(host.nodes['gs-status'].textContent, '已更新：名册本次结果历史（timeout）');
+    host.nodes['gs-verify'].onclick();
+    await host.reply(host.requests.at(-1), {state: 'unknown', reliable: false, status: 'pending', reason: 'permission_denied'});
+    assert.equal(host.nodes['gs-status'].textContent, '已更新：结果未知（permission_denied）');
+});
