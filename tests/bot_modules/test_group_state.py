@@ -646,6 +646,36 @@ async def test_cancelled_availability_broadcast_releases_registered_page_and_rou
     assert web_pages.get_page_html('group-state') is not None
 
 
+@pytest.mark.parametrize('replaced', [False, True])
+async def test_cancelled_availability_broadcast_removes_only_its_own_page(group_host, replaced):
+    from core.application import get_app
+    from core.plugin import web_pages
+
+    host = group_host
+    await host.modules.disable('group_state', _persist=False)
+
+    async def cancel_on_available(candidate):
+        if replaced:
+            # Another instance takes over the shared page key during the real async broadcast.
+            web_pages.register_page('group-state', 'Other', source='module', source_name='other-instance', html='other-page')
+        # Ordinary hook errors are logged by the framework; cancellation aborts setup.
+        raise asyncio.CancelledError
+
+    get_app().hook_manager.register('group_state_available', cancel_on_available, owner='page-owner-test')
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await host.modules.enable('group_state', _skip_deps=True, _persist=False)
+        assert web_pages.get_page_html('group-state') == ('other-page' if replaced else None)
+        assert web_pages.match_route('GET', '/api/ext/group-state/') is None
+    finally:
+        get_app().hook_manager.unregister_owner('page-owner-test')
+        web_pages.unregister_page('group-state')
+    assert await host.modules.enable('group_state', _skip_deps=True, _persist=False)
+    assert '已知群' in web_pages.get_page_html('group-state')
+    hooks = get_app().hook_manager.list_hooks().get('before_event', [])
+    assert len([entry for entry in hooks if entry['owner'] == '群状态']) == 1
+
+
 @pytest.mark.parametrize('step', ['recovery', 'connection', 'cancelled'])
 async def test_partial_connect_failure_keeps_original_error_and_releases_resources(group_host, monkeypatch, step):
     from core.application import get_app
