@@ -54,7 +54,8 @@ async def group_host(tmp_path, monkeypatch):
 
         async def reply(self, event, content=None, **kwargs):
             self.messages.append((event.appid, event.group_id if event.is_group else event.raw_user_id, content))
-            return True, {'id': 'fake-reply'}
+            # Same shape as Sender.reply: the platform response dict.
+            return {'id': 'fake-reply'}
 
     platform = Platform()
     for bot in ('bot-a', 'bot-b'):

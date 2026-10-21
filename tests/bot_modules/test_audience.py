@@ -198,8 +198,10 @@ async def test_consumer_send_entry_rechecks_before_group_send(probe_host):
     await until(lambda: 'newcomer' in host.state.states['bot-a']['groups']['group-a']['members'])
     await until(lambda: host.state.recovery.get_status('bot-a').ready)
     await host.event('受限答案', user='member-a', group='group-a')
-    # The join leaves the asker's own membership unverified: refuse, never answer.
-    assert host.sender.messages[-1][2] == 'denied' and host.probe['last']['reason'] == 'roster_incomplete'
+    # The join retires the old roster proof but not the asker's own verified fact:
+    # no group answer, only the status (the consumer then answers privately).
+    assert host.sender.messages[-1][2] == 'status:roster_incomplete' and host.probe['last']['reason'] == 'roster_incomplete'
+    assert not any(row['member'] == 'newcomer' for row in host.probe['last']['members'])
 
 
 async def test_owner_only_management_report_over_http_and_qq(access_host):
