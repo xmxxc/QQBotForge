@@ -173,3 +173,21 @@ async def test_legacy_migration_keeps_ids_and_never_widens_or_revives(account_ho
     status, again = await host.account_api('POST', 'migration', {})
     assert again['data']['authorization']['grants'] == 0 and again['data']['authorization']['skipped'] == 4
     assert 'revoked-source' not in {g['id'] for g in (await acl.access_snapshot('bot-a', 'account_sharing'))['grants']}
+
+
+async def test_group_delivery_final_check_uses_the_account_send_context(account_host):
+    from test_group_roster import roster_platform
+
+    host = account_host
+    account = await host.create(name='群发账户')
+    await owner(host, '白名单 {"group":"group-a","enabled":true}')
+    roster_platform(host)
+    assert (await host.state.sync_roster('bot-a', 'group-a'))['complete']
+    for member in ('member-a', 'this-bot', 'other-bot'):
+        status, data = await host.account_api('POST', 'access', {'operation': 'grant', 'group': 'group-a', 'member': member, 'resources': [account['id']]})
+        assert status == 200, data
+    status, data = await host.account_api('POST', 'group-delivery', {'group': 'group-a', 'resource': account['id'], 'enabled': True})
+    assert status == 200, data
+    assert data['data']['desired'] == 'group' and data['data']['actual'] == 'group'
+    status, listed = await host.account_api('GET', 'group-delivery')
+    assert status == 200 and [mode['actual'] for mode in listed['data']] == ['group']
