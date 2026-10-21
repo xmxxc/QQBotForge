@@ -165,7 +165,7 @@ async def group_host(tmp_path, monkeypatch):
     connecting_bot = ['bot-a']
     monkeypatch.setattr('core.network.websocket.websockets.connect', choose_gateway)
     host = Host()
-    host.gateways, host.sockets = gateways, sockets
+    host.gateways, host.sockets, host.connecting_bot = gateways, sockets, connecting_bot
 
     def lifecycle(kind, *, member=None, group='group-a', sequence=2, timestamp=1000, event_id='auto', bot='bot-a'):
         sockets[bot].feed(
