@@ -388,3 +388,115 @@ async def test_candidate_commits_wait_for_consumer_completion(group_host, operat
     assert result['complete'] if operation == 'roster' else result['reliable']
     assert (await state.fact('bot-a', 'group-a', 'member-a'))['usable']
     assert not state.fact_current(proof)
+
+
+@pytest.mark.parametrize('kind', ['GROUP_MEMBER_ADD', 'GROUP_MEMBER_REMOVE'])
+async def test_trusted_member_transition_retires_only_that_member(group_host, kind):
+    from test_group_roster import roster_platform
+
+    host, state = group_host, group_host.state
+    roster_platform(host)
+    await state.refresh('bot-a', 'group-a')
+    assert (await state.sync_roster('bot-a', 'group-a'))['complete']
+    group_proof = await state.fact('bot-a', 'group-a')
+    other = await state.fact('bot-a', 'group-a', 'other-bot')
+    assert group_proof['usable'] and other['usable']
+    target = 'member-new' if kind == 'GROUP_MEMBER_ADD' else 'member-a'
+    host.lifecycle(kind, member=target, sequence=2, timestamp=1000)
+    await until(lambda: state.states['bot-a']['groups']['group-a'].get('last_native', {}).get('sequence') == 2 and state._ready('bot-a'))
+    # The version change retires every earlier snapshot, roster proof and member proof.
+    assert not state.fact_current(group_proof) and not state.fact_current(other)
+    group = (await state.snapshot('bot-a'))['groups'][0]
+    assert not group['roster']['complete'] and group['roster']['reason'] == 'lifecycle_changed'
+    # Unaffected members and the Bot's own group facts stay usable once read again.
+    again = await state.fact('bot-a', 'group-a', 'other-bot')
+    assert again['usable'] and state.fact_current(again) and again['member']['cycle'] == other['member']['cycle']
+    assert (await state.fact('bot-a', 'group-a'))['usable']
+    changed = await state.fact('bot-a', 'group-a', target)
+    if kind == 'GROUP_MEMBER_ADD':
+        assert not changed['usable'] and changed['member']['status'] == 'pending'
+        return
+    assert changed['member']['status'] == 'left'
+    cycle = changed['member']['cycle']
+    host.lifecycle('GROUP_MEMBER_ADD', member=target, sequence=3, timestamp=1001)
+    await until(lambda: state.states['bot-a']['groups']['group-a']['members'][target]['status'] == 'pending' and state._ready('bot-a'))
+    rejoined = await state.fact('bot-a', 'group-a', target)
+    assert not rejoined['usable'] and rejoined['member']['cycle'] != cycle
+    assert (await state.fact('bot-a', 'group-a', 'other-bot'))['usable']
+
+
+async def test_trusted_member_event_rejects_inflight_check_of_other_member(group_host):
+    host, state = group_host, group_host.state
+    from test_group_roster import member
+
+    host.sender.json_results = {('/v2/groups/group-a/members/member-b', ''): (True, member('member-b'))}
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def hold(path, cursor):
+        entered.set()
+        await release.wait()
+
+    host.sender.after_json = hold
+    pending = asyncio.create_task(state.verify_member('bot-a', 'group-a', 'member-b'))
+    await until(entered.is_set)
+    host.lifecycle('GROUP_MEMBER_ADD', member='member-c', sequence=2, timestamp=1000)
+    await until(lambda: 'member-c' in state.states['bot-a']['groups']['group-a']['members'])
+    release.set()
+    assert (await pending)['reason'] == 'state_changed'
+    host.sender.after_json = None
+    await until(lambda: state._ready('bot-a'))
+    assert (await state.verify_member('bot-a', 'group-a', 'member-b'))['reliable']
+
+
+@pytest.mark.parametrize('fault', ['late', 'no_id'])
+async def test_untrusted_member_event_still_pauses_whole_bot(group_host, fault):
+    host, state = group_host, group_host.state
+    for member in ('member-a', 'member-b'):
+        await state.confirm_member('bot-a', 'group-a', member, evidence='verified')
+    host.lifecycle('GROUP_MEMBER_ADD', member='member-c', sequence=2, timestamp=1000)
+    await until(lambda: state._ready('bot-a') and 'member-c' in state.states['bot-a']['groups']['group-a']['members'])
+    options = {'timestamp': 999} if fault == 'late' else {'event_id': None, 'timestamp': 1002}
+    host.lifecycle('GROUP_MEMBER_REMOVE', member='member-c', sequence=3, **options)
+    await until(lambda: state.recovery.get_status('bot-a').failed)
+    for member in ('member-a', 'member-b'):
+        fact = await state.fact('bot-a', 'group-a', member)
+        assert not fact['usable'] and fact['reason'] == 'recovery_required'
+    assert state.states['bot-a']['groups']['group-a']['members']['member-c']['status'] == 'pending'
+
+
+@pytest.mark.parametrize('slow', [False, True])
+@pytest.mark.parametrize('groups', [1, 3])
+async def test_trusted_resume_waits_for_consumers_before_facts_return(group_host, groups, slow):
+    host, state = group_host, group_host.state
+    names = ['group-' + letter for letter in 'abc'[:groups]]
+    for name in names:
+        await state.confirm_member('bot-a', name, 'member-a', evidence='verified')
+    await until(lambda: state._ready('bot-a'))
+    before = await state.fact('bot-a', names[-1], 'member-a')
+    release, seen = asyncio.Event(), []
+
+    async def consumer(change):
+        seen.append(change['reason'])
+        if slow:
+            await release.wait()
+
+    state.subscribe(consumer, timeout=30)
+    host.sockets['bot-a'].frames.put_nowait(OSError('fake disconnect'))
+    second = host.gateways['bot-a'].add()
+    second.feed(10, d={'heartbeat_interval': 45000})
+    await until(lambda: any(f['op'] == 6 for f in second.sent))
+    assert not state.fact_current(before)
+    second.feed(0, t='RESUMED', s=2, d='')
+    await until(lambda: state.recovery.get_status('bot-a').ready)
+    if slow:
+        # The framework replay boundary is done, but consumers still hold the barrier.
+        for name in names:
+            paused = await state.fact('bot-a', name, 'member-a')
+            assert not paused['usable'] and paused['reason'] == 'recovery_processing'
+        release.set()
+    await until(lambda: state._ready('bot-a'))
+    for name in names:
+        fact = await state.fact('bot-a', name, 'member-a')
+        assert fact['usable'] and fact['reason'] == '' and state.fact_current(fact)
+    assert not state.fact_current(before)
+    assert len([reason for reason in seen if reason.startswith('connection:')]) >= 2 * groups
