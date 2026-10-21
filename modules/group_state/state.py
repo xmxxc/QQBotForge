@@ -11,6 +11,7 @@ from uuid import uuid4
 from aiohttp import web
 
 from core.base.config import cfg
+from core.base.logger import EXTENSION, get_logger
 from core.plugin._blacklist import get_blacklist_map
 
 from .reader import ROLES, MembershipReader
@@ -19,6 +20,7 @@ from .storage import ExtensionStore
 
 PREFIX = '/api/ext/group-state/'
 MESSAGE_TYPES = {'GROUP_AT_MESSAGE_CREATE', 'GROUP_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE'}
+log = get_logger(EXTENSION, '群状态')
 
 
 def identifier(value):
@@ -558,5 +560,9 @@ class GroupState:
             content = str(error)
         except (RuntimeError, sqlite3.Error, OSError):
             content = '群状态存储暂不可用，请检查后台'
-        await sender.reply(event, content)
+        try:
+            await sender.reply(event, content)
+        except Exception as error:
+            # The command is consumed either way: the platform may have delivered it, so neither resend nor fall through.
+            log.warning(f'群状态命令回复失败，结果未知，不重发: {type(error).__name__}: {error}')
         return None

@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import threading
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -519,3 +520,83 @@ async def test_cancelled_refresh_finishes_its_write_before_new_facts_are_saved(g
     restored = (await (await host.api()).json())['data']
     assert [group['group'] for group in restored['groups']] == ['group-a', 'group-b']
     assert all(not group['reliable'] for group in restored['groups'])
+
+
+@pytest.mark.parametrize('command', ['群状态', '群状态 刷新 group-a'])
+async def test_owner_reply_failure_keeps_command_consumed_without_resending(group_host, caplog, command):
+    from core.application import get_app
+
+    host = group_host
+    downstream = []
+    sent = []
+
+    async def receive(event):
+        downstream.append(event.content)
+        return event
+
+    async def failing_reply(event, content=None, **kwargs):
+        sent.append(content)
+        raise RuntimeError('fake transport reset')
+
+    get_app().hook_manager.register('before_event', receive, owner='reply-failure-test', priority=20)
+    host.sender.reply = failing_reply
+    try:
+        with caplog.at_level('WARNING', logger='ElainaBot'):
+            await host.event(command, group='group-a')
+    finally:
+        del host.sender.reply
+        get_app().hook_manager.unregister_owner('reply-failure-test')
+    assert downstream == [] and len(sent) == 1
+    assert any('fake transport reset' in record.getMessage() for record in caplog.records)
+    group = (await host.state.snapshot('bot-a'))['groups'][0]
+    assert group['reliable'] is (command != '群状态')
+    host.sender.messages.clear()
+    await host.event('群状态', group='group-a')
+    assert len(host.sender.messages) == 1
+
+
+@pytest.mark.parametrize('failure', ['page', 'cancel'])
+async def test_setup_failure_after_registration_releases_only_its_own_resources(group_host, monkeypatch, failure):
+    from core.application import get_app
+    from core.plugin import web_pages
+
+    host = group_host
+    await host.modules.disable('group_state', _persist=False)
+    other = AsyncMock()
+    web_pages.register_route('GET', '/api/ext/other-module/', other, auth=True)
+    web_pages.register_page('other-module', 'Other', source='module', source_name='other')
+    newer = AsyncMock()
+    closed = []
+
+    def failing_register_page(key, *args, **kwargs):
+        closed.extend(entry[2].__self__ for entry in get_app().hook_manager._hooks['before_event'] if entry[1] == '群状态')
+        if failure == 'cancel':
+            raise asyncio.CancelledError
+        # A newer instance replaced the shared route before this failed attempt unwinds.
+        web_pages.register_route('*', '/api/ext/group-state/*', newer, auth=True)
+        raise RuntimeError('fake page failure')
+
+    monkeypatch.setattr(web_pages, 'register_page', failing_register_page)
+    try:
+        if failure == 'cancel':
+            with pytest.raises(asyncio.CancelledError):
+                await host.modules.enable('group_state', _skip_deps=True, _persist=False)
+        else:
+            assert not await host.modules.enable('group_state', _skip_deps=True, _persist=False)
+        hooks = get_app().hook_manager.list_hooks().get('before_event', [])
+        assert [entry for entry in hooks if entry['owner'] == '群状态'] == []
+        assert web_pages.get_page_html('group-state') is None
+        route = web_pages.match_route('GET', '/api/ext/group-state/')
+        assert (route is None) if failure == 'cancel' else (route['handler'] is newer)
+        assert web_pages.match_route('GET', '/api/ext/other-module/')['handler'] is other
+        assert web_pages.get_page_html('other-module') is not None
+        assert host.modules.get('group_state') is None
+        assert len(closed) == 1 and closed[0].active is False
+    finally:
+        web_pages.unregister_route('GET', '/api/ext/other-module/')
+        web_pages.unregister_page('other-module')
+        web_pages.unregister_route('*', '/api/ext/group-state/*')
+    monkeypatch.undo()
+    assert await host.modules.enable('group_state', _skip_deps=True, _persist=False)
+    await host.event('ordinary', group='group-a', user='member-a')
+    assert (await host.state.snapshot('bot-a'))['groups'][0]['group'] == 'group-a'
