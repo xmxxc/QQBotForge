@@ -93,16 +93,19 @@ A03 验证：实际独立模块、Application 私聊、主人命令、鉴权 HTT
 
 ```python
 report = await access.audience_report(bot, consumer, function, group, resource, actions=['invoke', 'view'])
-access.member_current(bot, report, asker)   # 提问者本人当前是否仍通过所需动作
-access.report_current(bot, report)          # 群发前的非等待最终检查
+send = dict(consumer=consumer, function=function, group=group, resource=resource, actions=['invoke', 'view'])
+access.member_current(bot, report, asker, **send)   # 提问者本人当前是否仍通过所需动作
+access.report_current(bot, report, **send)          # 群发前的非等待最终检查
 ```
 
-受限问答传 `actions=['view']`；账户群发传 `['invoke', 'view']`。报告字段：`complete`（群状态本轮完整名册且可信）、`eligible`、`reason`（eligible/member_ineligible/roster_incomplete/group_facts_unavailable/state_changed）、`roster_reason`、`members`（成员原生ID、名称、bot、self、可靠角色、`private_bound` 及逐动作允许与原因）、`failures`、`failures_complete` 与 `valid_until`。
+两项检查都必须由调用方传入本次实际发送的 Bot、消费方、功能、群、资源与所需动作（关键字参数，无默认值、无旧的两参数入口）；与报告签发时的上下文逐项完全一致才可能通过。`view` 报告不能用于要求 `invoke+view` 的发送，其他消费方／功能／群／资源／Bot 的报告不能搬用，`member_current` 还要求该成员在报告名单中。
+
+受限问答传 `actions=['view']`；账户群发传 `['invoke', 'view']`。报告字段：`complete`（群状态本轮完整名册且可信）、`eligible`、`reason`（eligible/member_ineligible/roster_incomplete/group_facts_unavailable/state_changed）、`roster_reason`、`members`（成员原生ID、名称、bot、self、可靠角色、`private_bound` 及逐动作允许与原因）、`failures`、`failures_complete`、`valid_until` 与不透明的 `credential`。
 
 成员只来自群状态完整名册，名册要求显式末页、角色可识别、无遗漏已知成员且本 Bot 在册；不使用历史活跃名单或人数。名册不完整、分页失败或群状态停用时 `eligible=false`，只列出当前可靠在群的已确认成员，`failures_complete=false`，不宣称列出全部失败者。明确无权与完整性未知分别由每人原因和 `complete/roster_reason` 区分。
 
-报告内含不供读取的 `_proof`：本轮名册群凭据与每人每动作决定。`report_current` 不等待地复查名册凭据（群版本、恢复进度、写入者和持久化）、全部决定（策略、来源、拒绝、框架拒绝、模块代际）及最早到期时间。成员退群、新人观察／入群、角色核验变化、授权撤销／拒绝或到期都会立即使旧报告失效；其他消费方或其他 Bot 的变化不影响。群状态 `facts(bot, group)` 从同一份公开副本一次取得群与逐成员凭据，避免大群逐人复制；3000 人两动作报告约 1.3 秒，最终检查约 0.1 秒（本机临时测试）。
+报告字段只供展示：本轮名册群凭据、每人每动作决定、签发上下文与最早到期时间封装在不透明的 `credential` 对象内，只有签发它的授权实例接受（复制报告保留同一凭据；凭据不可 JSON 序列化，需要保存或展示时使用管理副本）。改写 `actions`、`valid_until`、`eligible`、成员名单或附加任意证明字段都不能扩大资格或延长期限；授权模块卸载／重载后旧凭据全部失效。`report_current` 不等待地复查名册凭据（群版本、恢复进度、写入者和持久化）、全部决定（策略、来源、拒绝、框架拒绝、模块代际）及最早到期时间。同进程模块可以直接调用任意消费方标识，本校验防止误用和改写报告，不是进程内的身份认证；也不承诺检查与网络发送之间的原子性或平台未投递事件。成员退群、新人观察／入群、角色核验变化、授权撤销／拒绝或到期都会立即使旧报告失效；其他消费方或其他 Bot 的变化不影响。群状态 `facts(bot, group)` 从同一份公开副本一次取得群与逐成员凭据，避免大群逐人复制；3000 人两动作报告约 1.3 秒，最终检查约 0.1 秒（本机临时测试）。
 
-主人管理：后台“全员资格报告”或 `授权管理 {"consumer":"reports","operation":"audience","function":"read","group":"假群","resource":"report-r","actions":["invoke","view"]}`。HTTP 与私聊返回去除 `_proof` 的管理副本；群里只给简短状态，普通成员命令不处理。
+主人管理：后台“全员资格报告”或 `授权管理 {"consumer":"reports","operation":"audience","function":"read","group":"假群","resource":"report-r","actions":["invoke","view"]}`。HTTP 与私聊返回去除 `credential` 的管理副本；群里只给简短状态，普通成员命令不处理。
 
 A04 验证：实际 ModuleManager 独立加载授权、群状态及一个测试消费模块，Application 群消息入口在报告后、发送前检查；原始 WS 退群／入群、临时 SQLite、平台分页替身。覆盖两个 Bot 成员、Bot 不合格、分页失败、检查中退群、新人入群、到期、角色变化、拒绝、消费方与 Bot 隔离及主人鉴权。浏览器无可用实例，未做视觉核查；未连接真实 QQ 或核查平台许可。账户群发改用本接口由 C03 #35 交付，受限问答由 Q05 #32 使用。
