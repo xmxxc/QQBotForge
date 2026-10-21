@@ -159,3 +159,26 @@ test('the next page carries the cursor, version and generation of the current gr
     const query = new URL(host.requests.at(-1).url, 'http://host').searchParams;
     assert.deepEqual(Object.fromEntries(query), {bot: 'bot-a', group: 'group-a', limit: '30', generation: 'g', version: '2', cursor: '1.key'});
 });
+
+test('editing a group clears already displayed results immediately', async () => {
+    const host = await page();
+    host.nodes['gs-members'].onclick();
+    await host.reply(host.requests.at(-1), {group: 'group-a', members: [{member: 'old'}], next_cursor: '1.key'});
+    host.nodes['gs-group'].value = 'group-b';
+    host.nodes['gs-group'].oninput();
+    assert.equal(host.output(), '');
+    assert.equal(host.nodes['gs-next'].disabled, true);
+});
+
+test('returning to a group cannot restore a request from its earlier selection', async () => {
+    const host = await page();
+    host.nodes['gs-members'].onclick();
+    const earlier = host.requests.at(-1);
+    host.nodes['gs-group'].value = 'group-b';
+    host.nodes['gs-group'].oninput();
+    host.nodes['gs-group'].value = 'group-a';
+    host.nodes['gs-group'].oninput();
+    await host.reply(earlier, {group: 'group-a', members: [{member: 'old'}], next_cursor: '1.key'});
+    assert.equal(host.output(), '');
+    assert.equal(host.nodes['gs-next'].disabled, true);
+});

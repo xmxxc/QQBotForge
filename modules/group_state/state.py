@@ -130,6 +130,10 @@ class GroupState:
         else:
             reason = label + '_failed'
         self._invalidate(state, group, reason)
+        if reason == 'persistence_failed':
+            group.update(reliable=False, status='historical', reason=reason)
+            for member in group['members'].values():
+                member.update(reliable=False, reason=reason)
         return reason
 
     async def _save(self, bot, state):
@@ -233,8 +237,8 @@ class GroupState:
             self._invalidate(state, group, 'bot_state_refreshing')
             group.update(reliable=False, status='pending', reason='refreshing')
             version = group['version']
-            await self._save(bot, state)
             try:
+                await self._save(bot, state)
                 sender = self.sender_provider(bot)
                 data, error, reason = None, None, ''
                 if sender is None or not hasattr(sender, 'get_group_bot_state'):
@@ -308,8 +312,8 @@ class GroupState:
             for record in group['members'].values():
                 record.update(reliable=False, status='historical', reason='roster_refreshing')
             version = group['version']
-            await self._save(bot, state)
             try:
+                await self._save(bot, state)
                 report = await self.reader.roster(bot, native_group)
                 if not self.active:
                     raise RuntimeError('群状态模块已卸载')
@@ -355,8 +359,8 @@ class GroupState:
         version = group['version']
         record = group['members'].setdefault(member, {'member': member, 'member_role': None, 'bot': None})
         record.update(reliable=False, status='pending', reason='verifying')
-        await self._save(bot, state)
         try:
+            await self._save(bot, state)
             result = await self.reader.member(bot, native_group, member)
             if not self.active:
                 raise RuntimeError('群状态模块已卸载')
@@ -405,7 +409,11 @@ class GroupState:
         if member_role is not None and (not isinstance(member_role, str) or member_role not in ROLES):
             raise ValueError('角色须为 member、admin、owner 或 null')
         state = await self._state(bot)
-        self._group(state, native_group)
+        group = self._group(state, native_group)
+        self._invalidate(state, group, 'individual_verification')
+        version = group['version']
+        record = group['members'].setdefault(member, {'member': member, 'member_role': None, 'bot': None})
+        record.update(reliable=False, status='pending', reason='confirming')
         fact = {
             'member_role': member_role,
             'reliable': True,
@@ -416,7 +424,12 @@ class GroupState:
             'evidence': evidence,
             'state': 'present',
         }
-        return await self._commit_member(bot, state, native_group, member, fact)
+        try:
+            return await self._commit_member(bot, state, native_group, member, fact)
+        except BaseException as error:
+            if reason := self._abandon(state, group, version, error, 'confirmation'):
+                record.update(status='historical', reason=reason)
+            raise
 
     def _page_key(self, bot, native_group, version):
         # Cursors continue only the Bot, group and snapshot version that issued them.

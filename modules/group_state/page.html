@@ -46,7 +46,7 @@
  document.getElementById('gs-roster').onclick=()=>run('roster');document.getElementById('gs-members').onclick=()=>run('members');
  next.onclick=()=>run('members',true);document.getElementById('gs-verify').onclick=()=>run('member');
  document.getElementById('gs-confirm').onclick=()=>run('confirm-member');
- groupInput.oninput=clearPage;
+ groupInput.oninput=()=>{++latestRequest;clearPage();output.textContent='';status.textContent='请选择操作读取当前群';};
  bot.onchange=()=>run();
  fetch('/api/bots',{credentials:'same-origin'}).then(r=>r.json()).then(data=>{
   const rows=data.data?.bots||data.bots||[];
