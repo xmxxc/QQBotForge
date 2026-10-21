@@ -544,10 +544,14 @@ class GroupState:
         self.notifications = Notifications(str(Path(ctx.module_dir).parent.resolve() / Path(ctx.module_dir).name))
         self.recovery = ctx.subscribe_recovery_events(self._lifecycle, event_types=LIFECYCLE)
         # A connection status is current (and queued for this subscription) as soon
-        # as it is published; facts stay paused until the subscription settled it.
+        # as it is published; facts stay paused until this instance delivered it.
         # Statuses before subscribing are never delivered (replay_current=False).
+        # One entry per Bot/transport, so it does not grow with reconnects.
         self.current_connection_statuses = lambda: ctx.connection_statuses
         self.connection_baseline = {(status.appid, status.transport): status.revision for status in ctx.connection_statuses}
+        self.connection_settled = dict(self.connection_baseline)
+        # Highest status our callback started for, whatever its outcome.
+        self.connection_attempted = dict(self.connection_baseline)
         self.connection_subscription = ctx.subscribe_connection_status(self._connection_change, replay_current=False)
         self.rebuild_locks = {}
 
@@ -569,14 +573,12 @@ class GroupState:
         )
 
     def _connection_pending(self, bot):
-        # Any outcome settles a status: success after our callback finished; error,
-        # timeout or a skipped 'busy' status (left behind by a timed-out callback)
-        # already invalidated recovery in _notify, so they need a rebuild, not a wait.
-        settled = dict(self.connection_baseline)
-        for result in self.connection_subscription.results:
-            key = result.status.appid, result.status.transport
-            settled[key] = max(settled.get(key, 0), result.status.revision)
-        return any(status.revision > settled.get((bot, status.transport), 0) for status in self.current_connection_statuses() if status.appid == bot)
+        # Only a completed delivery settles a status. An error, timeout or a status the
+        # framework skips as 'busy' behind a timed-out callback invalidated recovery in
+        # _notify, so it reports recovery_required until rebuild() settles it.
+        return any(
+            status.revision > self.connection_settled.get((bot, status.transport), 0) for status in self.current_connection_statuses() if status.appid == bot
+        )
 
     def _pause_reason(self, bot):
         """Why this Bot's facts are paused: '' when ready; 'recovery_processing' while a
@@ -640,10 +642,17 @@ class GroupState:
     async def _connection_change(self, status):
         # Current recovery status gates proofs synchronously, before this async
         # notification. Do not mutate historical presence on a transport failure.
+        key = status.appid, status.transport
+        self.connection_attempted[key] = max(self.connection_attempted.get(key, 0), status.revision)
         state = self.states.get(status.appid)
         if state and self.active:
             for group in tuple(state['groups'].values()):
                 await self._notify(status.appid, group, 'connection:' + status.phase)
+        self._settle_connection(status)
+
+    def _settle_connection(self, status):
+        key = status.appid, status.transport
+        self.connection_settled[key] = max(self.connection_settled.get(key, 0), status.revision)
 
     async def _lifecycle(self, delivery):
         event = delivery.event
@@ -760,6 +769,11 @@ class GroupState:
                 return False
             self.recovery.invalidate(bot, reason='rebuilding')
             checkpoint = self.recovery.get_status(bot)
+            unsettled = [
+                status
+                for status in self.current_connection_statuses()
+                if status.appid == bot and status.revision > self.connection_settled.get((bot, status.transport), 0)
+            ]
             state = await self._state(bot)
             groups = list(state['groups'])
             good = True
@@ -773,10 +787,24 @@ class GroupState:
                     if record.get('status') != 'left' and not current_manual:
                         await self.verify_member(bot, native_group, member)
                         good = good and state['groups'][native_group]['members'][member]['reliable']
+            failed = []
+            for status in unsettled:
+                if status.revision > self.connection_attempted.get((bot, status.transport), 0):
+                    # Still queued or skipped as 'busy': consumers never received it, so deliver it
+                    # now; it settles once delivered (recovery stays invalidated until establish).
+                    await self._connection_change(status)
+                else:
+                    # Our callback failed on it (a running one keeps notifications busy and fails the
+                    # check below); the refresh above re-notified every group after it.
+                    failed.append(status)
             if not good or list(state['groups']) != groups or self.pending_writes.get(bot) or self.notifications.busy(bot):
                 return False
             # The checkpoint also rejects events/connection transitions during queries.
-            return self.recovery.establish(checkpoint)
+            if not self.recovery.establish(checkpoint):
+                return False
+            for status in failed:
+                self._settle_connection(status)
+            return True
 
     async def http(self, request):
         from web.auth import authorize_request
