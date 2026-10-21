@@ -146,7 +146,7 @@ async def test_missing_or_conflicting_bot_and_member_fields_fail_closed(group_ho
     assert not (await response.json())['data']['complete']
 
 
-async def test_failed_durable_update_cannot_leave_a_complete_in_memory_proof(group_host):
+async def test_failed_durable_update_keeps_roster_unproven_until_retry(group_host):
     import sqlite3
 
     host = group_host
@@ -158,7 +158,13 @@ async def test_failed_durable_update_cannot_leave_a_complete_in_memory_proof(gro
             BEGIN SELECT RAISE(ABORT, 'fake persistence failure'); END""")
     response = await host.api('POST', 'roster', body={'group': 'group-a'})
     assert response.status == 503
-    assert (await host.api()).status == 503
+    failed = (await (await host.api()).json())['data']['groups'][0]
+    assert not failed['roster']['complete'] and failed['roster']['reason'] == 'persistence_failed'
+    assert not any(member['reliable'] for member in failed['members'].values())
+    with sqlite3.connect(path) as connection:
+        connection.execute('DROP TRIGGER fail_complete')
+    retried = (await (await host.api('POST', 'roster', body={'group': 'group-a'})).json())['data']
+    assert retried['complete'] and retried['version'] > failed['version']
 
 
 async def test_pending_durable_update_does_not_publish_complete_roster(group_host):
@@ -240,3 +246,97 @@ async def test_stale_bot_refresh_cannot_publish_another_queries_uncommitted_proo
         await refresh
         if roster:
             await roster
+
+
+@pytest.mark.parametrize('path', ['roster', 'member', 'confirm-member'])
+async def test_unload_during_final_write_cannot_publish_complete_or_reliable_facts(group_host, path):
+    import asyncio
+    import sqlite3
+    import threading
+    import time
+
+    host = group_host
+    roster_platform(host)
+    await host.state.snapshot('bot-a')
+    blocker = sqlite3.connect(host.modules.get_context('group_state').get_data_path('group-state.db'), check_same_thread=False)
+    entered = asyncio.Event()
+
+    async def lock_final_write(path, cursor):
+        if path.endswith(('/bot_state', '/members/member-a')):
+            blocker.execute('BEGIN IMMEDIATE')
+            entered.set()
+
+    host.sender.after_json = lock_final_write
+    body = {'group': 'group-a'} if path == 'roster' else {'group': 'group-a', 'member': 'member-a'}
+    if path == 'confirm-member':
+        body.update(evidence='fake owner checked', member_role='member')
+        blocker.execute('BEGIN IMMEDIATE')
+        entered.set()
+    operation = asyncio.create_task(host.api('POST', path, body=body))
+    await asyncio.wait_for(entered.wait(), 3)
+    await asyncio.sleep(0.05)
+    # Release from another thread: the close below waits for the same SQLite worker.
+    release = threading.Thread(target=lambda: (time.sleep(0.2), blocker.commit(), blocker.close()))
+    release.start()
+    await host.modules.disable('group_state', _persist=False)
+    response = await operation
+    release.join()
+    assert response.status == 503
+
+
+@pytest.mark.parametrize('method', ['snapshot', 'members'])
+async def test_read_queued_across_unload_returns_no_old_proof(group_host, method):
+    import asyncio
+
+    host = group_host
+    roster_platform(host)
+    old = host.state
+    assert (await old.sync_roster('bot-a', 'group-a'))['complete']
+    lock = old.load_locks['bot-a']
+    await lock.acquire()
+    operation = asyncio.create_task(old.snapshot('bot-a') if method == 'snapshot' else old.members('bot-a', 'group-a'))
+    await asyncio.sleep(0)
+    await host.modules.disable('group_state', _persist=False)
+    lock.release()
+    with pytest.raises(RuntimeError):
+        await operation
+
+
+@pytest.mark.parametrize('target', [('bot-a', 'group-b'), ('bot-b', 'group-a')])
+async def test_member_cursor_continues_only_its_own_bot_and_group(group_host, target):
+    host = group_host
+    for bot, group in {('bot-a', 'group-a'), target}:
+        for n in range(2):
+            await host.state.confirm_member(bot, group, f'{bot}-{group}-{n}', evidence='fake owner checked')
+    first = await host.state.members('bot-a', 'group-a', limit=1)
+    other = await host.state.members(*target, limit=1)
+    assert other['version'] == first['version'] and other['generation'] == first['generation']
+    with pytest.raises(ValueError, match='快照已变化'):
+        await host.state.members(*target, cursor=first['next_cursor'], version=first['version'], generation=first['generation'], limit=1)
+    with pytest.raises(ValueError, match='cursor'):
+        await host.state.members('bot-a', 'group-a', cursor='1', version=first['version'], generation=first['generation'])
+    second = await host.state.members('bot-a', 'group-a', cursor=first['next_cursor'], version=first['version'], generation=first['generation'], limit=1)
+    assert [m['member'] for m in second['members']] == ['bot-a-group-a-1']
+
+
+async def test_cancelled_roster_query_ends_without_in_progress_markers(group_host):
+    import asyncio
+
+    host = group_host
+    roster_platform(host)
+    await host.state.confirm_member('bot-a', 'group-a', 'member-a', evidence='fake owner checked')
+    entered = asyncio.Event()
+
+    async def hold(path, cursor):
+        entered.set()
+        await asyncio.Event().wait()
+
+    host.sender.after_json = hold
+    operation = asyncio.create_task(host.state.sync_roster('bot-a', 'group-a'))
+    await asyncio.wait_for(entered.wait(), 3)
+    operation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await operation
+    group = (await host.state.snapshot('bot-a'))['groups'][0]
+    assert not group['roster']['complete'] and group['roster']['reason'] == 'roster_cancelled'
+    assert group['members']['member-a']['reason'] == 'roster_cancelled' and not group['members']['member-a']['reliable']
