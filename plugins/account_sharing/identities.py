@@ -4,7 +4,7 @@ import asyncio
 import time
 from uuid import uuid4
 
-from modules.access_control.policy import identifier, identity_key
+from .validation import identifier, identity_key
 
 FUNCTION = 'account_sharing'
 

@@ -9,7 +9,8 @@ import time
 from uuid import uuid4
 
 from core.base.logger import EXTENSION, get_logger
-from modules.access_control.storage import ExtensionStore
+
+from .storage import ExtensionStore
 
 log = get_logger(EXTENSION, '黑白名单授权')
 

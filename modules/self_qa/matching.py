@@ -3,7 +3,7 @@
 import asyncio
 from uuid import uuid4
 
-from modules.access_control.storage import ExtensionStore
+from .storage import ExtensionStore
 
 FIELDS = {'name', 'kind', 'target', 'keywords', 'mode', 'priority', 'enabled'}
 
