@@ -549,6 +549,11 @@ class GroupState:
             raise RuntimeError('群状态需要恢复与群生命周期 v1 契约')
         self.notifications = Notifications(str(Path(ctx.module_dir).parent.resolve() / Path(ctx.module_dir).name))
         self.recovery = ctx.subscribe_recovery_events(self._lifecycle, event_types=LIFECYCLE)
+        # A connection status is current (and queued for this subscription) as soon
+        # as it is published; facts stay paused until the subscription settled it.
+        # Statuses before subscribing are never delivered (replay_current=False).
+        self.current_connection_statuses = lambda: ctx.connection_statuses
+        self.connection_baseline = {(status.appid, status.transport): status.revision for status in ctx.connection_statuses}
         self.connection_subscription = ctx.subscribe_connection_status(self._connection_change, replay_current=False)
         self.rebuild_locks = {}
 
@@ -561,8 +566,23 @@ class GroupState:
         status = self.recovery.get_status(bot)
         webhook = self.recovery.get_status(bot, transport='webhook')
         return (
-            self.active and status.ready and not status.pending and webhook.context is None and not self.notifications.busy(bot)
+            self.active
+            and status.ready
+            and not status.pending
+            and webhook.context is None
+            and not self.notifications.busy(bot)
+            and not self._connection_pending(bot)
         )
+
+    def _connection_pending(self, bot):
+        # Any outcome settles a status: success after our callback finished; error,
+        # timeout or a skipped 'busy' status (left behind by a timed-out callback)
+        # already invalidated recovery in _notify, so they need a rebuild, not a wait.
+        settled = dict(self.connection_baseline)
+        for result in self.connection_subscription.results:
+            key = result.status.appid, result.status.transport
+            settled[key] = max(settled.get(key, 0), result.status.revision)
+        return any(status.revision > settled.get((bot, status.transport), 0) for status in self.current_connection_statuses() if status.appid == bot)
 
     def _pause_reason(self, bot):
         """Why this Bot's facts are paused: '' when ready; 'recovery_processing' while a
