@@ -50,6 +50,8 @@ class GroupState:
         self.roster_locks = {}
         self.durable = {}
         self.pending_writes = {}
+        # Set by connect(); a partial connect leaves later ones None.
+        self.notifications = self.recovery = self.connection_subscription = None
 
     @staticmethod
     def _sender(bot):
@@ -62,20 +64,21 @@ class GroupState:
     async def initialize(self):
         await self.store.ready()
 
-    def close(self):
+    def _release(self):
+        # Idempotent; releases only what connect() acquired before any failure.
         self.active = False
-        if hasattr(self, 'notifications'):
+        if self.notifications is not None:
             self.notifications.close()
-            self.recovery.cancel()
-            self.connection_subscription.cancel()
+        for subscription in (self.recovery, self.connection_subscription):
+            if subscription is not None:
+                subscription.cancel()
+
+    def close(self):
+        self._release()
         self.store.close()
 
     async def aclose(self):
-        self.active = False
-        if hasattr(self, 'notifications'):
-            self.notifications.close()
-            self.recovery.cancel()
-            self.connection_subscription.cancel()
+        self._release()
         await asyncio.to_thread(self.store.close)
 
     async def _state(self, bot):
@@ -561,12 +564,26 @@ class GroupState:
             self.active and status.ready and not status.pending and webhook.context is None and not self.notifications.busy(bot)
         )
 
+    def _pause_reason(self, bot):
+        """Why this Bot's facts are paused: '' when ready; 'recovery_processing' while a
+        trusted boundary or consumer notification is still finishing and
+        'persistence_pending' while a write is (both: retry later); otherwise
+        'recovery_required' (a rebuild must establish a new baseline)."""
+        if self._ready(bot):
+            return 'persistence_pending' if self.pending_writes.get(bot) else ''
+        status = self.recovery.get_status(bot)
+        if self.active and self.recovery.get_status(bot, transport='webhook').context is None and status.phase in {'ready', 'processing', 'recovering'}:
+            return 'recovery_processing'
+        return 'recovery_required'
+
     async def fact(self, bot, group, member=None):
         state = await self._state(bot)
         record = state['groups'].get(group)
         public = self._public_group(bot, record) if record else None
         row = public['members'].get(member) if public and member else None
         status = self.recovery.get_status(bot)
+        paused = self._pause_reason(bot)
+        usable = bool(public and not paused and (row['reliable'] if member and row else public['reliable'] if not member else False))
         return {
             'bot': bot,
             'group': group,
@@ -575,12 +592,8 @@ class GroupState:
             'version': record['version'] if record else None,
             'recovery_revision': status.revision,
             'writer_revision': self.notifications.checkpoint(bot),
-            'usable': bool(
-                public
-                and self._ready(bot)
-                and not self.pending_writes.get(bot)
-                and (row['reliable'] if member and row else public['reliable'] if not member else False)
-            ),
+            'usable': usable,
+            'reason': '' if usable else paused or 'unverified',
             'member': row,
             'group_state': public,
         }
@@ -652,7 +665,12 @@ class GroupState:
             reason = reason or 'incomplete_event'
         elif previous.get('time') is not None and timestamp <= previous['time']:
             reason = reason or ('same_time_conflict' if timestamp == previous['time'] else 'late_event')
-        self._suspend(state, group, reason or 'lifecycle_changed')
+        if reason or not is_member:
+            self._suspend(state, group, reason or 'lifecycle_changed')
+        else:
+            # A trusted member transition changes only that member's facts. The version
+            # bump still retires older snapshots, roster proofs and in-flight checks.
+            self._invalidate(state, group, 'lifecycle_changed')
         metadata = asdict(event)
         group.update(source='native_lifecycle', observed_at=self.clock(), event_type=event.event_type, last_native=metadata)
         if reason:
