@@ -468,8 +468,6 @@ class Authorization(AccessControl):
         source = self.fact_source
         if source is None:
             raise RuntimeError('群事实来源已失效')
-        native = change.get('native', {})
-        kind, member = native.get('event_type'), native.get('member_openid')
         # Read all owned rows, including consumers not yet used in this process.
         try:
             consumers = await self.store.keys(bot, COLLECTION)
@@ -491,14 +489,12 @@ class Authorization(AccessControl):
                     raise
                 continue
             async with self.scope_locks.setdefault((bot, consumer), asyncio.Lock()):
-                targets = [
-                    g
-                    for g in state['grants']
-                    if g['group'] == group
-                    and (kind in {'GROUP_ADD_ROBOT', 'GROUP_DEL_ROBOT'} or kind in {'GROUP_MEMBER_ADD', 'GROUP_MEMBER_REMOVE'} and member == g['member'])
-                ]
+                # Only facts group_state accepted revoke: a departure or a new membership
+                # cycle. Rejected native events and Bot add/removal merely pause the
+                # sources until the members are verified again.
+                targets = []
                 for grant in state['grants']:
-                    if grant['group'] == group and grant not in targets:
+                    if grant['group'] == group:
                         proof = await source.fact(bot, group, grant['member'])
                         fact = proof['member'] or {}
                         if fact.get('status') == 'left' or fact.get('cycle') and fact['cycle'] != grant['cycle']:
@@ -541,6 +537,7 @@ class Authorization(AccessControl):
             'sources': [],
             'evaluated_at': self.clock(),
             'valid_until': None,
+            'retryable': False,
         }
         blocked = not framework_allowed or member in get_blacklist_map(bot, 'user') or group and group in get_blacklist_map(bot, 'group')
         denies = [
@@ -574,7 +571,14 @@ class Authorization(AccessControl):
             result['fact'] = proof
             row = proof['member'] or {}
             result.update(membership=row.get('status', 'unknown'), cycle=row.get('cycle'), role=row.get('member_role'))
-            if not proof['usable'] or row.get('status') != 'present':
+            paused = proof.get('reason') if not proof['usable'] else ''
+            if paused in {'recovery_processing', 'persistence_pending'}:
+                result.update(reason='group_facts_processing', retryable=True)
+            elif paused == 'recovery_required':
+                result['reason'] = 'group_facts_recovery_required'
+            elif row.get('status') == 'left':
+                result['reason'] = 'member_left'
+            elif not proof['usable'] or row.get('status') != 'present':
                 result['reason'] = 'membership_unverified'
             elif configured['kind'] == 'group':
                 result.update(allowed=True, reason='group_member')

@@ -644,3 +644,47 @@ async def test_cancelled_availability_broadcast_releases_registered_page_and_rou
     assert len(seen) == 1 and seen[0].active is False and host.modules.get('group_state') is None
     assert await host.modules.enable('group_state', _skip_deps=True, _persist=False)
     assert web_pages.get_page_html('group-state') is not None
+
+
+@pytest.mark.parametrize('step', ['recovery', 'connection', 'cancelled'])
+async def test_partial_connect_failure_keeps_original_error_and_releases_resources(group_host, monkeypatch, step):
+    from core.application import get_app
+    from core.module.manager import ModuleContext
+    from core.plugin import web_pages
+
+    host = group_host
+    await host.modules.disable('group_state', _persist=False)
+    acquired = {}
+    subscribe_recovery = ModuleContext.subscribe_recovery_events
+
+    def recovery(self, callback, **kwargs):
+        acquired['state'] = callback.__self__
+        if step == 'recovery':
+            raise RuntimeError('fake recovery subscribe failure')
+        acquired['recovery'] = subscribe_recovery(self, callback, **kwargs)
+        return acquired['recovery']
+
+    def connection(self, callback, **kwargs):
+        if step == 'cancelled':
+            raise asyncio.CancelledError
+        raise RuntimeError('fake connection subscribe failure')
+
+    monkeypatch.setattr(ModuleContext, 'subscribe_recovery_events', recovery)
+    monkeypatch.setattr(ModuleContext, 'subscribe_connection_status', connection)
+    if step == 'cancelled':
+        with pytest.raises(asyncio.CancelledError):
+            await host.modules.enable('group_state', _skip_deps=True, _persist=False)
+    else:
+        assert not await host.modules.enable('group_state', _skip_deps=True, _persist=False)
+        assert f'fake {step} subscribe failure' in host.modules._modules['group_state'].error
+    candidate = acquired['state']
+    assert not candidate.active and candidate.store._closed and candidate.store._connection is None
+    assert 'recovery' not in acquired or not acquired['recovery'].active
+    candidate.close()
+    await candidate.aclose()
+    hooks = get_app().hook_manager.list_hooks().get('before_event', [])
+    assert [entry for entry in hooks if entry['owner'] == '群状态'] == []
+    assert web_pages.match_route('GET', '/api/ext/group-state/') is None
+    monkeypatch.undo()
+    assert await host.modules.enable('group_state', _skip_deps=True, _persist=False)
+    assert host.state.active and host.state is not candidate
