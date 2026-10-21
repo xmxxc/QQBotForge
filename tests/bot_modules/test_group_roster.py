@@ -342,7 +342,7 @@ async def test_cancelled_roster_query_ends_without_in_progress_markers(group_hos
     assert group['members']['member-a']['reason'] == 'roster_cancelled' and not group['members']['member-a']['reliable']
 
 
-async def wait_for(predicate):
+async def wait_until(predicate):
     import asyncio
 
     for _ in range(300):
@@ -414,11 +414,11 @@ async def test_observation_write_failure_after_unpublished_roster_commit_is_mark
     observation = None
     try:
         await asyncio.wait_for(entered.wait(), 3)
-        await wait_for(lambda: host.state.write_locks['bot-a'].locked())
+        await wait_until(lambda: host.state.write_locks['bot-a'].locked())
         live = host.state.states['bot-a']['groups']['group-a']
         before = live['version']
         observation = asyncio.create_task(host.event('普通聊天', user='member-a', group='group-a'))
-        await wait_for(lambda: live['version'] != before)
+        await wait_until(lambda: live['version'] != before)
         # Only the observation's write is rejected; the roster candidate reaches disk.
         blocker.execute("""CREATE TRIGGER reject_observation BEFORE INSERT ON extension_records
             WHEN json_extract(NEW.payload, '$.groups."group-a".source') = 'native_event'
