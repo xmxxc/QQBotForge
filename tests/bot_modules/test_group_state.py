@@ -541,7 +541,7 @@ async def test_owner_reply_failure_keeps_command_consumed_without_resending(grou
     get_app().hook_manager.register('before_event', receive, owner='reply-failure-test', priority=20)
     host.sender.reply = failing_reply
     try:
-        with caplog.at_level('WARNING', logger='ElainaBot'):
+        with caplog.at_level('ERROR', logger='ElainaBot'):
             await host.event(command, group='group-a')
     finally:
         del host.sender.reply
@@ -555,7 +555,7 @@ async def test_owner_reply_failure_keeps_command_consumed_without_resending(grou
     assert len(host.sender.messages) == 1
 
 
-@pytest.mark.parametrize('failure', ['page', 'cancel'])
+@pytest.mark.parametrize('failure', ['page', 'cancel', 'route'])
 async def test_setup_failure_after_registration_releases_only_its_own_resources(group_host, monkeypatch, failure):
     from core.application import get_app
     from core.plugin import web_pages
@@ -576,7 +576,14 @@ async def test_setup_failure_after_registration_releases_only_its_own_resources(
         web_pages.register_route('*', '/api/ext/group-state/*', newer, auth=True)
         raise RuntimeError('fake page failure')
 
-    monkeypatch.setattr(web_pages, 'register_page', failing_register_page)
+    def failing_register_route(method, path, handler=None, **kwargs):
+        closed.extend(entry[2].__self__ for entry in get_app().hook_manager._hooks['before_event'] if entry[1] == '群状态')
+        raise ValueError('fake route failure')
+
+    if failure == 'route':
+        monkeypatch.setattr(web_pages, 'register_route', failing_register_route)
+    else:
+        monkeypatch.setattr(web_pages, 'register_page', failing_register_page)
     try:
         if failure == 'cancel':
             with pytest.raises(asyncio.CancelledError):
@@ -587,7 +594,7 @@ async def test_setup_failure_after_registration_releases_only_its_own_resources(
         assert [entry for entry in hooks if entry['owner'] == '群状态'] == []
         assert web_pages.get_page_html('group-state') is None
         route = web_pages.match_route('GET', '/api/ext/group-state/')
-        assert (route is None) if failure == 'cancel' else (route['handler'] is newer)
+        assert (route['handler'] is newer) if failure == 'page' else (route is None)
         assert web_pages.match_route('GET', '/api/ext/other-module/')['handler'] is other
         assert web_pages.get_page_html('other-module') is not None
         assert host.modules.get('group_state') is None
