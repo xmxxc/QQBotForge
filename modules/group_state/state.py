@@ -13,6 +13,7 @@ from uuid import uuid4
 from aiohttp import web
 
 from core.base.config import cfg
+from core.base.logger import EXTENSION, get_logger
 from core.plugin._blacklist import get_blacklist_map
 
 from .lifecycle import LIFECYCLE, event_time
@@ -23,6 +24,7 @@ from .storage import ExtensionStore
 
 PREFIX = '/api/ext/group-state/'
 MESSAGE_TYPES = {'GROUP_AT_MESSAGE_CREATE', 'GROUP_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE'}
+log = get_logger(EXTENSION, '群状态')
 
 
 def identifier(value):
@@ -119,7 +121,11 @@ class GroupState:
                 candidate = copy.deepcopy(state)
                 apply(candidate, candidate['groups'][native])
                 await self.store.put(bot, 'group_state', 'state', candidate)
-                self.durable[bot] = {key: value['version'] for key, value in candidate['groups'].items()}
+                durable = {key: value['version'] for key, value in candidate['groups'].items()}
+                if group['version'] != version:
+                    # The candidate's version number can equal a newer live observation's; that fact is not on disk.
+                    durable[native] = None
+                self.durable[bot] = durable
                 if not self.active:
                     raise RuntimeError('群状态模块已卸载')
                 if group['version'] != version:
@@ -131,16 +137,17 @@ class GroupState:
         finally:
             self.pending_writes[bot] -= 1
 
+    @staticmethod
+    def _failure(error, label):
+        if isinstance(error, asyncio.CancelledError):
+            return label + '_cancelled'
+        return 'persistence_failed' if isinstance(error, (sqlite3.Error, OSError)) else label + '_failed'
+
     def _abandon(self, state, group, version, error, label):
         # An interrupted operation must not leave its in-progress marker as the latest fact.
         if group['version'] != version:
             return None
-        if isinstance(error, asyncio.CancelledError):
-            reason = label + '_cancelled'
-        elif isinstance(error, (sqlite3.Error, OSError)):
-            reason = 'persistence_failed'
-        else:
-            reason = label + '_failed'
+        reason = self._failure(error, label)
         self._invalidate(state, group, reason)
         if reason == 'persistence_failed':
             group.update(reliable=False, status='historical', reason=reason)
@@ -330,6 +337,13 @@ class GroupState:
                 raise
 
     @staticmethod
+    def _settle_roster(group, reason):
+        # The roster lock serialises passes per group, so remaining markers are this pass's; newer facts already replaced theirs.
+        for record in group['members'].values():
+            if record.get('reason') == 'roster_refreshing':
+                record.update(reliable=False, status='left' if record.get('status') == 'left' else 'historical', reason=reason)
+
+    @staticmethod
     def _invalidate(state, group, reason):
         state['version'] += 1
         group['version'] += 1
@@ -343,7 +357,7 @@ class GroupState:
             known = {key for key, member in group['members'].items() if member.get('status') != 'left'}
             self._invalidate(state, group, 'roster_refreshing')
             for record in group['members'].values():
-                record.update(reliable=False, status='historical', reason='roster_refreshing')
+                record.update(reliable=False, status='left' if record.get('status') == 'left' else 'historical', reason='roster_refreshing')
             version = group['version']
             try:
                 await self._save(bot, state)
@@ -352,13 +366,17 @@ class GroupState:
                     raise RuntimeError('群状态模块已卸载')
                 if group['version'] != version:
                     report.update(complete=False, reason='state_changed')
+                    self._settle_roster(group, 'state_changed')
                     return copy.deepcopy(report)
                 if report['complete'] and known - {r['member'] for r in report['members']}:
                     report.update(complete=False, reason='known_member_missing', missing_known_members=sorted(known - {r['member'] for r in report['members']}))
                 checked = self.clock()
 
+                # Duplicates, cursor loops (an unending cursor chain included) and identity contradictions make the whole pass unusable as member proof.
+                conflict = report['reason'] in ('pagination_conflict', 'pagination_limit', 'bot_identity_conflict')
+
                 def apply(candidate, updated):
-                    for record in report['members']:
+                    for record in [] if conflict else report['members']:
                         reliable = record['member_role'] is not None
                         self._merge_member(updated, {
                             **record,
@@ -368,8 +386,9 @@ class GroupState:
                             'source': 'platform_roster',
                             'checked_at': checked,
                         })
-                    if any(not updated['members'][r['member']]['reliable'] for r in report['members']):
+                    if not conflict and any(not updated['members'][r['member']]['reliable'] for r in report['members']):
                         report.update(complete=False, reason='stale_membership')
+                    self._settle_roster(updated, report['reason'] or 'roster_refreshed')
                     self._invalidate(candidate, updated, report['reason'])
                     report.update(
                         id=uuid4().hex, generation=self.generation, version=updated['version'], group=native_group, source='platform_roster', checked_at=checked
@@ -378,6 +397,7 @@ class GroupState:
 
                 if not await self._commit(bot, state, native_group, apply):
                     report.update(complete=False, reason='state_changed')
+                    self._settle_roster(group, 'state_changed')
                 else:
                     await self._notify(bot, group, 'roster_refreshed')
                     if group['version'] != report['version']:
@@ -389,6 +409,7 @@ class GroupState:
                 if reason := self._abandon(state, group, version, error, 'roster'):
                     for record in group['members'].values():
                         record.update(reason=reason)
+                self._settle_roster(group, self._failure(error, 'roster'))
                 raise
 
     async def verify_member(self, bot, native_group, member):
@@ -820,5 +841,9 @@ class GroupState:
             content = str(error)
         except (RuntimeError, sqlite3.Error, OSError):
             content = '群状态存储暂不可用，请检查后台'
-        await sender.reply(event, content)
+        try:
+            await sender.reply(event, content)
+        except Exception as error:
+            # The command is consumed either way: the platform may have delivered it, so neither resend nor fall through.
+            log.error(f'群状态命令回复失败，结果未知，不重发: {type(error).__name__}: {error}')
         return None
