@@ -1,0 +1,1686 @@
+diff --git a/docs/group-state.md b/docs/group-state.md
+index 0ad0c3c..07eaad4 100644
+--- a/docs/group-state.md
++++ b/docs/group-state.md
+@@ -2,7 +2,7 @@
+ 
+ 对应 #21—#23；独立安装 `modules/group_state/` 完整目录，在模块管理中启用“群状态”。不需要安装授权、问答或账户扩展。数据在该目录的 `data/group-state.db`，使用与其他扩展相同的 SQLite v1 记录格式。
+ 
+-框架最低需要 F01 `460c841` 的本地恢复 v1、上游 `b410938` 的群生命周期／连接事实及 `before_event` 接收入口。当前验证组合为 QQBotForge 框架同步 `b23572b`（PR #39，来源 `460c841`、PR #38）与本业务目录；远端 personal `19e53af` 尚未具备该入口。必须先按主人审核结果同步框架，再安装业务目录；不能仅在旧框架里手工 emit Hook 代替验证。
++框架最低需要 F01 `460c841` 的本地恢复 v1、上游 `b410938` 的群生命周期／连接事实及 `before_event` 接收入口。本轮验证基线为 personal `f797ead`（已合入 #38／#39 的框架恢复与 Hook 接线）与本业务目录的真实合并候选；不能仅在旧框架里手工 emit Hook 代替验证。
+ 
+ 已登录后台打开“群状态”，选择 Bot，查看已知群，或输入群原生标识刷新 Bot 在群状态。QQ 主人可发：
+ 
+@@ -15,11 +15,19 @@
+ 
+ 已知群来自实际收到的原生群事件或主人显式刷新，界面与接口始终标明 `scope=known`、`complete=false`。不把记录总数称为平台所有群。刷新复用框架 `get_group_bot_state(return_error=True)`，只接受完整可识别的平台结果。接口许可、错误、历史状态和核验时间分别显示；查询失败、空值或未获许可不表示 Bot 已离群。历史 `bot_state` 在 `reliable=false` 时只能作历史参考。重启／重载保留历史，但先标记 `process_restart`，须重建恢复基线。
+ 
+-消费者从运行模块取得 `await group_state.snapshot(appid)`、`await group_state.refresh(appid, native_group)` 和 `group_state.capabilities()`，不要读取内部 SQLite。快照是独立副本，含 Bot、模块代际、版本、每群来源／核验时间和可靠性。进入核验与核验完成分别递增版本；不同模块代际的版本不能混用。刷新时收到同群新事实会拒绝旧结果；模块卸载后旧请求不能继续确认当前状态。
++消费者从运行模块取得 `await group_state.snapshot(appid)`、`await group_state.refresh(appid, native_group)` 和 `group_state.capabilities()`，不要读取内部 SQLite。快照是独立副本，含 Bot、模块代际、版本、每群来源／核验时间和可靠性。进入核验与核验完成分别递增版本；不同模块代际的版本不能混用。刷新时收到同群新事实会拒绝旧结果；模块卸载后旧请求不能继续确认当前状态。冷加载与等待读取锁的在途请求同样会失效：直接消费接口抛出 RuntimeError，已进入路由的 HTTP 读取返回 503；不会返回或缓存旧代际历史快照。重新启用后由新实例加载历史并重新核验。
++
++人工确认在等待提交前就递增群版本，使旧名册与分页凭据失效，并把目标成员保留为不可靠历史；失败或取消不能恢复旧证明，取消标记为 `confirmation_cancelled`。重新确认只恢复该成员，完整名册仍须单独重新核验。
++
++刷新、名册、单人核验与人工确认都以独立候选提交数据库，提交等待期间快照保持进行中的不可信状态。提交成功后再次检查模块是否仍启用及同群版本是否改变，再发布结果；卸载后返回存储不可用，不返回旧实例的完整／可靠事实。提交失败保留上一份事实作历史，该群、名册与成员标为 `persistence_failed`，修复存储后可直接重试。同群的新观察在等待写入时立即失效旧结果。取消请求时等待其数据库线程实际结束，再释放写入顺序锁和报告取消，避免迟到写入覆盖新观察。模块停止先撤销实例有效性，再异步等待 SQLite 在途操作与关闭，避免阻塞其他 Bot 和后台请求。
++
++群事件观察落库失败时，相关历史标记 `persistence_failed`，群内主人查看／刷新命令会收到存储错误提示。普通消息与未授权命令继续原消息链，错误提示仍受当前 Bot 主人及黑名单检查。失败只标记本次写入所携带且尚未落库的群；迟到的写入失败不会覆盖更新的同群事实，其他群与其他 Bot 不受影响。
++
++首次保存失败或排队取消也会结束刷新、名册及单人核验并保留历史；刷新取消后标为 `historical`、`refresh_cancelled`，名册与单人核验被取消或查询异常时同样标为 `roster_cancelled`／`verification_cancelled` 等，不留下进行中标记。首次保存尚在写锁队列中时取消，使用上述操作对应的 `*_cancelled`；若已进入 SQLite 写入，线程排空后首次保存会先将相关事实保守标为 `persistence_failed`，外层清理不覆盖该更新版本。两者都使旧证明失效，需重新核验。失败或取消的清理只修改仍属于本次操作的群版本，不能覆盖新的原生观察。平台字段类型异常按不可识别响应处理，返回 `response_unknown`，不发布可信状态。页面切换 Bot、修改群标识或发起新请求时清除旧结果与成员分页，只有当前 Bot、当前群的最新请求的成功或错误响应可以更新页面。
+ 
+ G01 提供已知群概览与 Bot 状态，G02（#22）补充分页名册及单成员核验，G03（#23）提供成员周期和恢复订阅。本模块不存功能授权、绑定或账密。新发现的群／成员使相关事实版本失效；已知成员普通聊天不重复改写成员周期，不将消息视为完整名册或连续性证明。
+ 
+-自动验证使用真实 ModuleManager 独立发现／启停／重载、Application 接收入口、鉴权 HTTP 与 QQ 主人命令，并检查多 Bot、错误保留、刷新中变更及路由卸载。使用临时数据库、假身份和平台查询／发送替身。当前业务组合 99 passed；框架版本证据见 #20。浏览器因当前会话没有可用浏览器未完成，真实平台许可未核查，未迁移生产数据。
++自动验证使用真实 ModuleManager 独立发现／启停／重载、Application 接收入口、鉴权 HTTP 与 QQ 主人命令，并检查多 Bot、错误保留、刷新中变更及路由卸载。存储故障回归使用临时 SQLite 触发器与写锁，验证失败后不发布可信事实、提交等待期间的新观察、最终保存期间重载及关闭时事件循环可继续运行。使用临时数据库、假身份和平台查询／发送替身；框架版本证据见 #20。浏览器因当前会话没有可用浏览器未完成，真实平台许可未核查，未迁移生产数据。
+ 
+ 
+ ## 成员、角色与名册完整性（G02）
+@@ -34,7 +42,7 @@ G01 提供已知群概览与 Bot 状态，G02（#22）补充分页名册及单
+ 
+ 人工确认只形成该人的有来源事实；角色未知可传 null，不能代替全群名册。群中命令只给简短处理状态，名册详情留在主人私聊或后台。
+ 
+-稳定消费接口：`sync_roster(bot, group)` 返回本轮名册报告；`verify_member(bot, group, member)` 返回单人核验；`members(bot, group, cursor='', limit=30, version=None, generation=None)` 分页读取已知事实；`confirm_member(..., evidence=..., member_role=None)` 用于已鉴权主人管理。后续页必须携带前页的版本与代际，变化后从第一页重读；持久化期间不签发分页凭据，稍后从第一页读取。HTTP 对应 `/roster`、`/member`、`/members` 和 `/confirm-member`，沿用同一会话／同源鉴权。
++稳定消费接口：`sync_roster(bot, group)` 返回本轮名册报告；`verify_member(bot, group, member)` 返回单人核验；`members(bot, group, cursor='', limit=30, version=None, generation=None)` 分页读取已知事实；`confirm_member(..., evidence=..., member_role=None)` 用于已鉴权主人管理。后续页必须携带前页的版本与代际；`next_cursor` 是不透明凭据，只对签发它的 Bot、群、代际与版本有效，换 Bot／群或变化后从第一页重读；持久化期间不签发分页凭据，稍后从第一页读取。HTTP 对应 `/roster`、`/member`、`/members` 和 `/confirm-member`，沿用同一会话／同源鉴权。
+ 
+ 平台适配器复用框架公开 `sender.get_json` 读取原始分页及单成员接口。没有使用 `get_group_members` 的补默认值结果作证明，因为该包装会为缺失字段补 `members=[]` 和 `next_cursor=''`，不能判断响应是否真的包含末页标记。每页最多 30 人、每轮最多 1000 页、每次请求 10 秒上限；空值、异常、无许可、中断、重复成员／游标、缺页和未知角色均返回不完整及原因，不推断离群。
+ 
+@@ -42,9 +50,11 @@ G01 提供已知群概览与 Bot 状态，G02（#22）补充分页名册及单
+ 
+ 历史成员与本轮名册分别保存。已知成员缺失标记 `known_member_missing`，保留缺失名单及历史，不直接删人。个人核验成功或失败、角色变化、新观察及重载都会使旧名册证明失效。完整名册不授予功能资格，也不承诺未投递变化、无穷离线期间或查询／发送原子一致性。
+ 
+-持久化未完成时，公开快照和分页接口不发布完整证明；持久化失败的 Bot 暂停事实读取，重载并重新核验后恢复。SQLite 事务不会把失败写入视为成功。该行为用临时 SQLite 写锁和触发器经公开 HTTP／快照验证，未替换存储实现。这些事实通过 G03 接入恢复确认和消费通知。
++持久化未完成时，公开快照和分页接口不发布完整证明，分页接口也不签发凭据；持久化失败时名册证明失效，修复存储后重新核验即可恢复。SQLite 事务不会把失败写入视为成功。该行为用临时 SQLite 写锁和触发器经公开 HTTP／快照验证，未替换存储实现。这些事实通过 G03 接入恢复确认和消费通知；存储重试不会跳过恢复基线与消费完成屏障。
++
++G02 先前 `95b0505` 的框架组合有 153 项业务回归通过，但独立复审仍发现人工确认失败关闭、首次写入排队取消及改群往返页面竞态三项缺口。当前补丁逐项修复并添加回归；精确 SHA、测试组合和同步结果见本轮集成审计报告。既有及新增测试覆盖独立加载、两 Bot／群、多页完整、缺页／重复／中断／角色缺失／本 Bot 缺失、已知成员冲突、并发新观察、个人核验和人工确认、旧分页失效、跨 Bot／群分页凭据、最终写入期间卸载、排队读取跨卸载、查询取消、写入失败后重试及持久化延迟。浏览器无可用实例，未执行视觉核查；真实 QQ 及其平台许可未核查。
+ 
+-G02 验证组合仍为框架 `b23572b` 与当前业务目录。完整业务回归 118 passed；覆盖独立加载、两 Bot／群、多页完整、缺页／重复／中断／角色缺失／本 Bot 缺失、已知成员冲突、并发新观察、个人核验和人工确认、旧分页失效、写入失败及持久化延迟。浏览器无可用实例，未执行视觉核查；真实 QQ 及其平台许可未核查。
++页面请求顺序回归执行实际页面脚本，使用 DOM／fetch 替身；运行 `node --test tests/bot_modules/test_group_state_page.cjs`，无需 npm 依赖。群状态 pytest 会在可用时调用该测试，没有 Node.js 时仅跳过页面脚本测试。这些脚本测试不替代浏览器视觉核查。
+ 
+ 
+ ## 生命周期、消费凭据与恢复（G03）
+diff --git a/modules/group_state/main.py b/modules/group_state/main.py
+index 1e0581e..56908fb 100644
+--- a/modules/group_state/main.py
++++ b/modules/group_state/main.py
+@@ -23,7 +23,7 @@ async def setup(ctx):
+     except BaseException:
+         unregister_route('*', PREFIX + '*')
+         unregister_page('group-state')
+-        candidate.close()
++        await candidate.aclose()
+         raise
+     _instance = candidate
+     return candidate
+@@ -33,6 +33,6 @@ async def teardown():
+     global _instance
+     unregister_route('*', PREFIX + '*')
+     unregister_page('group-state')
+-    if _instance is not None:
+-        _instance.close()
+-        _instance = None
++    instance, _instance = _instance, None
++    if instance is not None:
++        await instance.aclose()
+diff --git a/modules/group_state/page.html b/modules/group_state/page.html
+index 3c248ed..8670630 100644
+--- a/modules/group_state/page.html
++++ b/modules/group_state/page.html
+@@ -15,15 +15,19 @@
+ <script>
+ (()=>{
+  const bot=document.getElementById('gs-bot'), status=document.getElementById('gs-status'), output=document.getElementById('gs-output');
+- let memberPage=null;
+- async function run(action='', next=false){
+-  status.textContent='正在读取…';
++ const groupInput=document.getElementById('gs-group'), next=document.getElementById('gs-next');
++ let latestRequest=0, memberPage=null;
++ // Pagination belongs to one Bot and group; any newer selection or request retires it.
++ function clearPage(){memberPage=null;next.disabled=true;}
++ async function run(action='', nextPage=false){
++  const request=++latestRequest, appid=bot.value, group=groupInput.value.trim(), page=nextPage?memberPage:null;
++  const isCurrent=()=>request===latestRequest&&appid===bot.value&&(!action||group===groupInput.value.trim());
++  clearPage();output.textContent='';status.textContent='正在读取…';
+   try {
+-   const group=document.getElementById('gs-group').value.trim();
+-   const query=new URLSearchParams({bot:bot.value});
++   const query=new URLSearchParams({bot:appid});
+    if(action==='members'){
+     query.set('group',group);query.set('limit','30');
+-    if(next&&memberPage){for(const key of ['generation','version'])query.set(key,memberPage[key]);query.set('cursor',memberPage.next_cursor);}
++    if(page){for(const key of ['generation','version'])query.set(key,page[key]);query.set('cursor',page.next_cursor);}
+    }
+    let body={group};
+    if(action==='member'||action==='confirm-member')body.member=document.getElementById('gs-member').value.trim();
+@@ -33,16 +37,17 @@
+     method:writing?'POST':'GET',credentials:'same-origin',headers:writing?{'Content-Type':'application/json'}:{},
+     ...(writing?{body:JSON.stringify(body)}:{})});
+    const data=await response.json();
++   if(!isCurrent())return;
+    if(!response.ok||!data.success)throw Error(data.error||data.message||'读取失败');
+-   if(action==='members')memberPage=data.data;else memberPage=null;
+-   document.getElementById('gs-next').disabled=!memberPage?.next_cursor;
++   if(action==='members'&&data.data?.group===group){memberPage=data.data;next.disabled=!memberPage.next_cursor;}
+    output.textContent=JSON.stringify(data.data,null,2);status.textContent='已更新：请结合完整性、来源与历史标记查看核验结果';
+-  }catch(error){status.textContent=error.message;output.textContent='';memberPage=null;document.getElementById('gs-next').disabled=true;}
++  }catch(error){if(isCurrent()){status.textContent=error.message;output.textContent='';}}
+  }
+  document.getElementById('gs-rebuild').onclick=()=>run('rebuild');document.getElementById('gs-load').onclick=()=>run();document.getElementById('gs-refresh').onclick=()=>run('refresh');
+  document.getElementById('gs-roster').onclick=()=>run('roster');document.getElementById('gs-members').onclick=()=>run('members');
+- document.getElementById('gs-next').onclick=()=>run('members',true);document.getElementById('gs-verify').onclick=()=>run('member');
++ next.onclick=()=>run('members',true);document.getElementById('gs-verify').onclick=()=>run('member');
+  document.getElementById('gs-confirm').onclick=()=>run('confirm-member');
++ groupInput.oninput=()=>{++latestRequest;clearPage();output.textContent='';status.textContent='请选择操作读取当前群';};
+  bot.onchange=()=>run();
+  fetch('/api/bots',{credentials:'same-origin'}).then(r=>r.json()).then(data=>{
+   const rows=data.data?.bots||data.bots||[];
+diff --git a/modules/group_state/state.py b/modules/group_state/state.py
+index 3c92caf..567d583 100644
+--- a/modules/group_state/state.py
++++ b/modules/group_state/state.py
+@@ -2,6 +2,7 @@
+ 
+ import asyncio
+ import copy
++import hashlib
+ import json
+ import sqlite3
+ import time
+@@ -45,7 +46,7 @@ class GroupState:
+         self.write_locks = {}
+         self.refresh_locks = {}
+         self.roster_locks = {}
+-        self.failed_bots = set()
++        self.durable = {}
+         self.pending_writes = {}
+ 
+     @staticmethod
+@@ -67,13 +68,25 @@ class GroupState:
+             self.connection_subscription.cancel()
+         self.store.close()
+ 
++    async def aclose(self):
++        self.active = False
++        if hasattr(self, 'notifications'):
++            self.notifications.close()
++            self.recovery.cancel()
++            self.connection_subscription.cancel()
++        await asyncio.to_thread(self.store.close)
++
+     async def _state(self, bot):
+         identifier(bot)
+-        if not self.active or bot in self.failed_bots:
+-            raise RuntimeError('群状态模块未启用或该 Bot 持久化失败')
++        if not self.active:
++            raise RuntimeError('群状态模块未启用')
+         async with self.load_locks.setdefault(bot, asyncio.Lock()):
++            if not self.active:
++                raise RuntimeError('群状态模块未启用')
+             if bot not in self.states:
+                 state = await self.store.get(bot, 'group_state', 'state') or {'schema_version': 1, 'version': 0, 'groups': {}}
++                if not self.active:
++                    raise RuntimeError('群状态模块已卸载')
+                 if state.get('schema_version') != 1:
+                     raise RuntimeError('群状态数据版本不兼容')
+                 for group in state['groups'].values():
+@@ -86,24 +99,76 @@ class GroupState:
+                             reliable=False, cycle_uncertain=True, status='left' if member.get('status') == 'left' else 'historical', reason='process_restart'
+                         )
+                 state['version'] += 1
++                self.durable[bot] = {}
+                 self.states[bot] = state
+         return self.states[bot]
+ 
++    async def _commit(self, bot, state, native, apply):
++        """Persist a detached candidate; publish it only if its group stayed current.
++
++        Readers keep seeing the in-progress fact until the write succeeds, and a failed
++        write leaves the previous fact as history.
++        """
++        group = state['groups'][native]
++        version = group['version']
++        self.pending_writes[bot] = self.pending_writes.get(bot, 0) + 1
++        try:
++            async with self.write_locks.setdefault(bot, asyncio.Lock()):
++                if not self.active:
++                    raise RuntimeError('群状态模块已卸载')
++                if group['version'] != version:
++                    return False
++                candidate = copy.deepcopy(state)
++                apply(candidate, candidate['groups'][native])
++                await self.store.put(bot, 'group_state', 'state', candidate)
++                self.durable[bot] = {key: value['version'] for key, value in candidate['groups'].items()}
++                if not self.active:
++                    raise RuntimeError('群状态模块已卸载')
++                if group['version'] != version:
++                    return False
++                group.clear()
++                group.update(candidate['groups'][native])
++                state['version'] += 1
++                return True
++        finally:
++            self.pending_writes[bot] -= 1
++
++    def _abandon(self, state, group, version, error, label):
++        # An interrupted operation must not leave its in-progress marker as the latest fact.
++        if group['version'] != version:
++            return None
++        if isinstance(error, asyncio.CancelledError):
++            reason = label + '_cancelled'
++        elif isinstance(error, (sqlite3.Error, OSError)):
++            reason = 'persistence_failed'
++        else:
++            reason = label + '_failed'
++        self._invalidate(state, group, reason)
++        if reason == 'persistence_failed':
++            group.update(reliable=False, status='historical', reason=reason)
++            for member in group['members'].values():
++                member.update(reliable=False, reason=reason)
++        return reason
++
+     async def _save(self, bot, state):
+         self.pending_writes[bot] = self.pending_writes.get(bot, 0) + 1
+         try:
+             async with self.write_locks.setdefault(bot, asyncio.Lock()):
+-                if bot in self.failed_bots:
+-                    raise RuntimeError('该 Bot 持久化已失效，需要重载并重新核验')
+-                await self.store.put(bot, 'group_state', 'state', state)
+-        except BaseException:
+-            self.failed_bots.add(bot)
+-            for group in state['groups'].values():
+-                group.update(reliable=False, reason='persistence_failed')
+-                group['roster'].update(complete=False, reason='persistence_failed')
+-                for member in group['members'].values():
+-                    member.update(reliable=False, reason='persistence_failed')
+-            raise
++                written = {native: group['version'] for native, group in state['groups'].items()}
++                try:
++                    await self.store.put(bot, 'group_state', 'state', state)
++                except BaseException:
++                    # Retire only the facts this write carried; newer ones belong to a queued write.
++                    durable = self.durable.get(bot, {})
++                    for native, version in written.items():
++                        group = state['groups'][native]
++                        if group['version'] == version and durable.get(native) != version:
++                            self._invalidate(state, group, 'persistence_failed')
++                            group.update(reliable=False, status='historical', reason='persistence_failed')
++                            for member in group['members'].values():
++                                member.update(reliable=False, reason='persistence_failed')
++                    raise
++                self.durable[bot] = written
+         finally:
+             self.pending_writes[bot] -= 1
+ 
+@@ -202,55 +267,69 @@ class GroupState:
+             self._invalidate(state, group, 'bot_state_refreshing')
+             group.update(reliable=False, status='pending', reason='refreshing')
+             version = group['version']
+-            await self._save(bot, state)
+-            sender = self.sender_provider(bot)
+-            data, error, reason = None, None, ''
+-            if sender is None or not hasattr(sender, 'get_group_bot_state'):
+-                reason = 'unsupported'
+-            else:
+-                try:
+-                    result = await sender.get_group_bot_state(native, return_error=True)
+-                    if isinstance(result, tuple) and len(result) == 2:
+-                        data, error = result
+-                    else:
+-                        reason = 'response_unknown'
+-                except Exception:
+-                    reason = 'query_failed'
+-            if not self.active:
+-                raise RuntimeError('群状态模块已卸载')
+-            if group['version'] != version:
+-                return {**self._public_group(bot, group), 'reliable': False, 'reason': 'state_changed'}
+-            if isinstance(error, dict):
+-                reason = 'permission_denied' if str(error.get('code')) == '11253' else 'query_failed'
+-            valid = (
+-                not reason
+-                and error is None
+-                and isinstance(data, dict)
+-                and data.get('member_role') in {'owner', 'admin', 'member'}
+-                and isinstance(data.get('recv_msg_setting'), str)
+-                and bool(data['recv_msg_setting'])
+-                and isinstance(data.get('allow_proactive_msg'), bool)
+-            )
+-            self._invalidate(state, group, 'bot_state_refreshed')
+-            group.update(
+-                checked_at=self.clock(),
+-                reliable=bool(valid),
+-                status='verified' if valid else 'historical',
+-                reason='' if valid else reason or 'response_unknown',
+-            )
+-            if valid and isinstance(data, dict):
+-                group.update(
+-                    source='platform_bot_state',
+-                    bot_state={
+-                        'member_role': data['member_role'],
+-                        'recv_msg_setting': data['recv_msg_setting'],
+-                        'allow_proactive_msg': data['allow_proactive_msg'],
+-                        'in_group': True,
+-                    },
++            try:
++                await self._save(bot, state)
++                sender = self.sender_provider(bot)
++                data, error, reason = None, None, ''
++                if sender is None or not hasattr(sender, 'get_group_bot_state'):
++                    reason = 'unsupported'
++                else:
++                    try:
++                        result = await sender.get_group_bot_state(native, return_error=True)
++                        if isinstance(result, tuple) and len(result) == 2:
++                            data, error = result
++                        else:
++                            reason = 'response_unknown'
++                    except Exception:
++                        reason = 'query_failed'
++                if not self.active:
++                    raise RuntimeError('群状态模块已卸载')
++                if group['version'] != version:
++                    return {**self._public_group(bot, group), 'reliable': False, 'reason': 'state_changed'}
++                if isinstance(error, dict):
++                    reason = 'permission_denied' if str(error.get('code')) == '11253' else 'query_failed'
++                valid = (
++                    not reason
++                    and error is None
++                    and isinstance(data, dict)
++                    and isinstance(data.get('member_role'), str)
++                    and data.get('member_role') in {'owner', 'admin', 'member'}
++                    and isinstance(data.get('recv_msg_setting'), str)
++                    and bool(data['recv_msg_setting'])
++                    and isinstance(data.get('allow_proactive_msg'), bool)
+                 )
+-            await self._save(bot, state)
+-            await self._notify(bot, group, 'bot_state_refreshed')
+-            return self._public_group(bot, group)
++
++                def apply(candidate, updated):
++                    self._invalidate(candidate, updated, 'bot_state_refreshed')
++                    updated.update(
++                        checked_at=self.clock(),
++                        reliable=bool(valid),
++                        status='verified' if valid else 'historical',
++                        reason='' if valid else reason or 'response_unknown',
++                    )
++                    if valid and isinstance(data, dict):
++                        updated.update(
++                            source='platform_bot_state',
++                            bot_state={
++                                'member_role': data['member_role'],
++                                'recv_msg_setting': data['recv_msg_setting'],
++                                'allow_proactive_msg': data['allow_proactive_msg'],
++                                'in_group': True,
++                            },
++                        )
++
++                if not await self._commit(bot, state, native, apply):
++                    return {**self._public_group(bot, group), 'reliable': False, 'reason': 'state_changed'}
++                committed_version = group['version']
++                await self._notify(bot, group, 'bot_state_refreshed')
++                result = self._public_group(bot, group)
++                if group['version'] != committed_version:
++                    result.update(reliable=False, reason='state_changed')
++                return result
++            except BaseException as error:
++                if reason := self._abandon(state, group, version, error, 'refresh'):
++                    group.update(status='historical', reason=reason)
++                raise
+ 
+     @staticmethod
+     def _invalidate(state, group, reason):
+@@ -268,44 +347,51 @@ class GroupState:
+             for record in group['members'].values():
+                 record.update(reliable=False, status='historical', reason='roster_refreshing')
+             version = group['version']
+-            await self._save(bot, state)
+-            report = await self.reader.roster(bot, native_group)
+-            if not self.active:
+-                raise RuntimeError('群状态模块已卸载')
+-            changed = group['version'] != version
+-            if changed:
+-                report.update(complete=False, reason='state_changed')
+-            elif report['complete'] and known - {r['member'] for r in report['members']}:
+-                report.update(complete=False, reason='known_member_missing', missing_known_members=sorted(known - {r['member'] for r in report['members']}))
+-            checked = self.clock()
+-            if not changed:
+-                for record in report['members']:
+-                    reliable = record['member_role'] is not None
+-                    self._merge_member(
+-                        group,
+-                        {
++            try:
++                await self._save(bot, state)
++                report = await self.reader.roster(bot, native_group)
++                if not self.active:
++                    raise RuntimeError('群状态模块已卸载')
++                if group['version'] != version:
++                    report.update(complete=False, reason='state_changed')
++                    return copy.deepcopy(report)
++                if report['complete'] and known - {r['member'] for r in report['members']}:
++                    report.update(complete=False, reason='known_member_missing', missing_known_members=sorted(known - {r['member'] for r in report['members']}))
++                checked = self.clock()
++
++                def apply(candidate, updated):
++                    for record in report['members']:
++                        reliable = record['member_role'] is not None
++                        self._merge_member(updated, {
+                             **record,
+                             'reliable': reliable,
+                             'status': 'present' if reliable else 'pending',
+                             'reason': '' if reliable else 'role_missing',
+                             'source': 'platform_roster',
+                             'checked_at': checked,
+-                        },
++                        })
++                    if any(not updated['members'][r['member']]['reliable'] for r in report['members']):
++                        report.update(complete=False, reason='stale_membership')
++                    self._invalidate(candidate, updated, report['reason'])
++                    report.update(
++                        id=uuid4().hex, generation=self.generation, version=updated['version'], group=native_group, source='platform_roster', checked_at=checked
+                     )
+-            self._invalidate(state, group, report['reason'])
+-            report.update(
+-                id=uuid4().hex, generation=self.generation, version=group['version'], group=native_group, source='platform_roster', checked_at=checked
+-            )
+-            if not changed and any(not group['members'][r['member']]['reliable'] for r in report['members']):
+-                report.update(complete=False, reason='stale_membership')
+-            group['roster'] = copy.deepcopy(report)
+-            await self._save(bot, state)
+-            await self._notify(bot, group, 'roster_refreshed')
+-            if group['version'] != report['version']:
+-                report.update(complete=False, reason='state_changed')
+-            if not self._ready(bot):
+-                report.update(complete=False, continuity_reason='recovery_pending')
+-            return copy.deepcopy(report)
++                    updated['roster'] = copy.deepcopy(report)
++
++                if not await self._commit(bot, state, native_group, apply):
++                    report.update(complete=False, reason='state_changed')
++                else:
++                    await self._notify(bot, group, 'roster_refreshed')
++                    if group['version'] != report['version']:
++                        report.update(complete=False, reason='state_changed')
++                if not self._ready(bot):
++                    report.update(complete=False, continuity_reason='recovery_pending')
++                return copy.deepcopy(report)
++            except BaseException as error:
++                if reason := self._abandon(state, group, version, error, 'roster'):
++                    for record in group['members'].values():
++                        record.update(reason=reason)
++                raise
+ 
+     async def verify_member(self, bot, native_group, member):
+         identifier(native_group)
+@@ -317,26 +403,48 @@ class GroupState:
+         record = group['members'].setdefault(member, {'member': member, 'member_role': None, 'bot': None})
+         previous = copy.deepcopy(record)
+         record.update(reliable=False, status='pending', reason='verifying')
+-        await self._save(bot, state)
+-        result = await self.reader.member(bot, native_group, member)
+-        if not self.active:
+-            raise RuntimeError('群状态模块已卸载')
+-        if group['version'] != version:
+-            return {**copy.deepcopy(record), 'state': 'unknown', 'reliable': False, 'reason': 'state_changed'}
+-        record = {**record}
+-        record.update(
+-            result,
+-            source='platform_member',
+-            checked_at=self.clock(),
+-            reliable=result['state'] == 'present',
+-            status='present' if result['state'] == 'present' else 'pending',
+-        )
+-        record = self._merge_member(group, record, previous=previous)
+-        self._invalidate(state, group, 'individual_verification')
+-        version = group['version']
+-        await self._save(bot, state)
+-        await self._notify(bot, group, 'member_verified')
+-        return self._member_result(bot, group, record, version)
++        try:
++            await self._save(bot, state)
++            result = await self.reader.member(bot, native_group, member)
++            if not self.active:
++                raise RuntimeError('群状态模块已卸载')
++            if group['version'] != version:
++                return {**copy.deepcopy(record), 'state': 'unknown', 'reliable': False, 'reason': 'state_changed'}
++            fact = dict(
++                result,
++                source='platform_member',
++                checked_at=self.clock(),
++                reliable=result['state'] == 'present',
++                status='present' if result['state'] == 'present' else 'pending',
++            )
++            return await self._commit_member(bot, state, native_group, member, fact, previous=previous)
++        except BaseException as error:
++            if reason := self._abandon(state, group, version, error, 'verification'):
++                record.update(status='historical', reason=reason)
++            raise
++
++    async def _commit_member(self, bot, state, native_group, member, fact, *, previous=None, manual=False, continuity_unknown=False):
++        published: dict = {}
++
++        def apply(candidate, updated):
++            self._merge_member(updated, {'member': member, **fact}, manual=manual, previous=previous, continuity_unknown=continuity_unknown)
++            self._invalidate(candidate, updated, 'individual_verification')
++            published.update(updated['members'][member], group=native_group, version=updated['version'], generation=self.generation)
++
++        group = state['groups'][native_group]
++        if not await self._commit(bot, state, native_group, apply):
++            current = group['members'].get(member, {'member': member})
++            return {
++                **copy.deepcopy(current),
++                'group': native_group,
++                'version': group['version'],
++                'generation': self.generation,
++                'reliable': False,
++                'state': 'unknown',
++                'reason': 'state_changed',
++            }
++        await self._notify(bot, group, 'member_confirmed' if manual else 'member_verified')
++        return self._member_result(bot, group, published, published['version'])
+ 
+     async def confirm_member(self, bot, native_group, member, *, evidence, member_role=None):
+         identifier(native_group)
+@@ -347,28 +455,32 @@ class GroupState:
+             raise ValueError('角色须为 member、admin、owner 或 null')
+         state = await self._state(bot)
+         group = self._group(state, native_group)
+-        record = group['members'].setdefault(member, {'member': member, 'bot': None})
+-        record = {**record}
+-        record.update(
+-            member_role=member_role,
+-            reliable=True,
+-            status='present',
+-            reason='',
+-            source='owner_confirmed',
+-            checked_at=self.clock(),
+-            evidence=evidence,
+-            state='present',
+-            confirmation_generation=self.generation,
+-            confirmation_revision=self.recovery.get_status(bot).revision,
+-        )
+-        record = self._merge_member(
+-            group, record, manual=True, continuity_unknown=self.recovery.get_status(bot).phase in {'needs_baseline', 'unsupported', 'closed'}
+-        )
+         self._invalidate(state, group, 'individual_verification')
+         version = group['version']
+-        await self._save(bot, state)
+-        await self._notify(bot, group, 'member_confirmed')
+-        return self._member_result(bot, group, record, version)
++        record = group['members'].setdefault(member, {'member': member, 'member_role': None, 'bot': None})
++        previous = copy.deepcopy(record)
++        record.update(reliable=False, status='pending', reason='confirming')
++        fact = {
++            'member_role': member_role,
++            'reliable': True,
++            'status': 'present',
++            'reason': '',
++            'source': 'owner_confirmed',
++            'checked_at': self.clock(),
++            'evidence': evidence,
++            'state': 'present',
++            'confirmation_generation': self.generation,
++            'confirmation_revision': self.recovery.get_status(bot).revision,
++        }
++        try:
++            return await self._commit_member(
++                bot, state, native_group, member, fact, previous=previous, manual=True,
++                continuity_unknown=self.recovery.get_status(bot).phase in {'needs_baseline', 'unsupported', 'closed'},
++            )
++        except BaseException as error:
++            if reason := self._abandon(state, group, version, error, 'confirmation'):
++                record.update(status='historical', reason=reason)
++            raise
+ 
+     def _member_result(self, bot, group, record, version):
+         result = {**copy.deepcopy(record), 'group': group['group'], 'version': version, 'generation': self.generation}
+@@ -378,18 +490,25 @@ class GroupState:
+             result.update(reliable=False, continuity_reason='recovery_pending')
+         return result
+ 
++    def _page_key(self, bot, native_group, version):
++        # Cursors continue only the Bot, group and snapshot version that issued them.
++        return hashlib.sha256(json.dumps([self.generation, bot, native_group, version]).encode()).hexdigest()[:16]
++
+     async def members(self, bot, native_group, *, cursor='', limit=30, version=None, generation=None):
+         identifier(native_group)
+-        if type(limit) is not int or not 1 <= limit <= 100 or not isinstance(cursor, str) or (cursor and not cursor.isdecimal()):
+-            raise ValueError('成员分页 limit 须为 1 至 100，cursor 须为非负偏移')
++        start, _, page_key = cursor.partition('.') if isinstance(cursor, str) else ('', '', '')
++        if type(limit) is not int or not 1 <= limit <= 100 or not isinstance(cursor, str) or (cursor and not (start.isdecimal() and page_key)):
++            raise ValueError('成员分页 limit 须为 1 至 100，cursor 须为上一页返回的游标')
+         state = await self._state(bot)
+         if self.pending_writes.get(bot, 0):
+             raise ValueError('群事实持久化中，请稍后从第一页读取')
+         group = state['groups'].get(native_group, {'version': 0, 'members': {}, 'roster': {'complete': False, 'reason': 'unknown_group'}})
+-        if cursor and (generation != self.generation or str(version) != str(group['version'])):
++        if cursor and (
++            generation != self.generation or str(version) != str(group['version']) or page_key != self._page_key(bot, native_group, group['version'])
++        ):
+             raise ValueError('成员快照已变化，请从第一页重新读取')
+         group = self._public_group(bot, group)
+-        rows, offset = list(group['members'].values()), int(cursor or 0)
++        rows, offset = list(group['members'].values()), int(start or 0)
+         return copy.deepcopy(
+             {
+                 'group': native_group,
+@@ -397,7 +516,7 @@ class GroupState:
+                 'version': group['version'],
+                 'roster': {key: value for key, value in group['roster'].items() if key != 'members'},
+                 'members': rows[offset : offset + limit],
+-                'next_cursor': str(offset + limit) if offset + limit < len(rows) else '',
++                'next_cursor': f'{offset + limit}.{self._page_key(bot, native_group, group["version"])}' if offset + limit < len(rows) else '',
+             }
+         )
+ 
+@@ -418,7 +537,7 @@ class GroupState:
+         status = self.recovery.get_status(bot)
+         webhook = self.recovery.get_status(bot, transport='webhook')
+         return (
+-            self.active and status.ready and not status.pending and webhook.context is None and not self.notifications.busy(bot) and bot not in self.failed_bots
++            self.active and status.ready and not status.pending and webhook.context is None and not self.notifications.busy(bot)
+         )
+ 
+     async def fact(self, bot, group, member=None):
+@@ -669,13 +788,17 @@ class GroupState:
+ 
+     async def on_event(self, event):
+         # Facts are observed independently of plugin admission; management is owner-only.
++        observation_error = None
+         if event.group_id and event.event_type not in LIFECYCLE:
+-            await self.observe(event)
++            try:
++                await self.observe(event)
++            except (RuntimeError, sqlite3.Error, OSError) as error:
++                observation_error = error
+         text = (event.content or '').strip()
+-        if event.event_type not in MESSAGE_TYPES or event.is_channel or not (text == '群状态' or text.startswith('群状态 ')):
+-            return event
+         owner_ids = (cfg.get_bot_config(event.appid) or {}).get('owner_ids', [])
+-        if event.user_id not in owner_ids:
++        if event.event_type not in MESSAGE_TYPES or event.is_channel or not (text == '群状态' or text.startswith('群状态 ')) or event.user_id not in owner_ids:
++            if observation_error is not None:
++                raise observation_error
+             return event
+         if any(identity in get_blacklist_map(event.appid, 'user') for identity in (event.user_id, event.raw_user_id)) or event.group_id in get_blacklist_map(
+             event.appid, 'group'
+@@ -685,6 +808,8 @@ class GroupState:
+         if sender is None:
+             return None
+         try:
++            if observation_error is not None:
++                raise observation_error
+             words = text.split()
+             if words == ['群状态', '恢复']:
+                 result = {'ready': await self.rebuild(event.appid)}
+diff --git a/modules/group_state/storage.py b/modules/group_state/storage.py
+index f1c33a4..079d0cc 100644
+--- a/modules/group_state/storage.py
++++ b/modules/group_state/storage.py
+@@ -45,7 +45,22 @@ class ExtensionStore:
+                 return [json.loads(row[0]) for row in cursor.fetchall()] if read else None
+ 
+     async def _execute(self, sql, params, read=False):
+-        return await asyncio.to_thread(self._run, sql, params, read)
++        operation = asyncio.create_task(asyncio.to_thread(self._run, sql, params, read))
++        cancellation: asyncio.CancelledError | None = None
++        # Cancellation cannot stop SQLite's worker. Drain it before callers release
++        # their ordering locks, including when the caller is cancelled repeatedly.
++        while not operation.done():
++            try:
++                await asyncio.shield(operation)
++            except asyncio.CancelledError as error:
++                cancellation = error
++            except Exception:
++                break
++        if cancellation is not None:
++            if not operation.cancelled():
++                operation.exception()
++            raise cancellation
++        return operation.result()
+ 
+     async def ready(self):
+         await self._execute('SELECT 1', ())
+diff --git a/tests/bot_modules/test_group_lifecycle.py b/tests/bot_modules/test_group_lifecycle.py
+index 30b377b..a4aee57 100644
+--- a/tests/bot_modules/test_group_lifecycle.py
++++ b/tests/bot_modules/test_group_lifecycle.py
+@@ -347,3 +347,41 @@ async def test_first_platform_query_after_manual_anchor_detects_new_cycle(group_
+     await state.verify_member('bot-a', 'group-a', 'member-a')
+     record = (await state.fact('bot-a', 'group-a', 'member-a'))['member']
+     assert record['cycle'] != cycle
++
++
++@pytest.mark.parametrize('operation', ['refresh', 'roster', 'member', 'confirm'])
++async def test_candidate_commits_wait_for_consumer_completion(group_host, operation):
++    from test_group_roster import roster_platform
++
++    host = group_host
++    state = host.state
++    roster_platform(host)
++    await state.confirm_member('bot-a', 'group-a', 'member-a', evidence='主人已核验')
++    proof = await state.fact('bot-a', 'group-a', 'member-a')
++    assert state.fact_current(proof)
++    entered, release = asyncio.Event(), asyncio.Event()
++
++    async def consumer(change):
++        assert not state.fact_current(proof)
++        entered.set()
++        await release.wait()
++
++    sub = state.subscribe(consumer)
++    actions = {
++        'refresh': lambda: state.refresh('bot-a', 'group-a'),
++        'roster': lambda: state.sync_roster('bot-a', 'group-a'),
++        'member': lambda: state.verify_member('bot-a', 'group-a', 'member-a'),
++        'confirm': lambda: state.confirm_member('bot-a', 'group-a', 'member-a', evidence='主人重新核验'),
++    }
++    pending = asyncio.create_task(actions[operation]())
++    try:
++        await until(entered.is_set)
++        assert not pending.done()
++        assert not (await state.fact('bot-a', 'group-a', 'member-a'))['usable']
++    finally:
++        release.set()
++    result = await pending
++    assert sub.results[-1].status == 'success'
++    assert result['complete'] if operation == 'roster' else result['reliable']
++    assert (await state.fact('bot-a', 'group-a', 'member-a'))['usable']
++    assert not state.fact_current(proof)
+diff --git a/tests/bot_modules/test_group_roster.py b/tests/bot_modules/test_group_roster.py
+index 1ec2063..25b9f3c 100644
+--- a/tests/bot_modules/test_group_roster.py
++++ b/tests/bot_modules/test_group_roster.py
+@@ -146,7 +146,7 @@ async def test_missing_or_conflicting_bot_and_member_fields_fail_closed(group_ho
+     assert not (await response.json())['data']['complete']
+ 
+ 
+-async def test_failed_durable_update_cannot_leave_a_complete_in_memory_proof(group_host):
++async def test_failed_durable_update_keeps_roster_unproven_until_retry(group_host):
+     import sqlite3
+ 
+     host = group_host
+@@ -158,7 +158,13 @@ async def test_failed_durable_update_cannot_leave_a_complete_in_memory_proof(gro
+             BEGIN SELECT RAISE(ABORT, 'fake persistence failure'); END""")
+     response = await host.api('POST', 'roster', body={'group': 'group-a'})
+     assert response.status == 503
+-    assert (await host.api()).status == 503
++    failed = (await (await host.api()).json())['data']['groups'][0]
++    assert not failed['roster']['complete'] and failed['roster']['reason'] == 'persistence_failed'
++    assert not any(member['reliable'] for member in failed['members'].values())
++    with sqlite3.connect(path) as connection:
++        connection.execute('DROP TRIGGER fail_complete')
++    retried = (await (await host.api('POST', 'roster', body={'group': 'group-a'})).json())['data']
++    assert retried['complete'] and retried['version'] > failed['version']
+ 
+ 
+ async def test_pending_durable_update_does_not_publish_complete_roster(group_host):
+@@ -240,3 +246,97 @@ async def test_stale_bot_refresh_cannot_publish_another_queries_uncommitted_proo
+         await refresh
+         if roster:
+             await roster
++
++
++@pytest.mark.parametrize('path', ['roster', 'member', 'confirm-member'])
++async def test_unload_during_final_write_cannot_publish_complete_or_reliable_facts(group_host, path):
++    import asyncio
++    import sqlite3
++    import threading
++    import time
++
++    host = group_host
++    roster_platform(host)
++    await host.state.snapshot('bot-a')
++    blocker = sqlite3.connect(host.modules.get_context('group_state').get_data_path('group-state.db'), check_same_thread=False)
++    entered = asyncio.Event()
++
++    async def lock_final_write(path, cursor):
++        if path.endswith(('/bot_state', '/members/member-a')):
++            blocker.execute('BEGIN IMMEDIATE')
++            entered.set()
++
++    host.sender.after_json = lock_final_write
++    body = {'group': 'group-a'} if path == 'roster' else {'group': 'group-a', 'member': 'member-a'}
++    if path == 'confirm-member':
++        body.update(evidence='fake owner checked', member_role='member')
++        blocker.execute('BEGIN IMMEDIATE')
++        entered.set()
++    operation = asyncio.create_task(host.api('POST', path, body=body))
++    await asyncio.wait_for(entered.wait(), 3)
++    await asyncio.sleep(0.05)
++    # Release from another thread: the close below waits for the same SQLite worker.
++    release = threading.Thread(target=lambda: (time.sleep(0.2), blocker.commit(), blocker.close()))
++    release.start()
++    await host.modules.disable('group_state', _persist=False)
++    response = await operation
++    release.join()
++    assert response.status == 503
++
++
++@pytest.mark.parametrize('method', ['snapshot', 'members'])
++async def test_read_queued_across_unload_returns_no_old_proof(group_host, method):
++    import asyncio
++
++    host = group_host
++    roster_platform(host)
++    old = host.state
++    assert (await old.sync_roster('bot-a', 'group-a'))['complete']
++    lock = old.load_locks['bot-a']
++    await lock.acquire()
++    operation = asyncio.create_task(old.snapshot('bot-a') if method == 'snapshot' else old.members('bot-a', 'group-a'))
++    await asyncio.sleep(0)
++    await host.modules.disable('group_state', _persist=False)
++    lock.release()
++    with pytest.raises(RuntimeError):
++        await operation
++
++
++@pytest.mark.parametrize('target', [('bot-a', 'group-b'), ('bot-b', 'group-a')])
++async def test_member_cursor_continues_only_its_own_bot_and_group(group_host, target):
++    host = group_host
++    for bot, group in {('bot-a', 'group-a'), target}:
++        for n in range(2):
++            await host.state.confirm_member(bot, group, f'{bot}-{group}-{n}', evidence='fake owner checked')
++    first = await host.state.members('bot-a', 'group-a', limit=1)
++    other = await host.state.members(*target, limit=1)
++    assert other['version'] == first['version'] and other['generation'] == first['generation']
++    with pytest.raises(ValueError, match='快照已变化'):
++        await host.state.members(*target, cursor=first['next_cursor'], version=first['version'], generation=first['generation'], limit=1)
++    with pytest.raises(ValueError, match='cursor'):
++        await host.state.members('bot-a', 'group-a', cursor='1', version=first['version'], generation=first['generation'])
++    second = await host.state.members('bot-a', 'group-a', cursor=first['next_cursor'], version=first['version'], generation=first['generation'], limit=1)
++    assert [m['member'] for m in second['members']] == ['bot-a-group-a-1']
++
++
++async def test_cancelled_roster_query_ends_without_in_progress_markers(group_host):
++    import asyncio
++
++    host = group_host
++    roster_platform(host)
++    await host.state.confirm_member('bot-a', 'group-a', 'member-a', evidence='fake owner checked')
++    entered = asyncio.Event()
++
++    async def hold(path, cursor):
++        entered.set()
++        await asyncio.Event().wait()
++
++    host.sender.after_json = hold
++    operation = asyncio.create_task(host.state.sync_roster('bot-a', 'group-a'))
++    await asyncio.wait_for(entered.wait(), 3)
++    operation.cancel()
++    with pytest.raises(asyncio.CancelledError):
++        await operation
++    group = (await host.state.snapshot('bot-a'))['groups'][0]
++    assert not group['roster']['complete'] and group['roster']['reason'] == 'roster_cancelled'
++    assert group['members']['member-a']['reason'] == 'roster_cancelled' and not group['members']['member-a']['reliable']
+diff --git a/tests/bot_modules/test_group_state.py b/tests/bot_modules/test_group_state.py
+index 8257387..d1b65e0 100644
+--- a/tests/bot_modules/test_group_state.py
++++ b/tests/bot_modules/test_group_state.py
+@@ -1,8 +1,24 @@
+ """Independent module installation and owner management behavior."""
+ 
++import asyncio
++import json
++import shutil
++import sqlite3
++import subprocess
++import threading
++from pathlib import Path
++
+ import pytest
+ 
+ 
++def test_group_state_page_request_ordering():
++    node = shutil.which('node')
++    if node is None:
++        pytest.skip('页面脚本回归需要 Node.js；不使用额外 npm 依赖')
++    result = subprocess.run([node, '--test', str(Path(__file__).with_name('test_group_state_page.cjs'))], capture_output=True, text=True, timeout=15)
++    assert result.returncode == 0, result.stdout + result.stderr
++
++
+ async def test_independent_known_groups_owner_entry_refresh_and_restart(group_host):
+     host = group_host
+     assert (await host.api(authenticated=False)).status == 401
+@@ -75,3 +91,441 @@ async def test_refresh_completion_changes_snapshot_version(group_host):
+     assert pending[0]['groups'][0]['status'] == 'pending'
+     assert final['version'] > pending[0]['version']
+     assert final['groups'][0]['version'] > pending[0]['groups'][0]['version']
++
++
++@pytest.mark.parametrize('entry', ['http', 'qq'])
++async def test_failed_commit_keeps_previous_bot_state_untrusted_until_retry(group_host, entry):
++    host = group_host
++    host.sender.response = ({'member_role': 'member', 'recv_msg_setting': 'all', 'allow_proactive_msg': False}, None)
++    await host.api('POST', 'refresh', body={'group': 'group-a'})
++    database = host.modules.get_context('group_state').get_data_path('group-state.db')
++    with sqlite3.connect(database) as connection:
++        connection.execute("""CREATE TRIGGER reject_verified BEFORE INSERT ON extension_records
++            WHEN EXISTS (SELECT 1 FROM json_each(NEW.payload, '$.groups') WHERE json_extract(value, '$.reliable') = 1)
++            BEGIN SELECT RAISE(ABORT, 'fake disk failure'); END""")
++    host.sender.response = ({'member_role': 'admin', 'recv_msg_setting': 'all', 'allow_proactive_msg': True}, None)
++    if entry == 'http':
++        response = await host.api('POST', 'refresh', body={'group': 'group-a'})
++        assert response.status == 503
++    else:
++        await host.event('群状态 刷新 group-a')
++        assert '存储暂不可用' in host.sender.messages[-1][2]
++    failed = (await (await host.api()).json())['data']['groups'][0]
++    assert not failed['reliable']
++    assert failed['status'] == 'historical' and failed['reason'] == 'persistence_failed'
++    assert failed['bot_state']['member_role'] == 'member'
++    assert (await (await host.api(bot='bot-b')).json())['data']['groups'] == []
++    with sqlite3.connect(database) as connection:
++        connection.execute('DROP TRIGGER reject_verified')
++    result = (await (await host.api('POST', 'refresh', body={'group': 'group-a'})).json())['data']
++    assert result['reliable'] and result['bot_state']['member_role'] == 'admin'
++    assert result['version'] > failed['version']
++
++
++@pytest.mark.parametrize('observed_group', ['', 'group-a', 'group-b'])
++async def test_pending_commit_does_not_publish_or_overwrite_new_observations(group_host, observed_group):
++    host = group_host
++    entered = asyncio.Event()
++    database = host.modules.get_context('group_state').get_data_path('group-state.db')
++    blocker = sqlite3.connect(database)
++
++    async def lock_final_write():
++        blocker.execute('BEGIN IMMEDIATE')
++        entered.set()
++
++    host.sender.after_query = lock_final_write
++    pending = asyncio.create_task(host.api('POST', 'refresh', body={'group': 'group-a'}))
++    observation = None
++    try:
++        await asyncio.wait_for(entered.wait(), 2)
++        during = (await (await host.api()).json())['data']
++        assert not during['groups'][0]['reliable'] and during['groups'][0]['status'] == 'pending'
++        if observed_group:
++            observation = asyncio.create_task(host.event('普通消息', user='member-a', group=observed_group))
++            await asyncio.sleep(0)
++            observed = (await (await host.api()).json())['data']
++            assert any(group['group'] == observed_group and group['source'] == 'native_event' for group in observed['groups'])
++    finally:
++        blocker.rollback()
++        blocker.close()
++        response = await pending
++        if observation:
++            await observation
++    result = (await response.json())['data']
++    final = (await (await host.api()).json())['data']
++    if observed_group == 'group-a':
++        assert not result['reliable'] and result['reason'] == 'state_changed'
++        assert final['groups'][0]['source'] == 'native_event' and not final['groups'][0]['reliable']
++    else:
++        assert final['version'] > during['version']
++        if observed_group:
++            # G03 also gates public results while another group in this Bot is persisting.
++            assert not result['reliable'] and result['reason'] == 'persistence_pending'
++        else:
++            assert result['reliable']
++        assert final['groups'][0]['reliable']
++        assert final['groups'][0]['version'] > during['groups'][0]['version']
++    if observed_group == 'group-b':
++        assert [group['group'] for group in final['groups']] == ['group-a', 'group-b']
++    assert await host.modules.reload('group_state')
++    restored = (await (await host.api()).json())['data']
++    assert [group['group'] for group in restored['groups']] == [group['group'] for group in final['groups']]
++    assert all(not group['reliable'] for group in restored['groups'])
++
++
++@pytest.mark.parametrize('command', ['群状态', '群状态 刷新 group-a'])
++async def test_group_owner_command_reports_observation_storage_failure_and_can_retry(group_host, command):
++    host = group_host
++    previous = (await (await host.api('POST', 'refresh', body={'group': 'group-a'})).json())['data']
++    other_bot = await host.state.snapshot('bot-b')
++    database = host.modules.get_context('group_state').get_data_path('group-state.db')
++    with sqlite3.connect(database) as connection:
++        connection.execute("""CREATE TRIGGER reject_observation BEFORE INSERT ON extension_records
++            WHEN NEW.bot = 'bot-a' BEGIN SELECT RAISE(ABORT, 'fake disk failure'); END""")
++    try:
++        host.sender.messages.clear()
++        await host.event(command, group='group-a')
++        assert host.sender.messages == [('bot-a', 'group-a', '群状态存储暂不可用，请检查后台')]
++        failed = (await (await host.api()).json())['data']['groups'][0]
++        assert not failed['reliable'] and failed['status'] == 'historical'
++        assert failed['reason'] == 'persistence_failed' and failed['source'] == 'native_event'
++        assert failed['bot_state'] == previous['bot_state'] and failed['version'] > previous['version']
++        assert await host.state.snapshot('bot-b') == other_bot
++    finally:
++        with sqlite3.connect(database) as connection:
++            connection.execute('DROP TRIGGER reject_observation')
++    host.sender.messages.clear()
++    await host.event('群状态 刷新 group-a', group='group-a')
++    assert len(host.sender.messages) == 1 and '已处理' in host.sender.messages[0][2]
++    assert (await host.state.snapshot('bot-a'))['groups'][0]['reliable']
++
++
++async def test_observation_storage_failure_preserves_admission_and_message_dispatch(group_host):
++    from core.application import get_app
++    from core.plugin._blacklist import get_blacklist_map, set_blacklist_map
++
++    host = group_host
++    await host.event('ordinary', group='group-a', user='member-a')
++    database = host.modules.get_context('group_state').get_data_path('group-state.db')
++    downstream = []
++
++    async def receive(event):
++        downstream.append((event.appid, event.user_id, event.content))
++        return event
++
++    get_app().hook_manager.register('before_event', receive, owner='observation-failure-test', priority=20)
++    with sqlite3.connect(database) as connection:
++        connection.execute("""CREATE TRIGGER reject_observation BEFORE INSERT ON extension_records
++            WHEN NEW.bot = 'bot-a' BEGIN SELECT RAISE(ABORT, 'fake disk failure'); END""")
++    users = get_blacklist_map('bot-a', 'user')
++    try:
++        host.sender.messages.clear()
++        await host.event('ordinary', group='group-a', user='member-a')
++        await host.event('群状态', group='group-a', user='member-a')
++        await host.event('群状态', bot='bot-b', group='group-b', user='owner-a')
++        assert downstream == [('bot-a', 'member-a', 'ordinary'), ('bot-a', 'member-a', '群状态'), ('bot-b', 'owner-a', '群状态')]
++        assert host.sender.messages == []
++        set_blacklist_map('bot-a', 'user', {**users, 'owner-a': 'test denial'})
++        await host.event('群状态', group='group-a')
++        assert len(downstream) == 3 and host.sender.messages == []
++        assert (await host.state.snapshot('bot-a'))['groups'][0]['reason'] == 'persistence_failed'
++    finally:
++        set_blacklist_map('bot-a', 'user', users)
++        get_app().hook_manager.unregister_owner('observation-failure-test')
++        with sqlite3.connect(database) as connection:
++            connection.execute('DROP TRIGGER reject_observation')
++
++
++@pytest.mark.parametrize('newer_action', ['observe', 'refresh'])
++async def test_late_observation_save_failure_preserves_newer_same_group_facts(group_host, monkeypatch, newer_action):
++    host = group_host
++    await host.api('POST', 'refresh', body={'group': 'group-a'})
++    entered, release = threading.Event(), threading.Event()
++    attempts = []
++    connect = sqlite3.connect
++
++    def fail_first_write():
++        attempts.append(True)
++        if len(attempts) == 1:
++            entered.set()
++            if not release.wait(2):
++                raise RuntimeError('fake storage scheduling timeout')
++            return 1
++        return 0
++
++    def test_connection(*args, **kwargs):
++        connection = connect(*args, **kwargs)
++        connection.create_function('audit_fail_first_write', 0, fail_first_write)
++        return connection
++
++    monkeypatch.setattr(sqlite3, 'connect', test_connection)
++    assert await host.modules.reload('group_state')
++    assert await host.state.rebuild('bot-a')
++    database = host.modules.get_context('group_state').get_data_path('group-state.db')
++    with sqlite3.connect(database) as connection:
++        connection.execute("""CREATE TRIGGER fail_first_observation BEFORE INSERT ON extension_records
++            WHEN audit_fail_first_write() = 1 BEGIN SELECT RAISE(ABORT, 'fake disk failure'); END""")
++    old = asyncio.create_task(host.event('old observation', group='group-a', user='member-a'))
++    newer = None
++    try:
++        assert await asyncio.to_thread(entered.wait, 2)
++        before = await host.state.snapshot('bot-a')
++        newer = asyncio.create_task(
++            host.state.refresh('bot-a', 'group-a') if newer_action == 'refresh' else host.event('new observation', group='group-a', user='member-b')
++        )
++        await asyncio.sleep(0)
++        assert (await host.state.snapshot('bot-a'))['version'] > before['version']
++    finally:
++        release.set()
++        await old
++        if newer is not None:
++            await newer
++        with sqlite3.connect(database) as connection:
++            connection.execute('DROP TRIGGER fail_first_observation')
++    fact = (await host.state.snapshot('bot-a'))['groups'][0]
++    if newer_action == 'refresh':
++        assert fact['reliable'] and fact['status'] == 'verified' and fact['reason'] == ''
++    else:
++        assert not fact['reliable'] and fact['reason'] == 'observed_event_requires_refresh'
++
++
++async def test_initial_save_failure_ends_refresh_and_allows_retry(group_host):
++    host = group_host
++    previous = (await (await host.api('POST', 'refresh', body={'group': 'group-a'})).json())['data']
++    database = host.modules.get_context('group_state').get_data_path('group-state.db')
++    with sqlite3.connect(database) as connection:
++        connection.execute("""CREATE TRIGGER reject_all BEFORE INSERT ON extension_records
++            BEGIN SELECT RAISE(ABORT, 'fake disk failure'); END""")
++    try:
++        assert (await host.api('POST', 'refresh', body={'group': 'group-a'})).status == 503
++        failed = (await (await host.api()).json())['data']['groups'][0]
++        assert failed['status'] == 'historical' and failed['reason'] == 'persistence_failed'
++        assert not failed['reliable'] and failed['bot_state'] == previous['bot_state']
++        assert failed['version'] > previous['version']
++        assert (await (await host.api(bot='bot-b')).json())['data']['groups'] == []
++    finally:
++        with sqlite3.connect(database) as connection:
++            connection.execute('DROP TRIGGER reject_all')
++    retried = (await (await host.api('POST', 'refresh', body={'group': 'group-a'})).json())['data']
++    assert retried['reliable'] and retried['version'] > failed['version']
++
++
++@pytest.mark.parametrize('observed_group', ['', 'group-a', 'group-b'])
++async def test_cancelled_query_ends_refresh_without_overwriting_new_facts(group_host, observed_group):
++    host = group_host
++    previous = (await (await host.api('POST', 'refresh', body={'group': 'group-a'})).json())['data']
++    entered = asyncio.Event()
++
++    async def wait_for_cancellation():
++        entered.set()
++        await asyncio.Event().wait()
++
++    host.sender.after_query = wait_for_cancellation
++    pending = asyncio.create_task(host.state.refresh('bot-a', 'group-a'))
++    try:
++        await asyncio.wait_for(entered.wait(), 2)
++        during = await host.state.snapshot('bot-a')
++        if observed_group:
++            await host.event('普通消息', user='member-a', group=observed_group)
++    finally:
++        pending.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await pending
++    ended = await host.state.snapshot('bot-a')
++    fact = ended['groups'][0]
++    assert not fact['reliable'] and fact['status'] == 'historical'
++    assert fact['bot_state'] == previous['bot_state']
++    assert ended['version'] > during['version']
++    if observed_group == 'group-a':
++        assert fact['reason'] == 'observed_event_requires_refresh' and fact['source'] == 'native_event'
++    else:
++        assert fact['reason'] == 'refresh_cancelled'
++    assert [group['group'] for group in ended['groups']] == (['group-a', 'group-b'] if observed_group == 'group-b' else ['group-a'])
++    assert (await host.state.snapshot('bot-b'))['groups'] == []
++    host.sender.after_query = None
++    assert (await host.state.refresh('bot-a', 'group-a'))['reliable']
++
++
++@pytest.mark.parametrize('role', [[], {}])
++@pytest.mark.parametrize('entry', ['http', 'qq'])
++async def test_malformed_platform_role_is_a_historical_error(group_host, role, entry):
++    host = group_host
++    previous = (await (await host.api('POST', 'refresh', body={'group': 'group-a'})).json())['data']
++    host.sender.response = ({'member_role': role, 'recv_msg_setting': 'all', 'allow_proactive_msg': True}, None)
++    if entry == 'http':
++        response = await host.api('POST', 'refresh', body={'group': 'group-a'})
++        assert response.status == 200
++        result = (await response.json())['data']
++    else:
++        host.sender.messages.clear()
++        await host.event('群状态 刷新 group-a')
++        assert len(host.sender.messages) == 1
++        result = json.loads(host.sender.messages[-1][2].split('\n', 1)[1])
++    assert not result['reliable'] and result['status'] == 'historical'
++    assert result['reason'] == 'response_unknown' and result['bot_state'] == previous['bot_state']
++    assert (await host.state.snapshot('bot-a'))['groups'][0] == result
++
++
++async def test_reload_during_final_commit_rejects_old_http_result(group_host, monkeypatch):
++    host = group_host
++    entered, release = asyncio.Event(), asyncio.Event()
++    old = host.state
++    original = old.store.put
++
++    async def delayed_return(bot, collection, key, record):
++        await original(bot, collection, key, record)
++        if record['groups']['group-a']['reliable']:
++            entered.set()
++            await release.wait()
++
++    monkeypatch.setattr(old.store, 'put', delayed_return)
++    pending = asyncio.create_task(host.api('POST', 'refresh', body={'group': 'group-a'}))
++    try:
++        await asyncio.wait_for(entered.wait(), 2)
++        assert await host.modules.reload('group_state')
++        current = (await (await host.api()).json())['data']
++        assert not current['groups'][0]['reliable'] and current['groups'][0]['reason'] == 'process_restart'
++    finally:
++        release.set()
++        response = await pending
++    assert response.status == 503
++    with pytest.raises(RuntimeError):
++        await old.snapshot('bot-a')
++
++
++@pytest.mark.parametrize('entry', ['http', 'snapshot'])
++@pytest.mark.parametrize('lifecycle', ['disable', 'reload'])
++async def test_cold_and_queued_reads_are_rejected_across_unload(group_host, monkeypatch, entry, lifecycle):
++    host = group_host
++    await host.state.refresh('bot-a', 'group-a')
++    entered, release = threading.Event(), threading.Event()
++    connect = sqlite3.connect
++
++    class DelayedReadConnection(sqlite3.Connection):
++        def execute(self, sql, parameters=()):
++            cursor = super().execute(sql, parameters)
++            if sql.startswith('SELECT payload') and parameters[0] == 'bot-a':
++                entered.set()
++                if not release.wait(3):
++                    raise RuntimeError('fake storage scheduling timeout')
++            return cursor
++
++    def test_connection(*args, **kwargs):
++        return connect(*args, **kwargs, factory=DelayedReadConnection)
++
++    monkeypatch.setattr(sqlite3, 'connect', test_connection)
++    assert await host.modules.reload('group_state')
++    old = host.state
++
++    async def read():
++        return await host.api() if entry == 'http' else await old.snapshot('bot-a')
++
++    first = asyncio.create_task(read())
++    queued = transition = None
++    try:
++        assert await asyncio.to_thread(entered.wait, 2)
++        queued = asyncio.create_task(old.snapshot('bot-a'))
++        await asyncio.sleep(0)
++        assert not queued.done()
++        transition = asyncio.create_task(host.modules.reload('group_state') if lifecycle == 'reload' else host.modules.disable('group_state', _persist=False))
++        await asyncio.sleep(0)
++        assert (await host.api()).status == 404
++    finally:
++        release.set()
++        results = await asyncio.gather(first, *([queued] if queued is not None else []), return_exceptions=True)
++        if transition is not None:
++            assert await transition
++    assert len(results) == 2
++    if entry == 'http':
++        assert results[0].status == 503
++        assert (await results[0].json())['success'] is False
++    else:
++        assert isinstance(results[0], RuntimeError)
++    assert isinstance(results[1], RuntimeError)
++    with pytest.raises(RuntimeError):
++        await old.snapshot('bot-a')
++    if lifecycle == 'disable':
++        assert (await host.api()).status == 404
++        assert await host.modules.enable('group_state', _skip_deps=True, _persist=False)
++    current = await host.state.snapshot('bot-a')
++    assert current['generation'] != old.generation
++    assert current['groups'][0]['group'] == 'group-a'
++    assert not current['groups'][0]['reliable'] and current['groups'][0]['reason'] == 'process_restart'
++    pending = await host.state.refresh('bot-a', 'group-a')
++    assert not pending['reliable'] and pending['continuity_reason'] == 'recovery_pending'
++    assert await host.state.rebuild('bot-a')
++    assert (await host.state.refresh('bot-a', 'group-a'))['reliable']
++
++
++async def test_disable_allows_event_loop_to_run_while_sqlite_finishes(group_host, monkeypatch):
++    host = group_host
++    entered, release = threading.Event(), threading.Event()
++    released_before_timeout = []
++    connect = sqlite3.connect
++
++    def pause_write():
++        entered.set()
++        released_before_timeout.append(release.wait(2))
++        return 1
++
++    def test_connection(*args, **kwargs):
++        connection = connect(*args, **kwargs)
++        connection.create_function('audit_pause', 0, pause_write)
++        return connection
++
++    monkeypatch.setattr(sqlite3, 'connect', test_connection)
++    assert await host.modules.reload('group_state')
++    database = host.modules.get_context('group_state').get_data_path('group-state.db')
++    with sqlite3.connect(database) as connection:
++        connection.execute("""CREATE TRIGGER delay_verified BEFORE INSERT ON extension_records
++            WHEN EXISTS (SELECT 1 FROM json_each(NEW.payload, '$.groups') WHERE json_extract(value, '$.reliable') = 1)
++            BEGIN SELECT audit_pause(); END""")
++    pending = asyncio.create_task(host.api('POST', 'refresh', body={'group': 'group-a'}))
++    try:
++        assert await asyncio.to_thread(entered.wait, 2)
++        asyncio.get_running_loop().call_later(0.01, release.set)
++        assert await host.modules.disable('group_state', _persist=False)
++    finally:
++        release.set()
++        response = await pending
++    assert released_before_timeout == [True]
++    assert response.status == 503
++    assert (await host.api()).status == 404
++
++
++@pytest.mark.parametrize('cancellations', [1, 2])
++async def test_cancelled_refresh_finishes_its_write_before_new_facts_are_saved(group_host, monkeypatch, cancellations):
++    host = group_host
++    entered, release = threading.Event(), threading.Event()
++    original = host.state.store._run
++
++    def pause_before_database_lock(sql, params, read):
++        # Fix thread scheduling at the SQLite boundary while retaining real writes.
++        if sql.startswith('INSERT') and json.loads(params[3])['groups']['group-a']['reliable']:
++            entered.set()
++            if not release.wait(2):
++                raise RuntimeError('fake storage scheduling timeout')
++        return original(sql, params, read)
++
++    monkeypatch.setattr(host.state.store, '_run', pause_before_database_lock)
++    pending = asyncio.create_task(host.state.refresh('bot-a', 'group-a'))
++    observation = None
++    try:
++        assert await asyncio.to_thread(entered.wait, 2)
++        for _ in range(cancellations):
++            pending.cancel()
++            await asyncio.sleep(0)
++        observation = asyncio.create_task(host.event('普通消息', user='member-a', group='group-b'))
++        during = (await (await host.api()).json())['data']
++        assert not during['groups'][0]['reliable']
++        assert not pending.done()  # Cancellation must drain the underlying write.
++    finally:
++        release.set()
++        with pytest.raises(asyncio.CancelledError):
++            await pending
++        if observation:
++            await observation
++    assert await host.modules.reload('group_state')
++    restored = (await (await host.api()).json())['data']
++    assert [group['group'] for group in restored['groups']] == ['group-a', 'group-b']
++    assert all(not group['reliable'] for group in restored['groups'])
+diff --git a/tests/bot_modules/test_group_state_audit.py b/tests/bot_modules/test_group_state_audit.py
+new file mode 100644
+index 0000000..3d6a38c
+--- /dev/null
++++ b/tests/bot_modules/test_group_state_audit.py
+@@ -0,0 +1,147 @@
++"""Persistence failure boundaries through public group-state operations and real SQLite."""
++
++import asyncio
++import sqlite3
++
++import pytest
++from test_group_roster import roster_platform
++
++
++async def wait_until(predicate):
++    async def poll():
++        while not predicate():
++            await asyncio.sleep(0.001)
++    await asyncio.wait_for(poll(), 3)
++
++
++async def complete_roster(host):
++    roster_platform(host)
++    assert (await host.state.snapshot('bot-b'))['groups'] == []
++    assert (await (await host.api('POST', 'roster', body={'group': 'group-a'})).json())['data']['complete']
++    return await host.state.members('bot-a', 'group-a', limit=1)
++
++
++async def assert_retired(host, earlier):
++    group = next(g for g in (await host.state.snapshot('bot-a'))['groups'] if g['group'] == 'group-a')
++    assert not group['roster']['complete']
++    assert not group['members']['member-a']['reliable']
++    assert group['members']['member-a']['member_role'] == 'member'
++    assert group['version'] > earlier['version']
++    with pytest.raises(ValueError):
++        await host.state.members('bot-a', 'group-a', cursor=earlier['next_cursor'], version=earlier['version'], generation=earlier['generation'])
++    return group
++
++
++async def test_failed_confirmation_retires_old_proof_until_new_roster(group_host):
++    host = group_host
++    earlier = await complete_roster(host)
++    path = host.modules.get_context('group_state').get_data_path('group-state.db')
++    with sqlite3.connect(path) as db:
++        db.execute("CREATE TRIGGER fail_confirmation BEFORE INSERT ON extension_records BEGIN SELECT RAISE(ABORT, 'fake disk failure'); END")
++    try:
++        response = await host.api('POST', 'confirm-member', body={'group': 'group-a', 'member': 'member-a', 'evidence': '主人核对角色变化', 'member_role': 'owner'})
++        assert response.status == 503
++        group = await assert_retired(host, earlier)
++        assert group['members']['member-a']['reason'] == 'persistence_failed'
++    finally:
++        with sqlite3.connect(path) as db:
++            db.execute('DROP TRIGGER fail_confirmation')
++    retry = await host.api('POST', 'confirm-member', body={'group': 'group-a', 'member': 'member-a', 'evidence': '主人重新核对', 'member_role': 'owner'})
++    result = (await retry.json())['data']
++    assert result['reliable'] and result['member_role'] == 'owner'
++    assert not (await host.state.snapshot('bot-a'))['groups'][0]['roster']['complete']
++    assert (await host.state.snapshot('bot-b'))['groups'] == []
++    assert (await host.state.sync_roster('bot-a', 'group-a'))['complete']
++
++
++@pytest.mark.parametrize('cancelled', [False, True])
++async def test_confirmation_wait_and_cancel_never_publish_old_proof(group_host, cancelled):
++    host = group_host
++    earlier = await complete_roster(host)
++    blocker = sqlite3.connect(host.modules.get_context('group_state').get_data_path('group-state.db'))
++    blocker.execute('BEGIN IMMEDIATE')
++    operation = asyncio.create_task(host.state.confirm_member('bot-a', 'group-a', 'member-a', evidence='主人核对角色', member_role='owner'))
++    try:
++        await wait_until(lambda: host.state.pending_writes.get('bot-a'))
++        await assert_retired(host, earlier)
++        if cancelled:
++            operation.cancel()
++            await asyncio.sleep(0.01)
++            assert not operation.done()  # SQLite's real worker still owns the write order.
++    finally:
++        blocker.commit()
++        blocker.close()
++        if cancelled:
++            with pytest.raises(asyncio.CancelledError):
++                await operation
++        else:
++            assert (await operation)['reliable']
++    if cancelled:
++        group = await assert_retired(host, earlier)
++        assert group['members']['member-a']['status'] == 'historical'
++        assert group['members']['member-a']['reason'] == 'confirmation_cancelled'
++        assert await host.modules.reload('group_state')
++        restored = (await host.state.snapshot('bot-a'))['groups'][0]
++        assert not restored['roster']['complete'] and not restored['members']['member-a']['reliable']
++
++
++@pytest.mark.parametrize('operation', ['refresh', 'roster', 'member'])
++async def test_cancelling_initial_queued_write_ends_current_operation(group_host, operation):
++    host = group_host
++    earlier = await complete_roster(host)
++    blocker = sqlite3.connect(host.modules.get_context('group_state').get_data_path('group-state.db'))
++    blocker.execute('BEGIN IMMEDIATE')
++    first = asyncio.create_task(host.state.refresh('bot-a', 'group-blocker'))
++    second = None
++    try:
++        await wait_until(lambda: host.state.pending_writes.get('bot-a'))
++        method = {'refresh': host.state.refresh, 'roster': host.state.sync_roster, 'member': host.state.verify_member}[operation]
++        args = ('bot-a', 'group-a', 'member-a') if operation == 'member' else ('bot-a', 'group-a')
++        second = asyncio.create_task(method(*args))
++        await wait_until(lambda: host.state.pending_writes.get('bot-a', 0) >= 2)
++        second.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await second
++    finally:
++        blocker.commit()
++        blocker.close()
++        await first
++        if second is not None and not second.done():
++            second.cancel()
++            await asyncio.gather(second, return_exceptions=True)
++    group = next(g for g in (await host.state.snapshot('bot-a'))['groups'] if g['group'] == 'group-a')
++    assert not group['roster']['complete'] and group['version'] > earlier['version']
++    if operation == 'refresh':
++        assert group['status'] == 'historical' and group['reason'] == 'refresh_cancelled'
++    elif operation == 'roster':
++        assert group['roster']['reason'] == 'roster_cancelled'
++        assert group['members']['member-a']['reason'] == 'roster_cancelled'
++    else:
++        record = group['members']['member-a']
++        assert record['status'] == 'historical' and record['reason'] == 'verification_cancelled'
++    assert (await host.state.snapshot('bot-b'))['groups'] == []
++
++
++
++async def test_cancelled_confirmation_preserves_newer_same_group_observation(group_host):
++    host = group_host
++    earlier = await complete_roster(host)
++    blocker = sqlite3.connect(host.modules.get_context('group_state').get_data_path('group-state.db'))
++    blocker.execute('BEGIN IMMEDIATE')
++    operation = asyncio.create_task(host.state.confirm_member('bot-a', 'group-a', 'member-a', evidence='主人核对角色', member_role='owner'))
++    observation = None
++    try:
++        await wait_until(lambda: host.state.pending_writes.get('bot-a'))
++        observation = asyncio.create_task(host.event('新的群消息', user='member-new', group='group-a'))
++        await wait_until(lambda: host.state.pending_writes.get('bot-a', 0) >= 2)
++        operation.cancel()
++    finally:
++        blocker.commit()
++        blocker.close()
++        with pytest.raises(asyncio.CancelledError):
++            await operation
++        if observation is not None:
++            await observation
++    group = await assert_retired(host, earlier)
++    assert group['source'] == 'native_event' and group['reason'] == 'observed_event_requires_refresh'
++    assert group['members']['member-new']['reason'] == 'requires_verification'
+diff --git a/tests/bot_modules/test_group_state_page.cjs b/tests/bot_modules/test_group_state_page.cjs
+new file mode 100644
+index 0000000..ce82ac4
+--- /dev/null
++++ b/tests/bot_modules/test_group_state_page.cjs
+@@ -0,0 +1,184 @@
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const path = require('node:path');
++const test = require('node:test');
++const vm = require('node:vm');
++const {setImmediate: tick} = require('node:timers/promises');
++
++// Run the shipped page script, replacing only the DOM and network boundaries.
++async function page() {
++    const html = fs.readFileSync(path.join(__dirname, '../../modules/group_state/page.html'), 'utf8');
++    const nodes = {};
++    for (const [, id] of html.matchAll(/id="([^"]+)"/g)) {
++        nodes[id] = {
++            value: id === 'gs-group' ? 'group-a' : '', textContent: '', disabled: false, options: [],
++            append(option) {
++                this.options.push(option);
++                if (!this.value) this.value = option.value;
++            },
++        };
++    }
++    const requests = [];
++    vm.runInNewContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], {
++        document: {getElementById: id => nodes[id], createElement: () => ({})}, URLSearchParams,
++        fetch: (url, options) => url === '/api/bots'
++            ? Promise.resolve({json: async () => ({data: {bots: [{appid: 'bot-a'}, {appid: 'bot-b'}]}})})
++            : new Promise((resolve, reject) => requests.push({url, options, resolve, reject})),
++    });
++    await tick();
++    return {
++        nodes, requests,
++        output: () => nodes['gs-output'].textContent,
++        async reply(request, data) {
++            request.resolve({ok: true, json: async () => ({success: true, data})});
++            await tick();
++        },
++    };
++}
++
++test('an earlier GET cannot restore verified facts after a failed refresh', async () => {
++    const host = await page();
++    const earlier = host.requests[0];
++    host.nodes['gs-refresh'].onclick();
++    const latest = {group: 'group-a', version: 4, reliable: false, status: 'historical', reason: 'permission_denied'};
++    await host.reply(host.requests.at(-1), latest);
++    assert.deepEqual(JSON.parse(host.output()), latest);
++    await host.reply(earlier, {bot: 'bot-a', version: 3, groups: [{group: 'group-a', reliable: true}]});
++    assert.deepEqual(JSON.parse(host.output()), latest);
++});
++
++test('changing Bot clears old facts and loads only the selected Bot', async () => {
++    const host = await page();
++    await host.reply(host.requests[0], {bot: 'bot-a', groups: [{reliable: true}]});
++    host.nodes['gs-load'].onclick();
++    const earlier = host.requests.at(-1);
++    host.nodes['gs-bot'].value = 'bot-b';
++    host.nodes['gs-bot'].onchange?.();
++    assert.equal(host.output(), '');
++    const selected = host.requests.at(-1);
++    assert.match(selected.url, /bot=bot-b$/);
++    await host.reply(earlier, {bot: 'bot-a', groups: [{reliable: true}]});
++    assert.equal(host.output(), '');
++    const latest = {bot: 'bot-b', groups: []};
++    await host.reply(selected, latest);
++    assert.deepEqual(JSON.parse(host.output()), latest);
++});
++
++test('returning to a Bot cannot revive a request from the earlier selection', async () => {
++    const host = await page();
++    const earlierA = host.requests[0];
++    host.nodes['gs-bot'].value = 'bot-b';
++    host.nodes['gs-bot'].onchange();
++    const earlierB = host.requests.at(-1);
++    host.nodes['gs-bot'].value = 'bot-a';
++    host.nodes['gs-bot'].onchange();
++    const latest = {bot: 'bot-a', version: 8, groups: [{reliable: false}]};
++    await host.reply(host.requests.at(-1), latest);
++    await host.reply(earlierA, {bot: 'bot-a', version: 3, groups: [{reliable: true}]});
++    await host.reply(earlierB, {bot: 'bot-b', groups: []});
++    assert.deepEqual(JSON.parse(host.output()), latest);
++});
++
++for (const failure of ['network', 'http', 'json']) {
++    test(`a late ${failure} error cannot clear a newer successful result`, async () => {
++        const host = await page();
++        const earlier = host.requests[0];
++        host.nodes['gs-load'].onclick();
++        const latest = {bot: 'bot-a', version: 8, groups: []};
++        await host.reply(host.requests.at(-1), latest);
++        const status = host.nodes['gs-status'].textContent;
++        if (failure === 'network') earlier.reject(new Error('old network failure'));
++        else earlier.resolve({
++            ok: false,
++            json: async () => {
++                if (failure === 'json') throw new Error('old invalid JSON');
++                return {success: false, error: 'old HTTP error'};
++            },
++        });
++        await tick();
++        assert.deepEqual(JSON.parse(host.output()), latest);
++        assert.equal(host.nodes['gs-status'].textContent, status);
++    });
++}
++
++test('starting a request clears old verified facts and current errors remain visible', async () => {
++    const host = await page();
++    await host.reply(host.requests[0], {bot: 'bot-a', groups: [{reliable: true}]});
++    host.nodes['gs-refresh'].onclick();
++    assert.equal(host.output(), '');
++    assert.equal(host.nodes['gs-status'].textContent, '正在读取…');
++    host.requests.at(-1).reject(new Error('current network failure'));
++    await tick();
++    assert.equal(host.output(), '');
++    assert.equal(host.nodes['gs-status'].textContent, 'current network failure');
++});
++
++test('a late complete roster cannot overwrite a newer failed member verification', async () => {
++    const host = await page();
++    host.nodes['gs-roster'].onclick();
++    const earlier = host.requests.at(-1);
++    host.nodes['gs-verify'].onclick();
++    const latest = {group: 'group-a', reliable: false, state: 'unknown', reason: 'permission_denied'};
++    await host.reply(host.requests.at(-1), latest);
++    await host.reply(earlier, {group: 'group-a', complete: true, version: 3});
++    assert.deepEqual(JSON.parse(host.output()), latest);
++});
++
++test('a late member page from an earlier Bot cannot enable the next page', async () => {
++    const host = await page();
++    host.nodes['gs-members'].onclick();
++    const earlier = host.requests.at(-1);
++    host.nodes['gs-bot'].value = 'bot-b';
++    host.nodes['gs-bot'].onchange();
++    await host.reply(host.requests.at(-1), {bot: 'bot-b', groups: []});
++    await host.reply(earlier, {group: 'group-a', version: 2, generation: 'g', members: [{member: 'old'}], next_cursor: '1.key'});
++    assert.equal(host.nodes['gs-next'].disabled, true);
++    assert.deepEqual(JSON.parse(host.output()), {bot: 'bot-b', groups: []});
++});
++
++test('editing the group retires the earlier member page and its late response', async () => {
++    const host = await page();
++    host.nodes['gs-members'].onclick();
++    await host.reply(host.requests.at(-1), {group: 'group-a', version: 2, generation: 'g', members: [], next_cursor: '1.key'});
++    assert.equal(host.nodes['gs-next'].disabled, false);
++    host.nodes['gs-members'].onclick();
++    const earlier = host.requests.at(-1);
++    host.nodes['gs-group'].value = 'group-b';
++    host.nodes['gs-group'].oninput();
++    assert.equal(host.nodes['gs-next'].disabled, true);
++    await host.reply(earlier, {group: 'group-a', version: 2, generation: 'g', members: [], next_cursor: '1.key'});
++    assert.equal(host.nodes['gs-next'].disabled, true);
++    assert.equal(host.output(), '');
++});
++
++test('the next page carries the cursor, version and generation of the current group page', async () => {
++    const host = await page();
++    host.nodes['gs-members'].onclick();
++    await host.reply(host.requests.at(-1), {group: 'group-a', version: 2, generation: 'g', members: [], next_cursor: '1.key'});
++    host.nodes['gs-next'].onclick();
++    const query = new URL(host.requests.at(-1).url, 'http://host').searchParams;
++    assert.deepEqual(Object.fromEntries(query), {bot: 'bot-a', group: 'group-a', limit: '30', generation: 'g', version: '2', cursor: '1.key'});
++});
++
++test('editing a group clears already displayed results immediately', async () => {
++    const host = await page();
++    host.nodes['gs-members'].onclick();
++    await host.reply(host.requests.at(-1), {group: 'group-a', members: [{member: 'old'}], next_cursor: '1.key'});
++    host.nodes['gs-group'].value = 'group-b';
++    host.nodes['gs-group'].oninput();
++    assert.equal(host.output(), '');
++    assert.equal(host.nodes['gs-next'].disabled, true);
++});
++
++test('returning to a group cannot restore a request from its earlier selection', async () => {
++    const host = await page();
++    host.nodes['gs-members'].onclick();
++    const earlier = host.requests.at(-1);
++    host.nodes['gs-group'].value = 'group-b';
++    host.nodes['gs-group'].oninput();
++    host.nodes['gs-group'].value = 'group-a';
++    host.nodes['gs-group'].oninput();
++    await host.reply(earlier, {group: 'group-a', members: [{member: 'old'}], next_cursor: '1.key'});
++    assert.equal(host.output(), '');
++    assert.equal(host.nodes['gs-next'].disabled, true);
++});

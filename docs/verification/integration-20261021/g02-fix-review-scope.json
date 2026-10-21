@@ -1,0 +1,13 @@
+{
+  "base": "80647647436e3ffb40aa5c5bd650c7ec5e96fddc",
+  "starting_pr": "95b05058f323caaf5ff83f29a460cb2823c438a5",
+  "personal": "f797eadcf6196163340e4640de11385433e1ff76",
+  "mode": "task-owned working-tree since clean merged candidate",
+  "hashes": {
+    "docs/group-state.md": "4a78e7dff558b1fa02dcd484a47111899f54b9df2d1340da667fa207dd047a84",
+    "modules/group_state/page.html": "9ad9b045eedf43c981f2d482f71edaeb0aa47e3e101e2f319e3bef85a7791323",
+    "modules/group_state/state.py": "b78203a8522224164414a451efe38722eb37a384544ac223f16d9f5b7a4f4ce8",
+    "tests/bot_modules/test_group_state_page.cjs": "e73e1b71bbd91918b50156c562d4cc8592c42d6c5b4f51083b8afc77f082c7a2",
+    "tests/bot_modules/test_group_state_audit.py": "f32c49845ab34537aecc4bf4b7aab86d0ba76c1c1c4ab73c8040b74f485e6967"
+  }
+}

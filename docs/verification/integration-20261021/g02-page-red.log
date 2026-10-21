@@ -1,0 +1,143 @@
+TAP version 13
+# Subtest: an earlier GET cannot restore verified facts after a failed refresh
+ok 1 - an earlier GET cannot restore verified facts after a failed refresh
+  ---
+  duration_ms: 11.050988
+  ...
+# Subtest: changing Bot clears old facts and loads only the selected Bot
+ok 2 - changing Bot clears old facts and loads only the selected Bot
+  ---
+  duration_ms: 2.523419
+  ...
+# Subtest: returning to a Bot cannot revive a request from the earlier selection
+ok 3 - returning to a Bot cannot revive a request from the earlier selection
+  ---
+  duration_ms: 3.93525
+  ...
+# Subtest: a late network error cannot clear a newer successful result
+ok 4 - a late network error cannot clear a newer successful result
+  ---
+  duration_ms: 1.762255
+  ...
+# Subtest: a late http error cannot clear a newer successful result
+ok 5 - a late http error cannot clear a newer successful result
+  ---
+  duration_ms: 1.600164
+  ...
+# Subtest: a late json error cannot clear a newer successful result
+ok 6 - a late json error cannot clear a newer successful result
+  ---
+  duration_ms: 1.803546
+  ...
+# Subtest: starting a request clears old verified facts and current errors remain visible
+ok 7 - starting a request clears old verified facts and current errors remain visible
+  ---
+  duration_ms: 1.517145
+  ...
+# Subtest: a late complete roster cannot overwrite a newer failed member verification
+ok 8 - a late complete roster cannot overwrite a newer failed member verification
+  ---
+  duration_ms: 4.364437
+  ...
+# Subtest: a late member page from an earlier Bot cannot enable the next page
+ok 9 - a late member page from an earlier Bot cannot enable the next page
+  ---
+  duration_ms: 2.862496
+  ...
+# Subtest: editing the group retires the earlier member page and its late response
+ok 10 - editing the group retires the earlier member page and its late response
+  ---
+  duration_ms: 1.967546
+  ...
+# Subtest: the next page carries the cursor, version and generation of the current group page
+ok 11 - the next page carries the cursor, version and generation of the current group page
+  ---
+  duration_ms: 2.106829
+  ...
+# Subtest: editing a group clears already displayed results immediately
+not ok 12 - editing a group clears already displayed results immediately
+  ---
+  duration_ms: 6.051808
+  location: '/tmp/qqbotforge-integration-20261021/g02/tests/bot_modules/test_group_state_page.cjs:163:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    Expected values to be strictly equal:
+    + actual - expected
+    
+    + '{\n' +
+    +   '  "group": "group-a",\n' +
+    +   '  "members": [\n' +
+    +   '    {\n' +
+    +   '      "member": "old"\n' +
+    +   '    }\n' +
+    +   '  ],\n' +
+    +   '  "next_cursor": "1.key"\n' +
+    +   '}'
+    - ''
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: ''
+  actual: |-
+    {
+      "group": "group-a",
+      "members": [
+        {
+          "member": "old"
+        }
+      ],
+      "next_cursor": "1.key"
+    }
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (/tmp/qqbotforge-integration-20261021/g02/tests/bot_modules/test_group_state_page.cjs:169:12)
+    async Test.run (node:internal/test_runner/test:797:9)
+    async Test.processPendingSubtests (node:internal/test_runner/test:526:7)
+  ...
+# Subtest: returning to a group cannot restore a request from its earlier selection
+not ok 13 - returning to a group cannot restore a request from its earlier selection
+  ---
+  duration_ms: 3.5374
+  location: '/tmp/qqbotforge-integration-20261021/g02/tests/bot_modules/test_group_state_page.cjs:173:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    Expected values to be strictly equal:
+    + actual - expected
+    
+    + '{\n' +
+    +   '  "group": "group-a",\n' +
+    +   '  "members": [\n' +
+    +   '    {\n' +
+    +   '      "member": "old"\n' +
+    +   '    }\n' +
+    +   '  ],\n' +
+    +   '  "next_cursor": "1.key"\n' +
+    +   '}'
+    - ''
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: ''
+  actual: |-
+    {
+      "group": "group-a",
+      "members": [
+        {
+          "member": "old"
+        }
+      ],
+      "next_cursor": "1.key"
+    }
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (/tmp/qqbotforge-integration-20261021/g02/tests/bot_modules/test_group_state_page.cjs:182:12)
+    async Test.run (node:internal/test_runner/test:797:9)
+    async Test.processPendingSubtests (node:internal/test_runner/test:526:7)
+  ...
+1..13
+# tests 13
+# suites 0
+# pass 11
+# fail 2
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 108.177845

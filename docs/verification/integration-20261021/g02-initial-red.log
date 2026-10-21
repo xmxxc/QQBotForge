@@ -1,0 +1,111 @@
+...FFF                                                                   [100%]
+=================================== FAILURES ===================================
+_____ test_cancelling_initial_queued_write_ends_current_operation[refresh] _____
+
+group_host = <conftest.group_host.<locals>.Host object at 0x7d8f5bbfdd30>
+operation = 'refresh'
+
+    @pytest.mark.parametrize('operation', ['refresh', 'roster', 'member'])
+    async def test_cancelling_initial_queued_write_ends_current_operation(group_host, operation):
+        host = group_host
+        earlier = await complete_roster(host)
+        blocker = sqlite3.connect(host.modules.get_context('group_state').get_data_path('group-state.db'))
+        blocker.execute('BEGIN IMMEDIATE')
+        first = asyncio.create_task(host.state.refresh('bot-a', 'group-blocker'))
+        second = None
+        try:
+            await wait_until(lambda: host.state.pending_writes.get('bot-a'))
+            method = {'refresh': host.state.refresh, 'roster': host.state.sync_roster, 'member': host.state.verify_member}[operation]
+            args = ('bot-a', 'group-a', 'member-a') if operation == 'member' else ('bot-a', 'group-a')
+            second = asyncio.create_task(method(*args))
+            await wait_until(lambda: host.state.pending_writes.get('bot-a', 0) >= 2)
+            second.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await second
+            group = next(g for g in (await host.state.snapshot('bot-a'))['groups'] if g['group'] == 'group-a')
+            assert not group['roster']['complete'] and group['version'] > earlier['version']
+            if operation == 'refresh':
+>               assert group['status'] == 'historical' and group['reason'] == 'refresh_cancelled'
+E               AssertionError: assert ('pending' == 'historical'
+E                 
+E                 - historical
+E                 + pending)
+
+tests/bot_modules/test_group_state_audit.py:108: AssertionError
+_____ test_cancelling_initial_queued_write_ends_current_operation[roster] ______
+
+group_host = <conftest.group_host.<locals>.Host object at 0x7d8f5a764ad0>
+operation = 'roster'
+
+    @pytest.mark.parametrize('operation', ['refresh', 'roster', 'member'])
+    async def test_cancelling_initial_queued_write_ends_current_operation(group_host, operation):
+        host = group_host
+        earlier = await complete_roster(host)
+        blocker = sqlite3.connect(host.modules.get_context('group_state').get_data_path('group-state.db'))
+        blocker.execute('BEGIN IMMEDIATE')
+        first = asyncio.create_task(host.state.refresh('bot-a', 'group-blocker'))
+        second = None
+        try:
+            await wait_until(lambda: host.state.pending_writes.get('bot-a'))
+            method = {'refresh': host.state.refresh, 'roster': host.state.sync_roster, 'member': host.state.verify_member}[operation]
+            args = ('bot-a', 'group-a', 'member-a') if operation == 'member' else ('bot-a', 'group-a')
+            second = asyncio.create_task(method(*args))
+            await wait_until(lambda: host.state.pending_writes.get('bot-a', 0) >= 2)
+            second.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await second
+            group = next(g for g in (await host.state.snapshot('bot-a'))['groups'] if g['group'] == 'group-a')
+            assert not group['roster']['complete'] and group['version'] > earlier['version']
+            if operation == 'refresh':
+                assert group['status'] == 'historical' and group['reason'] == 'refresh_cancelled'
+            elif operation == 'roster':
+>               assert group['roster']['reason'] == 'roster_cancelled'
+E               AssertionError: assert 'roster_refreshing' == 'roster_cancelled'
+E                 
+E                 - roster_cancelled
+E                 + roster_refreshing
+
+tests/bot_modules/test_group_state_audit.py:110: AssertionError
+_____ test_cancelling_initial_queued_write_ends_current_operation[member] ______
+
+group_host = <conftest.group_host.<locals>.Host object at 0x7d8f5a7663c0>
+operation = 'member'
+
+    @pytest.mark.parametrize('operation', ['refresh', 'roster', 'member'])
+    async def test_cancelling_initial_queued_write_ends_current_operation(group_host, operation):
+        host = group_host
+        earlier = await complete_roster(host)
+        blocker = sqlite3.connect(host.modules.get_context('group_state').get_data_path('group-state.db'))
+        blocker.execute('BEGIN IMMEDIATE')
+        first = asyncio.create_task(host.state.refresh('bot-a', 'group-blocker'))
+        second = None
+        try:
+            await wait_until(lambda: host.state.pending_writes.get('bot-a'))
+            method = {'refresh': host.state.refresh, 'roster': host.state.sync_roster, 'member': host.state.verify_member}[operation]
+            args = ('bot-a', 'group-a', 'member-a') if operation == 'member' else ('bot-a', 'group-a')
+            second = asyncio.create_task(method(*args))
+            await wait_until(lambda: host.state.pending_writes.get('bot-a', 0) >= 2)
+            second.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await second
+            group = next(g for g in (await host.state.snapshot('bot-a'))['groups'] if g['group'] == 'group-a')
+            assert not group['roster']['complete'] and group['version'] > earlier['version']
+            if operation == 'refresh':
+                assert group['status'] == 'historical' and group['reason'] == 'refresh_cancelled'
+            elif operation == 'roster':
+                assert group['roster']['reason'] == 'roster_cancelled'
+                assert group['members']['member-a']['reason'] == 'roster_cancelled'
+            else:
+                record = group['members']['member-a']
+>               assert record['status'] == 'historical' and record['reason'] == 'verification_cancelled'
+E               AssertionError: assert ('pending' == 'historical'
+E                 
+E                 - historical
+E                 + pending)
+
+tests/bot_modules/test_group_state_audit.py:114: AssertionError
+=========================== short test summary info ============================
+FAILED tests/bot_modules/test_group_state_audit.py::test_cancelling_initial_queued_write_ends_current_operation[refresh]
+FAILED tests/bot_modules/test_group_state_audit.py::test_cancelling_initial_queued_write_ends_current_operation[roster]
+FAILED tests/bot_modules/test_group_state_audit.py::test_cancelling_initial_queued_write_ends_current_operation[member]
+3 failed, 3 passed in 0.33s

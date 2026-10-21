@@ -1,0 +1,7 @@
+{
+  "head": "b32a00a78cd48baa343b3d37fc8bf4fee0d7bcf0",
+  "tree": "e69e4d818975fe1833e9f6bd0a2e5755be04f56c",
+  "parents": "b32a00a78cd48baa343b3d37fc8bf4fee0d7bcf0 09feaaa91c278fd126c9d570f9975e1df9bdeb73 f797eadcf6196163340e4640de11385433e1ff76",
+  "ci_assets": "04d901726cc6d94bae1b2b5524521f997a326e10",
+  "copy": "tests into source/tests/tests (matches unchanged reusable CI)"
+}

@@ -1,0 +1,9 @@
+{
+  "pr": 47,
+  "head": "bf462cf97bd61049c44ae53ac207f4f22bf32f34",
+  "base": "dfcf5a1948bd646a855179e5ce70e74c321d6dd3",
+  "merge_base": "398c6afe70055589d1f12ab35affe66ca6e2396c",
+  "personal": "f797eadcf6196163340e4640de11385433e1ff76",
+  "api_base_at_capture": "398c6afe70055589d1f12ab35affe66ca6e2396c",
+  "base_source": "fresh git fetch origin; API base.sha stale, confirmed fresh no-cache API also stale"
+}

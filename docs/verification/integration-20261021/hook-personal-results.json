@@ -1,0 +1,387 @@
+[
+  {
+    "case": "consume, logging, tracking, interceptor order",
+    "trace": [
+      "before_event",
+      "log",
+      "interceptor",
+      "hook:fake-a",
+      "reply:module",
+      "sql",
+      "track"
+    ]
+  },
+  {
+    "case": "pass to plugin",
+    "trace": [
+      "before_event",
+      "log",
+      "interceptor",
+      "hook:fake-a",
+      "sql",
+      "handler",
+      "track"
+    ]
+  },
+  {
+    "case": "pass to default",
+    "trace": [
+      "before_event",
+      "log",
+      "interceptor",
+      "hook:fake-a",
+      "sql",
+      "reply:default",
+      "track"
+    ]
+  },
+  {
+    "case": "blacklist user",
+    "trace": [
+      "before_event",
+      "log",
+      "sql",
+      "reply:blacklist",
+      "track"
+    ]
+  },
+  {
+    "case": "blacklist group",
+    "trace": [
+      "before_event",
+      "log",
+      "sql",
+      "reply:group_blacklist",
+      "track"
+    ]
+  },
+  {
+    "case": "maintenance nonowner",
+    "trace": [
+      "before_event",
+      "log",
+      "sql",
+      "reply:maintenance",
+      "track"
+    ]
+  },
+  {
+    "case": "maintenance owner",
+    "trace": [
+      "before_event",
+      "log",
+      "interceptor",
+      "hook:fake-a",
+      "reply:module",
+      "sql",
+      "track"
+    ]
+  },
+  {
+    "case": "owner still blacklisted",
+    "trace": [
+      "before_event",
+      "log",
+      "sql",
+      "reply:blacklist",
+      "track"
+    ]
+  },
+  {
+    "case": "message type GROUP_AT_MESSAGE_CREATE",
+    "trace": [
+      "before_event",
+      "log",
+      "interceptor",
+      "hook:fake-a",
+      "reply:module",
+      "sql",
+      "track"
+    ]
+  },
+  {
+    "case": "message type C2C_MESSAGE_CREATE",
+    "trace": [
+      "before_event",
+      "log",
+      "interceptor",
+      "hook:fake-a",
+      "reply:module",
+      "sql",
+      "track"
+    ]
+  },
+  {
+    "case": "message type AT_MESSAGE_CREATE",
+    "trace": [
+      "before_event",
+      "log",
+      "interceptor",
+      "hook:fake-a",
+      "reply:module",
+      "sql",
+      "track"
+    ]
+  },
+  {
+    "case": "message type DIRECT_MESSAGE_CREATE",
+    "trace": [
+      "before_event",
+      "log",
+      "interceptor",
+      "hook:fake-a",
+      "reply:module",
+      "sql",
+      "track"
+    ]
+  },
+  {
+    "case": "message type MESSAGE_CREATE",
+    "trace": [
+      "before_event",
+      "log",
+      "interceptor",
+      "hook:fake-a",
+      "reply:module",
+      "sql",
+      "track"
+    ]
+  },
+  {
+    "case": "non-at False []",
+    "trace": [
+      "before_event",
+      "log",
+      "sql",
+      "interceptor",
+      "sql",
+      "track"
+    ]
+  },
+  {
+    "case": "non-at True []",
+    "trace": [
+      "before_event",
+      "log",
+      "sql",
+      "interceptor",
+      "hook:fake-a",
+      "reply:module",
+      "sql",
+      "track"
+    ]
+  },
+  {
+    "case": "non-at False ['fake-g']",
+    "trace": [
+      "before_event",
+      "log",
+      "sql",
+      "interceptor",
+      "hook:fake-a",
+      "reply:module",
+      "sql",
+      "track"
+    ]
+  },
+  {
+    "case": "non-at False ['other']",
+    "trace": [
+      "before_event",
+      "log",
+      "sql",
+      "interceptor",
+      "sql",
+      "track"
+    ]
+  },
+  {
+    "case": "is_at_other_bot ignore=True",
+    "trace": [
+      "before_event",
+      "log",
+      "sql",
+      "interceptor",
+      "sql",
+      "track"
+    ]
+  },
+  {
+    "case": "is_at_other_bot ignore=False",
+    "trace": [
+      "before_event",
+      "log",
+      "sql",
+      "interceptor",
+      "hook:fake-a",
+      "reply:module",
+      "sql",
+      "track"
+    ]
+  },
+  {
+    "case": "is_at_other_bot also self at",
+    "trace": [
+      "before_event",
+      "log",
+      "sql",
+      "interceptor",
+      "hook:fake-a",
+      "reply:module",
+      "sql",
+      "track"
+    ]
+  },
+  {
+    "case": "is_at_other_user ignore=True",
+    "trace": [
+      "before_event",
+      "log",
+      "sql",
+      "interceptor",
+      "sql",
+      "track"
+    ]
+  },
+  {
+    "case": "is_at_other_user ignore=False",
+    "trace": [
+      "before_event",
+      "log",
+      "sql",
+      "interceptor",
+      "hook:fake-a",
+      "reply:module",
+      "sql",
+      "track"
+    ]
+  },
+  {
+    "case": "is_at_other_user also self at",
+    "trace": [
+      "before_event",
+      "log",
+      "sql",
+      "interceptor",
+      "hook:fake-a",
+      "reply:module",
+      "sql",
+      "track"
+    ]
+  },
+  {
+    "case": "at-all dropped before dispatch",
+    "trace": [
+      "before_event",
+      "log",
+      "sql",
+      "sql",
+      "track"
+    ]
+  },
+  {
+    "case": "bot sender dropped before dispatch",
+    "trace": [
+      "before_event",
+      "log",
+      "sql",
+      "track"
+    ]
+  },
+  {
+    "case": "interceptor consumes",
+    "trace": [
+      "before_event",
+      "log",
+      "interceptor",
+      "sql",
+      "track"
+    ]
+  },
+  {
+    "case": "unknown non-message",
+    "trace": [
+      "before_event"
+    ]
+  },
+  {
+    "case": "cross-bot B admitted independently",
+    "trace": [
+      "before_event",
+      "log",
+      "interceptor",
+      "hook:fake-b",
+      "reply:module",
+      "sql",
+      "track",
+      "log",
+      "interceptor",
+      "reply:default",
+      "track",
+      "log",
+      "interceptor",
+      "log",
+      "interceptor",
+      "reply:lifecycle-module",
+      "log",
+      "interceptor",
+      "reply:lifecycle-module",
+      "log",
+      "interceptor",
+      "reply:lifecycle-module",
+      "log",
+      "interceptor",
+      "reply:default",
+      "log",
+      "interceptor",
+      "reply:lifecycle-module",
+      "log",
+      "interceptor",
+      "reply:default",
+      "log"
+    ]
+  },
+  {
+    "case": "exception logged and priority tail continues",
+    "seen": [
+      "fail",
+      "tail"
+    ]
+  },
+  {
+    "case": "cancellation propagates and no tail",
+    "seen": [
+      "cancel"
+    ]
+  },
+  {
+    "case": "module lifecycle enable",
+    "hook_count": 1
+  },
+  {
+    "case": "module lifecycle enable",
+    "hook_count": 1
+  },
+  {
+    "case": "module lifecycle reload",
+    "hook_count": 1
+  },
+  {
+    "case": "module lifecycle disable",
+    "hook_count": 0
+  },
+  {
+    "case": "module lifecycle enable",
+    "hook_count": 1
+  },
+  {
+    "case": "existing explicit duplicate semantics",
+    "seen": [
+      "tail",
+      "tail"
+    ]
+  },
+  {
+    "case": "no plugin manager no hook"
+  }
+]

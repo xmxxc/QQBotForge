@@ -1,0 +1,31 @@
+{
+  "base": "0a83634cb3864d63435c28158da315abf5838146",
+  "merge_parent": "1adf415995c21da0aa40c7748ba41bf9f40a6e05",
+  "mode": "task-owned conflict resolution from clean original G03; diff HEAD includes automatic merge; g02-compat compares retained G03 capabilities",
+  "hashes": {
+    "core/bot/event.py": "9c60d03777f09501110f347d2916d893ebc52b4ff811e62108ce91893db0c979",
+    "core/message/event.py": "d5894bb5d11b54802ea4603920926afce64fe617a66a9bd555298573a8669144",
+    "core/module/connection_status.py": "e6579bbb9708f189358d77201012c92b3c85fcd0d534cf34a694620f34eb1c4a",
+    "core/module/group_lifecycle.py": "02e95258d7fd0f45cacfeb17de8978fc49d8c0d012626a3a3204970895f2038b",
+    "core/module/hook.py": "b529949d1a4db59966aa316c252478e14f8f15e563f42913b5f6a332fea341ec",
+    "core/module/manager.py": "76f5ea999c372f0e1621d0c68bd4cd8643194eda173df16e642bda3841dbcf8a",
+    "core/module/recovery.py": "4f34594eb1e5a64e63d14152504d18e8adb5f536667e633ef0837978a9d14884",
+    "core/network/websocket.py": "ddf28b2f0d187192dcaf62ae113a8413d4e5d423886d8fa1a3a9be12c586936d",
+    "core/plugin/_dispatch.py": "14c7b9574c80013d9502f322d9ee08c85591fd9d10dbf9b50007146fad418801",
+    "docs/group-state.md": "bc39e0ed9bd198c3248f25b52a579a45005a4514af77f308c47adc043759ae50",
+    "docs/module-connection-status.md": "ccd7b824d408cac314c1bf0d8633531d8624749e81d200d885883651fba5b81f",
+    "docs/module-event-hooks.md": "8062f3480bbd73007c09462e262226d90fa273ccfa1a69ea04aabe19cb55ac93",
+    "docs/module-recovery.md": "7aa931663fcb7ab0a2bbb2e4d2c9489a3503d1d2d32410c207feb61055376580",
+    "docs/verification/module-contract-f01.md": "437df47215bed8ee50f7f71a41addd40b9c74a22f88274a23d4b9e7eb4493827",
+    "modules/group_state/main.py": "d787dcc75b6dccc87dcb82550b58d08672ec7f7d2c34804fc95ac14ed1e56e6d",
+    "modules/group_state/page.html": "badfdc9cc7ef971fdf6ca406829614eb891d4fd18d0ecb89813cb40fe0fcd5c6",
+    "modules/group_state/state.py": "25c73cd0b90a6884eb13a4c4f7ca90977f199079e6f735e44206a46576030ca1",
+    "modules/group_state/storage.py": "4c5fe4ba6ec224974b21ce83177dd9e93577fcc4e33de621405be2a11b81c37a",
+    "plugins/account_sharing/service.py": "926918890c740213bf1d22c292a8db6ca1dd67965af815a16eb3ef8a26419e93",
+    "tests/bot_modules/test_group_lifecycle.py": "afa947211366d989001f96b87c7580317d412d48baad6bc55482cc8fb4070ded",
+    "tests/bot_modules/test_group_roster.py": "8bd6c84e411ea0fb218d77bf5881d097481cb7697705b9629ab5a0f2a600b88a",
+    "tests/bot_modules/test_group_state.py": "f64c7046773d208d84c83b67070063fad8d286c353afe5fa26b60f63a7c5ef9b",
+    "tests/bot_modules/test_group_state_audit.py": "95cd501191e5f974779450603a94453aa9fce7f61dba126c861cc3ec2d10ce71",
+    "tests/bot_modules/test_group_state_page.cjs": "e73e1b71bbd91918b50156c562d4cc8592c42d6c5b4f51083b8afc77f082c7a2"
+  }
+}

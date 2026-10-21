@@ -1,0 +1,2860 @@
+diff --git a/core/bot/event.py b/core/bot/event.py
+index 1a78ce3..f5865c4 100644
+--- a/core/bot/event.py
++++ b/core/bot/event.py
+@@ -283,19 +283,20 @@ class EventHandlerMixin:
+     # ==================== 事件入口 ====================
+ 
+     def _prepare_event(self, event, *, transport='internal', session_id=None):
+-        if event.appid in self._bots:
+-            self._hook_manager.group_lifecycle.prepare(event, transport=transport, session_id=session_id)
++        if self.get_bot(event.appid) is not None:
++            if not event._group_lifecycle_prepared:
++                self._hook_manager.group_lifecycle.prepare(event, transport=transport, session_id=session_id)
++            self._hook_manager.recovery.prepare(event)
+ 
+     async def _on_event(self, event):
+         appid = event.appid
+-        bot = self._bots.get(appid)
++        bot = self.get_bot(appid)
+         if not bot:
+             return
+ 
+         # 内置传输在调度前登记顺序；此处为自定义适配器保留回退。
+         self._prepare_event(event)
+         await self._hook_manager.group_lifecycle.wait(event)
+-        et = event.event_type
+ 
+         # 去重
+         if cfg.get_bot_setting(appid, 'dedup.enabled', False):
+@@ -315,6 +316,15 @@ class EventHandlerMixin:
+             if need_swap:
+                 event.user_id, event.union_openid, _ = IdentityHelper.swap_ids(event.raw_user_id, event.union_openid, True)
+ 
++        # 模块可接管或转换事件；返回 None 表示已经处理，不再进入内置分发。
++        if self._hook_manager.has('before_event'):
++            event = await self._hook_manager.pipeline('before_event', event)
++            if event is None:
++                return
++            if event.appid != appid:
++                raise ValueError('before_event hook must preserve appid')
++        et = event.event_type
++
+         # 生命周期事件
+         lc = self._LIFECYCLE_HANDLERS.get(et)
+         if lc:
+diff --git a/core/message/event.py b/core/message/event.py
+index 46b2333..0217bad 100644
+--- a/core/message/event.py
++++ b/core/message/event.py
+@@ -185,6 +185,7 @@ class Event:
+     """事件数据容器"""
+ 
+     __slots__ = (
++        '_recovery_prepared',
+         '_group_lifecycle_scope',
+         '_group_lifecycle_prepared',
+         '_group_lifecycle_barriers',
+@@ -248,6 +249,7 @@ class Event:
+     )
+ 
+     def __init__(self):
++        self._recovery_prepared = False
+         self._group_lifecycle_scope = None
+         self._group_lifecycle_prepared = False
+         self._group_lifecycle_barriers = ()
+diff --git a/core/module/connection_status.py b/core/module/connection_status.py
+index 58cd638..9ffdda5 100644
+--- a/core/module/connection_status.py
++++ b/core/module/connection_status.py
+@@ -121,6 +121,8 @@ class ConnectionStatusSubscription:
+ 
+     async def _drain(self, key, pending):
+         try:
++            # 先登记排空任务，避免 eager 工厂同步结束后回写已完成的任务。
++            await asyncio.sleep(0)
+             while pending:
+                 status = pending.popleft()
+                 outcome, error = await self._invoke(key, status)
+@@ -175,6 +177,8 @@ class ConnectionStatusManager:
+     def __init__(self):
+         self.runtime_id = uuid4().hex
+         self._revision = 0
++        self._observers = []
++        self._dispatch_observers = []
+         self._current: dict[tuple[str, str], ConnectionStatus] = {}
+         self._sources = {}
+         self._session_bots = {}
+@@ -268,5 +272,7 @@ class _ConnectionReporter:
+         self._manager._current[key] = self._status
+         if phase == 'stopped':
+             self.stopped = True
++        for observer in tuple(self._manager._observers):
++            observer(self._status)
+         for subscription in tuple(self._manager._subscriptions.values()):
+             subscription._enqueue(self._status)
+diff --git a/core/module/group_lifecycle.py b/core/module/group_lifecycle.py
+index 28b783b..b3740ad 100644
+--- a/core/module/group_lifecycle.py
++++ b/core/module/group_lifecycle.py
+@@ -82,6 +82,8 @@ class GroupLifecycleSubscription:
+         self.timeout = timeout
+         self._manager = manager
+         self._callback = callback
++        self._on_prepare = None
++        self._on_result = None
+         self._closed = asyncio.Event()
+         self._close_status = None
+         self._history: deque[GroupLifecycleResult] = deque(maxlen=100)
+@@ -114,7 +116,9 @@ class GroupLifecycleSubscription:
+         key = (event.appid, event.group_openid)
+         if self.active:
+             previous = self._running.get(key)
+-            bot_busy = any(task in self._abandoned and not task.done() for (bot, _), task in self._running.items() if bot == event.appid)
++            bot_busy = bool(self._abandoned) and any(
++                task in self._abandoned and not task.done() for (bot, _), task in self._running.items() if bot == event.appid
++            )
+             if bot_busy or (previous is not None and not previous.done()):
+                 status = 'busy'
+             else:
+@@ -149,6 +153,8 @@ class GroupLifecycleSubscription:
+                     task.add_done_callback(release)
+         result = GroupLifecycleResult(event, self.subscription_id, self.owner, status, error, started, time.monotonic())
+         self._history.append(result)
++        if self._on_result is not None:
++            self._on_result(result)
+         return result
+ 
+ 
+@@ -227,9 +233,13 @@ class GroupLifecycleManager:
+             event.connection_context,
+         )
+         subscribers = tuple(s for s in self._subscriptions.values() if s.appid is None or s.appid == appid)
++        for subscriber in subscribers:
++            if subscriber._on_prepare is not None:
++                subscriber._on_prepare(notification)
+         completion = asyncio.get_running_loop().create_future()
+         event.group_lifecycle_delivery = GroupLifecycleDelivery(notification, completion)
+-        event._group_lifecycle_barriers = (*predecessors, completion)
++        # 排空任务已等待前序事件，入口只需等待本次完成凭据。
++        event._group_lifecycle_barriers = (completion,)
+         tails = self._tails.setdefault(appid, {})
+         tails[group] = completion
+         key = (appid, group)
+@@ -249,6 +259,8 @@ class GroupLifecycleManager:
+     async def _drain(self, key, pending):
+         """每个 Bot／群只运行一个排空任务，队列保持接收顺序。"""
+         try:
++            # 无订阅者时也可能同步排空，先让创建方登记任务。
++            await asyncio.sleep(0)
+             while pending:
+                 item = pending[0]
+                 for previous in item.predecessors:
+@@ -267,5 +279,3 @@ class GroupLifecycleManager:
+         """在记录、欢迎回复及插件分发前，等待已知群变化。"""
+         for previous in event._group_lifecycle_barriers:
+             await asyncio.shield(previous)
+-        if event.group_lifecycle_delivery is not None:
+-            await event.group_lifecycle_delivery.wait()
+diff --git a/core/module/hook.py b/core/module/hook.py
+index cb5c8a9..fb45b24 100644
+--- a/core/module/hook.py
++++ b/core/module/hook.py
+@@ -6,6 +6,7 @@ from collections import defaultdict
+ from core.base.logger import FRAMEWORK, get_logger
+ from core.module.connection_status import ConnectionStatusManager
+ from core.module.group_lifecycle import GroupLifecycleManager
++from core.module.recovery import RecoveryManager
+ 
+ log = get_logger(FRAMEWORK, 'Hook')
+ 
+@@ -22,11 +23,12 @@ def _make_callback(cb, args, kwargs):
+ class HookManager:
+     """通用 Hook 管理器 (全局单例, 任意字符串作为 hook 名称)"""
+ 
+-    __slots__ = ('_hooks', '_sorted', 'group_lifecycle', 'connection_status')
++    __slots__ = ('_hooks', '_sorted', 'group_lifecycle', 'connection_status', 'recovery')
+ 
+     def __init__(self):
+         self.group_lifecycle = GroupLifecycleManager()
+         self.connection_status = ConnectionStatusManager()
++        self.recovery = RecoveryManager(self.connection_status, self.group_lifecycle)
+         self._hooks = defaultdict(list)  # {name: [(pri, owner, cb, is_coro)]}
+         self._sorted = {}
+ 
+diff --git a/core/module/manager.py b/core/module/manager.py
+index 0d9586f..440ad35 100644
+--- a/core/module/manager.py
++++ b/core/module/manager.py
+@@ -7,6 +7,7 @@ import importlib.util
+ import json
+ import os
+ import sys
++from pathlib import Path
+ from weakref import WeakSet
+ 
+ from core.base.context import BaseContext
+@@ -37,13 +38,18 @@ _DEFAULT_MANIFEST = {
+ class ModuleContext(BaseContext):
+     """模块上下文 — 继承 BaseContext, 额外提供 Hook 注册"""
+ 
+-    __slots__ = ('_hooks', '_group_subscriptions', '_subscriptions_closed', '_connection_subscriptions')
++    __slots__ = ('_hooks', '_group_subscriptions', '_subscriptions_closed', '_connection_subscriptions', '_recovery_subscriptions', '_recovery_scope')
+ 
+     def __init__(self, name, module_dir, hook_manager):
+         super().__init__(name, module_dir, EXTENSION)
+         self._hooks = hook_manager
++        # 绑定安装槽位而非展示名；入口 symlink 切换版本后仍属于同一模块。
++        module_path = Path(module_dir)
++        # 先按真实文件系统解析父路径，不能先折叠 symlink/..。
++        self._recovery_scope = str(module_path.resolve() if module_path.name == '..' else module_path.parent.resolve() / module_path.name)
+         self._group_subscriptions = WeakSet()
+         self._connection_subscriptions = WeakSet()
++        self._recovery_subscriptions = WeakSet()
+         self._subscriptions_closed = False
+ 
+     @property
+@@ -91,8 +97,24 @@ class ModuleContext(BaseContext):
+         self._connection_subscriptions.add(subscription)
+         return subscription
+ 
++    @property
++    def recovery_api_version(self):
++        return self._hooks.recovery.api_version
++
++    def subscribe_recovery_events(self, callback, *, event_types, appid=None, timeout=5.0, max_pending=128, depends_on=()):
++        """显式参与状态恢复；回调需在更新完成后调用 delivery.acknowledge()。"""
++        if self._subscriptions_closed:
++            raise RuntimeError('module context is unloaded')
++        subscription = self._hooks.recovery.subscribe(callback, owner=self.name, event_types=event_types, appid=appid,
++                                                       timeout=timeout, max_pending=max_pending, depends_on=depends_on, _scope=self._recovery_scope)
++        self._recovery_subscriptions.add(subscription)
++        return subscription
++
+     def _close_subscriptions(self):
+         self._subscriptions_closed = True
++        for subscription in self._recovery_subscriptions:
++            subscription._close('unloaded')
++        self._recovery_subscriptions.clear()
+         for subscription in self._group_subscriptions:
+             subscription._close('unloaded')
+         self._group_subscriptions.clear()
+diff --git a/core/module/recovery.py b/core/module/recovery.py
+new file mode 100644
+index 0000000..05272f0
+--- /dev/null
++++ b/core/module/recovery.py
+@@ -0,0 +1,485 @@
++"""显式消费者确认与可信协议边界组合；不持久化或推断业务状态。"""
++
++import asyncio
++import inspect
++import json
++import math
++from collections import OrderedDict
++from dataclasses import dataclass, field
++from hashlib import sha256
++from types import MappingProxyType
++from uuid import uuid4
++
++from core.module.connection_status import ConnectionContext
++from core.module.group_lifecycle import GROUP_LIFECYCLE_TYPES, GroupLifecycleEvent
++
++RECOVERY_API_VERSION = 1
++
++
++def _session(context):
++    return (context.runtime_id, context.bot_generation, context.session_generation, context.session_id)
++
++
++@dataclass(frozen=True, slots=True)
++class RecoveryStatus:
++    subscription_id: str
++    appid: str
++    transport: str
++    revision: int
++    context: ConnectionContext | None
++    phase: str
++    reason: str
++    ready: bool
++    pending: int
++    boundary_pending: int
++    replay_end_sequence: int | None
++    replay_end_receive_index: int | None
++    failed: bool
++    dependencies: tuple['RecoveryStatus', ...] = ()
++
++
++def _freeze(value):
++    if isinstance(value, dict):
++        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
++    if isinstance(value, list):
++        return tuple(_freeze(item) for item in value)
++    return value
++
++
++@dataclass(frozen=True, slots=True)
++class RecoveryEvent:
++    """非群生命周期事件的接收快照，不与普通插件共享可变 Event。"""
++
++    appid: str
++    event_type: str
++    event_id: str | None
++    raw: object
++    connection_context: ConnectionContext | None
++
++
++@dataclass(slots=True)
++class _Confirmation:
++    acknowledged: bool = False
++    active: bool = True
++
++
++@dataclass(frozen=True, slots=True)
++class RecoveryDelivery:
++    """必须在承诺的更新完成后确认；返回回调和派生后台任务都不代替确认。"""
++
++    event: GroupLifecycleEvent | RecoveryEvent
++    context: ConnectionContext
++    _confirmation: _Confirmation = field(default_factory=_Confirmation, repr=False, compare=False)
++
++    def acknowledge(self) -> bool:
++        if not self._confirmation.active:
++            return False
++        self._confirmation.acknowledged = True
++        return True
++
++    def _expire(self):
++        self._confirmation.active = False
++
++
++@dataclass(slots=True)
++class _Progress:
++    context: ConnectionContext | None = None
++    revision: int = 0
++    baseline: bool = False
++    failure: str | None = None
++    pending: dict = field(default_factory=dict)
++    seen: OrderedDict = field(default_factory=OrderedDict)
++    high_sequence: int | None = None
++
++
++class RecoverySubscription:
++    """每个消费者拥有独立的基线、失败和有界在途处理。"""
++
++    def __init__(self, manager, callback, owner, event_types, appid, timeout, max_pending, depends_on, *, _scope=None):
++        self.subscription_id = uuid4().hex
++        self.owner = owner
++        self._scope = object() if _scope is None else _scope
++        self.event_types = event_types
++        self.appid = appid
++        self.timeout = timeout
++        self.max_pending = max_pending
++        self.depends_on = depends_on
++        self._manager = manager
++        self._callback = callback
++        self._progress: dict[tuple[str, str], _Progress] = {}
++        self._tickets: dict[str, tuple[_Progress, RecoveryDelivery]] = {}
++        self._running: dict[asyncio.Task, tuple[str, str]] = {}
++        self._workers: set[asyncio.Task] = set()
++        self._group = None
++        self._closed = None
++
++    @property
++    def active(self):
++        return self._closed is None
++
++    def _observe(self, status):
++        if self.appid is not None and self.appid != status.appid:
++            return
++        key = (status.appid, status.transport)
++        progress = self._progress.setdefault(key, _Progress())
++        if progress.context is not None and _session(progress.context) != _session(status.context):
++            self._retire(key, progress)
++            self._manager._invalidate_dependents(self, *key)
++            progress = self._progress[key] = _Progress(revision=progress.revision)
++        progress.context = status.context
++        progress.revision += 1
++        if status.phase in {'unknown', 'identifying', 'resume_failed', 'stopped'}:
++            progress.baseline = False
++            progress.failure = status.reason
++            self._manager._invalidate_dependents(self, *key)
++            if status.phase == 'stopped':
++                self._retire(key, progress)
++
++    def _retire(self, key, progress):
++        for delivery_id, delivery in tuple(progress.pending.items()):
++            delivery._expire()
++            self._tickets.pop(delivery_id, None)
++        progress.pending.clear()
++        for task, scope in tuple(self._running.items()):
++            if scope == key:
++                self._manager._abandon(self, task, scope)
++                task.cancel()
++
++    def get_status(self, appid, *, transport='websocket') -> RecoveryStatus:
++        appid = str(appid)
++        key = (appid, transport)
++        progress = self._progress.get(key, _Progress())
++        status = self._manager.connections.get(appid, transport=transport)
++        phase, reason, ready = 'needs_baseline', 'baseline_required', False
++        end_sequence = status.replay_end_sequence if status else None
++        end_index = status.replay_end_receive_index if status else None
++        boundary_pending = len(progress.pending)
++        if status and status.phase == 'replay_complete' and end_index is not None:
++            boundary_pending = sum(
++                delivery.context is None
++                or delivery.context.connection_generation != status.context.connection_generation
++                or delivery.context.receive_index <= end_index
++                for delivery in progress.pending.values()
++            )
++        if self._closed:
++            phase, reason = 'closed', self._closed
++        elif transport != 'websocket' or (status and not status.capabilities.replay_boundary):
++            phase, reason = 'unsupported', 'unverified_transport'
++        elif self._manager._blocked(self._scope, key):
++            phase, reason = 'needs_baseline', 'old_callback_running'
++        elif progress.failure:
++            phase, reason = 'needs_baseline', progress.failure
++        elif progress.baseline and status:
++            if status.phase == 'replay_complete' and status.continuity == 'resumed':
++                phase, reason, ready = 'ready', 'replay_processed', boundary_pending == 0
++                if not ready:
++                    phase, reason = 'processing', 'pending_processing'
++            elif status.phase == 'ready':
++                ready = not progress.pending
++                phase, reason = ('ready', 'baseline_established') if ready else ('processing', 'pending_processing')
++            else:
++                phase, reason = 'recovering', status.reason
++        dependencies = tuple(dep.get_status(appid, transport=transport) for dep in self.depends_on)
++        if ready and any(not dep.ready for dep in dependencies):
++            phase, reason, ready = 'dependency_failed', 'dependency_not_ready', False
++        return RecoveryStatus(
++            self.subscription_id,
++            appid,
++            transport,
++            progress.revision,
++            progress.context,
++            phase,
++            reason,
++            ready,
++            len(progress.pending),
++            boundary_pending,
++            end_sequence,
++            end_index,
++            progress.failure is not None,
++            dependencies,
++        )
++
++    def establish(self, checkpoint: RecoveryStatus):
++        """调用者已重建状态后确认基线；拒绝重建期间发生变化的旧凭据。"""
++        if not isinstance(checkpoint, RecoveryStatus) or checkpoint.subscription_id != self.subscription_id:
++            return False
++        current = self.get_status(checkpoint.appid, transport=checkpoint.transport)
++        status = self._manager.connections.get(checkpoint.appid, transport=checkpoint.transport)
++        if (
++            not self.active
++            or current != checkpoint
++            or current.pending
++            or current.context is None
++            or (self.appid is not None and self.appid != checkpoint.appid)
++            or checkpoint.transport != 'websocket'
++            or status is None
++            or not status.capabilities.replay_boundary
++            or status.phase not in {'ready', 'replay_complete'}
++            or not status.context.session_generation
++            or self._manager._blocked(self._scope, (checkpoint.appid, checkpoint.transport))
++            or (checkpoint.appid, checkpoint.transport) in self._running.values()
++            or any(not dep.ready for dep in current.dependencies)
++        ):
++            return False
++        progress = self._progress[(checkpoint.appid, checkpoint.transport)]
++        progress.baseline, progress.failure = True, None
++        progress.revision += 1
++        return True
++
++    def invalidate(self, appid, *, transport='websocket', reason='consumer_invalidated'):
++        """共享事实失效时显式关闭信任；声明的依赖者同步看到未就绪。"""
++        progress = self._progress.setdefault((str(appid), transport), _Progress())
++        progress.baseline, progress.failure = False, reason
++        progress.revision += 1
++        self._manager._invalidate_dependents(self, str(appid), transport)
++
++    def cancel(self):
++        self._close('unsubscribed')
++
++    def _close(self, reason):
++        if self._closed:
++            return
++        self._closed = reason
++        self._manager._subscriptions.pop(self.subscription_id, None)
++        if self._group:
++            self._group._close(reason)
++        for key, progress in self._progress.items():
++            self._manager._invalidate_dependents(self, *key)
++            progress.revision += 1
++            for delivery in progress.pending.values():
++                delivery._expire()
++            progress.pending.clear()
++        self._tickets.clear()
++        for task, scope in self._running.items():
++            self._manager._abandon(self, task, scope)
++        for task in (*self._running, *self._workers):
++            task.cancel()
++
++    def _prepare(self, event, delivery_id):
++        context = event.connection_context
++        appid = str(event.appid)
++        transport = context.transport if context else 'internal'
++        if not self.active or event.event_type not in self.event_types or (self.appid is not None and self.appid != appid):
++            return None
++        key = (appid, transport)
++        progress = self._progress.setdefault(key, _Progress())
++        progress.revision += 1
++        if self._manager._blocked(self._scope, key):
++            self.invalidate(appid, transport=transport, reason='old_callback_running')
++            return None
++        if (
++            context is None
++            or progress.context is None
++            or _session(context) != _session(progress.context)
++            or context.connection_generation != progress.context.connection_generation
++        ):
++            self.invalidate(appid, transport=transport, reason='unproven_event_source')
++            return None
++        sequence = context.sequence
++        if type(sequence) is not int:
++            self.invalidate(appid, transport=transport, reason='missing_sequence')
++            return None
++        # 序号只在同一实际会话内使用；不补造平台序号或承诺无限去重。
++        raw = getattr(event, 'raw', None)
++        identity = sha256(
++            json.dumps(
++                raw
++                if raw is not None
++                else (
++                    event.event_type,
++                    event.event_id,
++                    event.group_openid,
++                    event.member_openid,
++                    event.op_member_openid,
++                    event.timestamp,
++                ),
++                sort_keys=True,
++                ensure_ascii=True,
++            ).encode()
++        ).digest()
++        if sequence in progress.seen:
++            if progress.seen[sequence] != identity:
++                self.invalidate(appid, transport=transport, reason='conflicting_duplicate')
++            return None
++        if progress.high_sequence is not None and sequence <= progress.high_sequence:
++            self.invalidate(appid, transport=transport, reason='late_event')
++            return None
++        progress.high_sequence = sequence
++        progress.seen[sequence] = identity
++        if len(progress.seen) > 256:
++            progress.seen.popitem(last=False)
++        if len(progress.pending) >= self.max_pending or sum(scope == key for scope in self._running.values()) >= self.max_pending:
++            self.invalidate(appid, transport=transport, reason='overflow')
++            return None
++        if not isinstance(event, GroupLifecycleEvent):
++            event = RecoveryEvent(event.appid, event.event_type, event.event_id, _freeze(event.raw), context)
++        delivery = RecoveryDelivery(event, context)
++        progress.pending[delivery_id] = delivery
++        self._tickets[delivery_id] = (progress, delivery)
++        return delivery
++
++    def _finish(self, delivery_id, outcome):
++        item = self._tickets.pop(delivery_id, None)
++        if item is None:
++            return
++        progress, delivery = item
++        delivery._expire()
++        if progress is not self._progress.get((delivery.context.appid, delivery.context.transport)):
++            return
++        progress.pending.pop(delivery_id, None)
++        progress.revision += 1
++        if outcome != 'success' or not delivery._confirmation.acknowledged:
++            self.invalidate(delivery.context.appid, transport=delivery.context.transport, reason=outcome if outcome != 'success' else 'unconfirmed')
++
++    async def _on_group(self, event):
++        item = self._tickets.get(event.delivery_id)
++        if item is not None and item[1]._confirmation.active:
++            if self._manager._blocked(self._scope, (event.appid, event.transport)):
++                self._finish(event.delivery_id, 'old_callback_running')
++                return
++            task = asyncio.current_task()
++            assert task is not None
++            self._running[task] = (event.appid, event.transport)
++            task.add_done_callback(lambda finished: self._release(finished, item[0]))
++            await self._callback(item[1])
++
++    def _group_result(self, result):
++        self._finish(result.event.delivery_id, result.status)
++
++    def _generic(self, event):
++        delivery_id = uuid4().hex
++        delivery = self._prepare(event, delivery_id)
++        if delivery is None:
++            return
++        task = asyncio.create_task(self._invoke(delivery_id, delivery))
++        self._workers.add(task)
++        task.add_done_callback(self._workers.discard)
++        task.add_done_callback(_consume)
++
++    async def _invoke(self, delivery_id, delivery):
++        if not self.active or not delivery._confirmation.active:
++            self._finish(delivery_id, 'cancelled')
++            return
++        if self._manager._blocked(self._scope, (delivery.context.appid, delivery.context.transport)):
++            self._finish(delivery_id, 'old_callback_running')
++            return
++        task = asyncio.create_task(self._run_callback(delivery))
++        self._running[task] = (delivery.context.appid, delivery.context.transport)
++        progress = self._progress[(delivery.context.appid, delivery.context.transport)]
++        task.add_done_callback(lambda finished: self._release(finished, progress))
++        outcome = 'cancelled'
++        try:
++            done, _ = await asyncio.wait((task,), timeout=self.timeout)
++            if not done:
++                outcome = 'timeout'
++            elif not task.cancelled():
++                outcome = 'error' if task.exception() else 'success'
++        finally:
++            self._finish(delivery_id, outcome)
++            if not task.done():
++                task.cancel()
++
++    async def _run_callback(self, delivery):
++        # eager 工厂也先让创建方登记真实回调及外层任务，再执行用户代码。
++        await asyncio.sleep(0)
++        await self._callback(delivery)
++
++    def _release(self, task, progress: _Progress):
++        key = self._running.pop(task, None)
++        if self.active and key is not None and self._progress.get(key) is progress:
++            # 超时结果不代表写入者已退出；期间的重建凭据也必须单调过期。
++            progress.revision += 1
++        _consume(task)
++
++
++def _consume(task):
++    if not task.cancelled():
++        task.exception()
++
++
++class RecoveryManager:
++    """复用成员投递结果，直接观察同步连接事实，不依赖异步通知排空。"""
++
++    api_version = RECOVERY_API_VERSION
++
++    def __init__(self, connections, groups):
++        self.connections = connections
++        self.groups = groups
++        self._subscriptions = {}
++        # 注销订阅不代表它的业务写入者已经退出；守卫必须跨重载存活。
++        self._abandoned = {}
++        connections._observers.append(self._observe)
++        connections._dispatch_observers.append(self._audit_dispatch)
++
++    def _observe(self, status):
++        for subscription in tuple(self._subscriptions.values()):
++            subscription._observe(status)
++
++    def _blocked(self, scope, key):
++        return (scope, *key) in self._abandoned.values()
++
++    def _abandon(self, source, task, key):
++        if task.done() or task in self._abandoned:
++            return
++        scope = (source._scope, *key)
++        self._abandoned[task] = scope
++        for subscription in tuple(self._subscriptions.values()):
++            if subscription._scope == source._scope and (subscription.appid is None or subscription.appid == key[0]):
++                subscription.invalidate(key[0], transport=key[1], reason='old_callback_running')
++
++        def release(finished):
++            self._abandoned.pop(finished, None)
++            # 屏障期间开始的重建可能已被旧写入覆盖，退出也必须使其凭据过期。
++            for subscription in tuple(self._subscriptions.values()):
++                if subscription._scope == scope[0] and (subscription.appid is None or subscription.appid == key[0]):
++                    progress = subscription._progress.setdefault(key, _Progress())
++                    progress.revision += 1
++
++        task.add_done_callback(release)
++
++    def _audit_dispatch(self, event):
++        prepared = event._group_lifecycle_prepared if event.event_type in GROUP_LIFECYCLE_TYPES else event._recovery_prepared
++        if not prepared:
++            for subscription in tuple(self._subscriptions.values()):
++                if event.event_type in subscription.event_types and (subscription.appid is None or subscription.appid == event.appid):
++                    subscription.invalidate(event.appid, reason='unobserved_dispatch')
++
++    def _invalidate_dependents(self, source, appid, transport):
++        for subscription in tuple(self._subscriptions.values()):
++            if source in subscription.depends_on and (subscription.appid is None or subscription.appid == appid):
++                subscription.invalidate(appid, transport=transport, reason='dependency_invalidated')
++
++    def subscribe(self, callback, *, owner='unknown', event_types, appid=None, timeout=5.0, max_pending=128, depends_on=(), _scope=None):
++        if not inspect.iscoroutinefunction(callback):
++            raise TypeError('recovery callbacks must be async functions')
++        if isinstance(event_types, str):
++            raise TypeError('event_types must be a collection of event names')
++        event_types = frozenset(event_types)
++        if not event_types or any(not isinstance(name, str) or not name or name in {'READY', 'RESUMED'} for name in event_types):
++            raise ValueError('event_types must contain dispatch event names')
++        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
++            raise ValueError('timeout must be finite and positive')
++        if type(max_pending) is not int or max_pending <= 0:
++            raise ValueError('max_pending must be a positive integer')
++        depends_on = tuple(depends_on)
++        if any(not isinstance(dep, RecoverySubscription) or dep._manager is not self or not dep.active for dep in depends_on):
++            raise ValueError('dependencies must be active subscriptions from this application')
++        subscription = RecoverySubscription(self, callback, owner, event_types, str(appid) if appid is not None else None,
++                                            timeout, max_pending, depends_on, _scope=_scope)
++        self._subscriptions[subscription.subscription_id] = subscription
++        for status in self.connections.statuses:
++            subscription._observe(status)
++        if event_types & GROUP_LIFECYCLE_TYPES:
++            group = self.groups.subscribe(subscription._on_group, owner=owner, appid=appid, timeout=timeout)
++            group._on_prepare = lambda event: subscription._prepare(event, event.delivery_id)
++            group._on_result = subscription._group_result
++            subscription._group = group
++        return subscription
++
++    def prepare(self, event):
++        if event._recovery_prepared:
++            return
++        event._recovery_prepared = True
++        if event.event_type not in GROUP_LIFECYCLE_TYPES:
++            for subscription in tuple(self._subscriptions.values()):
++                subscription._generic(event)
+diff --git a/core/network/websocket.py b/core/network/websocket.py
+index d1315ca..285c8dc 100644
+--- a/core/network/websocket.py
++++ b/core/network/websocket.py
+@@ -127,10 +127,26 @@ class WSClient:
+             return
+         if self._session_id is None:
+             self._status.update_context(session_id=None, session_generation=None, resume_attempt_id=None)
+-        self._connect_task = asyncio.current_task()
+         self._closed = False
+         self._ensure_event_workers()
++        # close 只取消客户端拥有的连接循环，不取消 await connect() 的调用者。
++        connecting = self._connect_task = asyncio.create_task(self._run_connection())
+         try:
++            await connecting
++        except asyncio.CancelledError:
++            # 主动关闭允许调用者正常继续；调用者自身的取消仍须向外传播。
++            if stop_generation == self._stop_generation:
++                # 连接循环尚未开始就被取消时，其 finally 不会运行。
++                if self._connect_task is connecting:
++                    await self.close(reason='connect_cancelled')
++                raise
++            if asyncio.current_task().cancelling():
++                raise
++
++    async def _run_connection(self):
++        try:
++            # 先让创建方登记任务，兼容 eager 工厂在 create_task 内立即执行协程。
++            await asyncio.sleep(0)
+             while not self._closed:
+                 opened, failed = False, False
+                 reason = 'socket_eof'
+@@ -232,6 +248,8 @@ class WSClient:
+             await self._ws.close()
+         if connecting is not None and connecting is not asyncio.current_task():
+             await asyncio.gather(connecting, return_exceptions=True)
++            if self._connect_task is connecting:
++                self._connect_task = None
+ 
+     def _ensure_event_workers(self):
+         if any(not worker.done() for worker in self._event_workers):
+@@ -258,11 +276,13 @@ class WSClient:
+         scope = event._group_lifecycle_scope
+         waiting = self._deferred_events.get(scope)
+         if waiting is None:
+-            waiting = self._deferred_events[scope] = deque()
++            # eager 工厂可能立即开始排空，创建任务前先保存首条事件。
++            waiting = self._deferred_events[scope] = deque([event])
+             task = spawn(self._resume_deferred(scope, waiting))
+             self._deferred_tasks.add(task)
+             task.add_done_callback(self._deferred_tasks.discard)
+-        waiting.append(event)
++        else:
++            waiting.append(event)
+         return True
+ 
+     async def _resume_deferred(self, scope, waiting):
+@@ -359,6 +379,11 @@ class WSClient:
+         if self._closed:
+             return
+         event_type = payload.get('t', '')
++        if not isinstance(event_type, str) or not event_type:
++            # 必须在解析器将假值归一为空事件名之前关闭该来源的连续性信任。
++            self._resume_provable = False
++            self._status.publish('unknown', reason='invalid_dispatch_type')
++            return
+         if event_type == 'READY':
+             if self._ready_seen:
+                 return
+@@ -402,9 +427,16 @@ class WSClient:
+             return
+         try:
+             event = Event.from_websocket(self._appid, payload)
++            if event.event_type != event_type:
++                # 兼容适配器可以推导事件名，但不能改变 WS 协议声明的处理范围。
++                self._resume_provable = False
++                self._status.publish('unknown', reason='dispatch_type_mismatch')
++                return
+             event.connection_context = self._status.context
+             if self._on_event_received is not None:
+                 self._on_event_received(event, transport='websocket', session_id=self._session_id)
++            for observer in tuple(self.connection_status._dispatch_observers):
++                observer(event)
+             log.debug(f'[{self._appid}] WS事件: {event}')
+             if event_type == 'INTERACTION_CREATE':
+                 # 分发插件后用其 code 回复交互回调 (独立任务等待, 不阻塞读取循环)
+@@ -416,6 +448,8 @@ class WSClient:
+                 self._ensure_event_workers()
+                 await self._event_queue.put(event)
+         except Exception as e:
++            self._resume_provable = False
++            self._status.publish('unknown', reason='event_dispatch_failed')
+             log.error(f'[{self._appid}] 事件处理异常: {e}')
+ 
+     def _start_interaction_task(self, coro, event):
+@@ -463,7 +497,7 @@ class WSClient:
+         token = await self._tm.get_token()
+         self._auth_mode = 'resume'
+         self._resume_pending = True
+-        self._resume_from_sequence = self._seq
++        self._resume_from_sequence = self._seq if type(self._seq) is int else None
+         self._resume_provable = (
+             self._status.capabilities.replay_boundary and self._status.context.session_generation is not None and type(self._seq) is int and self._seq >= 0
+         )
+@@ -474,7 +508,7 @@ class WSClient:
+             reason='resume',
+             continuity='pending' if self._resume_provable else 'unknown',
+             login_kind='resume',
+-            resume_from_sequence=self._seq,
++            resume_from_sequence=self._resume_from_sequence,
+         )
+         await self._send_op(
+             _OP_RESUME,
+diff --git a/core/plugin/_dispatch.py b/core/plugin/_dispatch.py
+index fc7b64a..7e276ed 100644
+--- a/core/plugin/_dispatch.py
++++ b/core/plugin/_dispatch.py
+@@ -91,13 +91,17 @@ class _DispatchMixin:
+             for et, specific in by_et.items()
+         }
+ 
+-    def _handlers_for(self, et: str) -> list[dict[str, Any]]:
++    def _handlers_for(self, et: str, *, explicit_only: bool = False) -> list[dict[str, Any]]:
+         """返回该事件类型的 handler 列表 (预合并, O(1) 查找)"""
+-        return self._et_merged.get(et, self._handlers_any_et)
++        handlers = self._et_merged.get(et, self._handlers_any_et)
++        if explicit_only:
++            return [h for h in handlers if et in (h['event_types'] or ())]
++        return handlers
+ 
+     # ---------- 分发 ----------
+ 
+-    async def dispatch(self, event: Event, sender: Any) -> bool:
++    async def dispatch(self, event: Event, sender: Any, *, explicit_only: bool = False) -> bool:
++        """分发事件；explicit_only 仅匹配显式声明了当前 event_types 的处理器。"""
+         content: str = event.content or ''
+         user_id: str = event.user_id or ''
+         appid: str = event.appid or self._appid
+@@ -107,7 +111,7 @@ class _DispatchMixin:
+ 
+         # ── 非消息事件快速路径: 跳过黑名单/维护/权限检查 ──
+         if et not in _FULL_CHECK_TYPES:
+-            handlers = self._handlers_for(et)
++            handlers = self._handlers_for(et, explicit_only=explicit_only)
+             if not handlers:
+                 event.finish_dispatch()
+                 return False
+@@ -189,9 +193,15 @@ class _DispatchMixin:
+             except Exception as e:
+                 report_error(PLUGIN, ic.get('_plugin', '?'), e)
+ 
++        # 模块处理器: 已通过黑名单、维护、非@权限与拦截器, 先于插件处理器; 返回 None 表示已处理
++        if not skip_at_other and (not is_non_at or non_at_ok):
++            hooks = _hook_manager()
++            if hooks is not None and hooks.has('before_handler') and await hooks.pipeline('before_handler', event) is None:
++                return True
++
+         # 普通处理器先完成原文和斜杠兼容匹配，均未命中才进入 fallback。
+         scene = _event_scene(event)
+-        handlers = self._handlers_for(et)
++        handlers = self._handlers_for(et, explicit_only=explicit_only)
+         handler_content = content
+         if is_group_msg and _get(appid, 'non_at_message.strip_bot_name_at', False):
+             handler_content = _strip_leading_bot_name_at(content, getattr(sender, '_bot_name', '') or '')
+@@ -360,6 +370,16 @@ class _DispatchMixin:
+         return bot.log_service if bot else None
+ 
+ 
++def _hook_manager() -> Any:
++    try:
++        from core.application import get_app
++
++        app = get_app()
++    except Exception:
++        return None
++    return app.hook_manager if app is not None else None
++
++
+ def _fallback_enabled(h: dict[str, Any], event: Event) -> bool:
+     """Resolve a static fallback flag or a per-event configuration predicate."""
+     value = h.get('fallback', False)
+diff --git a/docs/group-state.md b/docs/group-state.md
+index 212009b..a52eb79 100644
+--- a/docs/group-state.md
++++ b/docs/group-state.md
+@@ -2,7 +2,7 @@
+ 
+ 对应 #21—#23；独立安装 `modules/group_state/` 完整目录，在模块管理中启用“群状态”。不需要安装授权、问答或账户扩展。数据在该目录的 `data/group-state.db`，使用与其他扩展相同的 SQLite v1 记录格式。
+ 
+-框架最低需要 F01 `460c841` 的本地恢复 v1、上游 `b410938` 的群生命周期／连接事实及 `before_event` 接收入口。当前验证组合为 QQBotForge 框架同步 `b23572b`（PR #39，来源 `460c841`、PR #38）与本业务目录；远端 personal `19e53af` 尚未具备该入口。必须先按主人审核结果同步框架，再安装业务目录；不能仅在旧框架里手工 emit Hook 代替验证。
++框架最低需要 F01 `460c841` 的本地恢复 v1、上游 `b410938` 的群生命周期／连接事实及 `before_event` 接收入口。本轮验证基线为 personal `f797ead`（已合入 #38／#39 的框架恢复与 Hook 接线）与本业务目录的真实合并候选；不能仅在旧框架里手工 emit Hook 代替验证。
+ 
+ 已登录后台打开“群状态”，选择 Bot，查看已知群，或输入群原生标识刷新 Bot 在群状态。QQ 主人可发：
+ 
+@@ -15,11 +15,19 @@
+ 
+ 已知群来自实际收到的原生群事件或主人显式刷新，界面与接口始终标明 `scope=known`、`complete=false`。不把记录总数称为平台所有群。刷新复用框架 `get_group_bot_state(return_error=True)`，只接受完整可识别的平台结果。接口许可、错误、历史状态和核验时间分别显示；查询失败、空值或未获许可不表示 Bot 已离群。历史 `bot_state` 在 `reliable=false` 时只能作历史参考。重启／重载保留历史，但先标记 `process_restart`，须重建恢复基线。
+ 
+-消费者从运行模块取得 `await group_state.snapshot(appid)`、`await group_state.refresh(appid, native_group)` 和 `group_state.capabilities()`，不要读取内部 SQLite。快照是独立副本，含 Bot、模块代际、版本、每群来源／核验时间和可靠性。进入核验与核验完成分别递增版本；不同模块代际的版本不能混用。刷新时收到同群新事实会拒绝旧结果；模块卸载后旧请求不能继续确认当前状态。
++消费者从运行模块取得 `await group_state.snapshot(appid)`、`await group_state.refresh(appid, native_group)` 和 `group_state.capabilities()`，不要读取内部 SQLite。快照是独立副本，含 Bot、模块代际、版本、每群来源／核验时间和可靠性。进入核验与核验完成分别递增版本；不同模块代际的版本不能混用。刷新时收到同群新事实会拒绝旧结果；模块卸载后旧请求不能继续确认当前状态。冷加载与等待读取锁的在途请求同样会失效：直接消费接口抛出 RuntimeError，已进入路由的 HTTP 读取返回 503；不会返回或缓存旧代际历史快照。重新启用后由新实例加载历史并重新核验。
++
++人工确认在等待提交前就递增群版本，使旧名册与分页凭据失效，并把目标成员保留为不可靠历史；失败或取消不能恢复旧证明，取消标记为 `confirmation_cancelled`。重新确认只恢复该成员，完整名册仍须单独重新核验。
++
++刷新、名册、单人核验与人工确认都以独立候选提交数据库，提交等待期间快照保持进行中的不可信状态。提交成功后再次检查模块是否仍启用及同群版本是否改变，再发布结果；卸载后返回存储不可用，不返回旧实例的完整／可靠事实。提交失败保留上一份事实作历史，该群、名册与成员标为 `persistence_failed`，修复存储后可直接重试。同群的新观察在等待写入时立即失效旧结果。取消请求时等待其数据库线程实际结束，再释放写入顺序锁和报告取消，避免迟到写入覆盖新观察。模块停止先撤销实例有效性，再异步等待 SQLite 在途操作与关闭，避免阻塞其他 Bot 和后台请求。
++
++群事件观察落库失败时，相关历史标记 `persistence_failed`，群内主人查看／刷新命令会收到存储错误提示。普通消息与未授权命令继续原消息链，错误提示仍受当前 Bot 主人及黑名单检查。失败只标记本次写入所携带且尚未落库的群；迟到的写入失败不会覆盖更新的同群事实，其他群与其他 Bot 不受影响。
++
++首次保存失败或排队取消也会结束刷新、名册及单人核验并保留历史；刷新取消后标为 `historical`、`refresh_cancelled`，名册与单人核验被取消或查询异常时同样标为 `roster_cancelled`／`verification_cancelled` 等，不留下进行中标记。首次保存尚在写锁队列中时取消，使用上述操作对应的 `*_cancelled`；若已进入 SQLite 写入，线程排空后首次保存会先将相关事实保守标为 `persistence_failed`，外层清理不覆盖该更新版本。两者都使旧证明失效，需重新核验。失败或取消的清理只修改仍属于本次操作的群版本，不能覆盖新的原生观察。平台字段类型异常按不可识别响应处理，返回 `response_unknown`，不发布可信状态。页面切换 Bot、修改群标识或发起新请求时清除旧结果与成员分页，只有当前 Bot、当前群的最新请求的成功或错误响应可以更新页面。
+ 
+ G01 提供已知群概览与 Bot 状态，G02（#22）补充分页名册及单成员核验，G03（#23）提供成员周期和恢复订阅。本模块不存功能授权、绑定或账密。新发现的群／成员使相关事实版本失效；已知成员普通聊天不重复改写成员周期，不将消息视为完整名册或连续性证明。
+ 
+-自动验证使用真实 ModuleManager 独立发现／启停／重载、Application 接收入口、鉴权 HTTP 与 QQ 主人命令，并检查多 Bot、错误保留、刷新中变更及路由卸载。使用临时数据库、假身份和平台查询／发送替身。当前业务组合 99 passed；框架版本证据见 #20。浏览器因当前会话没有可用浏览器未完成，真实平台许可未核查，未迁移生产数据。
++自动验证使用真实 ModuleManager 独立发现／启停／重载、Application 接收入口、鉴权 HTTP 与 QQ 主人命令，并检查多 Bot、错误保留、刷新中变更及路由卸载。存储故障回归使用临时 SQLite 触发器与写锁，验证失败后不发布可信事实、提交等待期间的新观察、最终保存期间重载及关闭时事件循环可继续运行。使用临时数据库、假身份和平台查询／发送替身；框架版本证据见 #20。浏览器因当前会话没有可用浏览器未完成，真实平台许可未核查，未迁移生产数据。
+ 
+ 
+ ## 成员、角色与名册完整性（G02）
+@@ -34,7 +42,7 @@ G01 提供已知群概览与 Bot 状态，G02（#22）补充分页名册及单
+ 
+ 人工确认只形成该人的有来源事实；角色未知可传 null，不能代替全群名册。群中命令只给简短处理状态，名册详情留在主人私聊或后台。
+ 
+-稳定消费接口：`sync_roster(bot, group)` 返回本轮名册报告；`verify_member(bot, group, member)` 返回单人核验；`members(bot, group, cursor='', limit=30, version=None, generation=None)` 分页读取已知事实；`confirm_member(..., evidence=..., member_role=None)` 用于已鉴权主人管理。后续页必须携带前页的版本与代际，变化后从第一页重读；持久化期间不签发分页凭据，稍后从第一页读取。HTTP 对应 `/roster`、`/member`、`/members` 和 `/confirm-member`，沿用同一会话／同源鉴权。
++稳定消费接口：`sync_roster(bot, group)` 返回本轮名册报告；`verify_member(bot, group, member)` 返回单人核验；`members(bot, group, cursor='', limit=30, version=None, generation=None)` 分页读取已知事实；`confirm_member(..., evidence=..., member_role=None)` 用于已鉴权主人管理。后续页必须携带前页的版本与代际；`next_cursor` 是不透明凭据，只对签发它的 Bot、群、代际与版本有效，换 Bot／群或变化后从第一页重读；持久化期间不签发分页凭据，稍后从第一页读取。HTTP 对应 `/roster`、`/member`、`/members` 和 `/confirm-member`，沿用同一会话／同源鉴权。
+ 
+ 平台适配器复用框架公开 `sender.get_json` 读取原始分页及单成员接口。没有使用 `get_group_members` 的补默认值结果作证明，因为该包装会为缺失字段补 `members=[]` 和 `next_cursor=''`，不能判断响应是否真的包含末页标记。每页最多 30 人、每轮最多 1000 页、每次请求 10 秒上限；空值、异常、无许可、中断、重复成员／游标、缺页和未知角色均返回不完整及原因，不推断离群。
+ 
+@@ -42,9 +50,11 @@ G01 提供已知群概览与 Bot 状态，G02（#22）补充分页名册及单
+ 
+ 历史成员与本轮名册分别保存。已知成员缺失标记 `known_member_missing`，保留缺失名单及历史，不直接删人。个人核验成功或失败、角色变化、新观察及重载都会使旧名册证明失效。完整名册不授予功能资格，也不承诺未投递变化、无穷离线期间或查询／发送原子一致性。
+ 
+-持久化未完成时，公开快照和分页接口不发布完整证明；持久化失败的 Bot 暂停事实读取，重载并重新核验后恢复。SQLite 事务不会把失败写入视为成功。该行为用临时 SQLite 写锁和触发器经公开 HTTP／快照验证，未替换存储实现。这些事实通过 G03 接入恢复确认和消费通知。
++持久化未完成时，公开快照和分页接口不发布完整证明，分页接口也不签发凭据；持久化失败时名册证明失效，修复存储后重新核验即可恢复。SQLite 事务不会把失败写入视为成功。该行为用临时 SQLite 写锁和触发器经公开 HTTP／快照验证，未替换存储实现。这些事实通过 G03 接入恢复确认和消费通知；存储重试不会跳过恢复基线与消费完成屏障。
++
++G02 先前 `95b0505` 的框架组合有 153 项业务回归通过，但独立复审仍发现人工确认失败关闭、首次写入排队取消及改群往返页面竞态三项缺口。当前补丁逐项修复并添加回归；精确 SHA、测试组合和同步结果见本轮集成审计报告。既有及新增测试覆盖独立加载、两 Bot／群、多页完整、缺页／重复／中断／角色缺失／本 Bot 缺失、已知成员冲突、并发新观察、个人核验和人工确认、旧分页失效、跨 Bot／群分页凭据、最终写入期间卸载、排队读取跨卸载、查询取消、写入失败后重试及持久化延迟。浏览器无可用实例，未执行视觉核查；真实 QQ 及其平台许可未核查。
+ 
+-G02 验证组合仍为框架 `b23572b` 与当前业务目录。完整业务回归 118 passed；覆盖独立加载、两 Bot／群、多页完整、缺页／重复／中断／角色缺失／本 Bot 缺失、已知成员冲突、并发新观察、个人核验和人工确认、旧分页失效、写入失败及持久化延迟。浏览器无可用实例，未执行视觉核查；真实 QQ 及其平台许可未核查。
++页面请求顺序回归执行实际页面脚本，使用 DOM／fetch 替身；运行 `node --test tests/bot_modules/test_group_state_page.cjs`，无需 npm 依赖。群状态 pytest 会在可用时调用该测试，没有 Node.js 时仅跳过页面脚本测试。这些脚本测试不替代浏览器视觉核查。
+ 
+ 
+ ## 生命周期、消费凭据与恢复（G03）
+diff --git a/docs/module-connection-status.md b/docs/module-connection-status.md
+index a0dc65d..ecab85e 100644
+--- a/docs/module-connection-status.md
++++ b/docs/module-connection-status.md
+@@ -124,7 +124,7 @@ stateDiagram-v2
+ 
+ `ConnectionStatus` 还提供进程内递增的 `revision`、`phase`、`reason`、`capabilities`，以及：
+ 
+-- `resume_from_sequence`：本轮 Resume 实际发送的 seq。
++- `resume_from_sequence`：本轮 Resume 实际发送的整数 seq；原始 seq 不是整数（含布尔值）时为 `None`，不公开原始对象，也不授予连续性证明。
+ - `replay_end_sequence`：可靠 RESUMED 的实际 s。
+ - `replay_end_receive_index`：本轮 RESUMED 的固定接收位置，后续收到帧也不会改写此边界。
+ 
+diff --git a/docs/module-event-hooks.md b/docs/module-event-hooks.md
+new file mode 100644
+index 0000000..8b84c63
+--- /dev/null
++++ b/docs/module-event-hooks.md
+@@ -0,0 +1,62 @@
++# 模块接收事件 Hook
++
++模块可通过 `ModuleContext.register_hook()` 或 `@ctx.hook()` 注册通用的 `before_event` 管道。Webhook、WebSocket 和自定义适配器共用此入口。
++
++该 Hook 在机器人校验、群生命周期等待、事件去重和身份转换之后，在内置生命周期处理、消息记录、未知事件报告和插件分发之前执行。没有订阅者时沿用原处理路径。
++
++回调接收 `Event`，可原样返回、返回转换后的 `Event`，或返回 `None` 表示事件已经接管。替换事件必须保留原 `appid`。Hook 按 priority 从小到大运行，返回 `None` 后停止后续 Hook 和内置处理。异常沿用通用 Hook 管道规则：记录错误并让后续回调继续接收当前事件。因此接管私有事件的模块应自行处理异常，并明确返回 `None`。
++
++```python
++async def setup(ctx):
++    @ctx.hook('before_event', priority=0)
++    async def process_custom_event(event):
++        if event.event_type != 'CUSTOM_TASK_COMPLETE':
++            return event
++        # 在模块中校验、转换并持久化自定义事件。
++        # 如需交给插件，可调用下面的通用分发入口。
++        return None
++```
++
++模块禁用时，模块管理器按 owner 自动注销 Hook。若服务需提前停止接收，可调用 `app.hook_manager.unregister('before_event', callback)` 注销自己的回调。
++
++## 仅向显式订阅者分发
++
++`await app.plugin_manager.dispatch(event, sender, explicit_only=True)` 仅匹配 `event_types` 显式包含当前事件类型的处理器。未声明 `event_types` 的通配处理器不会收到事件。正则、优先级、机器人绑定、场景限制、block 及处理器执行规则沿用原分发流程。省略此参数时保持原行为。
++
++```python
++from core.application import get_app
++
++app = get_app()
++bot = app.get_bot(event.appid)
++await app.plugin_manager.dispatch(event, bot.sender, explicit_only=True)
++```
++
++插件使用现有装饰器显式订阅：
++
++```python
++from core.plugin.decorators import handler
++
++@handler(r'^my-plugin:', event_types={'CUSTOM_TASK_COMPLETE'})
++async def on_custom_task(event, match):
++    pass
++```
++
++Hook 和分发能力不包含任何具体业务事件、接口路径或业务参数。
++
++## 插件处理器之前的模块消息 Hook
++
++普通消息由模块应答时使用 `before_handler` 管道，而不是 `before_event`。它在插件分发内部执行：消息记录、用户追踪、全量群记录、黑名单、维护模式、非@群消息权限（含忽略仅@其他 Bot／用户）和插件拦截器都已完成，随后才轮到插件处理器。不满足这些接收条件的消息不会进入此 Hook。
++
++回调接收 `Event`，原样返回则继续匹配插件处理器及默认回复；返回 `None` 表示模块已处理，后续插件处理器和默认回复不再执行。异常、优先级和按 owner 自动注销规则与其他 Hook 相同。`non_at_message.strip_bot_name_at` 只影响插件正则匹配，模块需要时自行处理 `event.content`。
++
++```python
++async def setup(ctx):
++    @ctx.hook('before_handler', priority=100)
++    async def answer(event):
++        if not await my_rules_match(event):
++            return event
++        await reply(event)
++        return None
++```
++
++非消息事件和没有插件管理器的进程不会触发此 Hook。
+diff --git a/docs/module-recovery.md b/docs/module-recovery.md
+new file mode 100644
+index 0000000..7ebbb58
+--- /dev/null
++++ b/docs/module-recovery.md
+@@ -0,0 +1,102 @@
++# 模块本地处理与恢复判定（v1）
++
++`ctx.subscribe_recovery_events` 是主动参与的状态消费者契约。QQ 官方 WS 的可信补发边界、该边界内相关事件成功处理及显式确认、同会话的已建立基线、没有已知失败或缺口，必须同时成立，才能报告 `ready=True`。连接事实接口本身不表示消费者已经恢复。
++
++## 接入
++
++```python
++async def setup(ctx):
++    async def update(delivery):
++        event = delivery.event
++        # 这四类事件仍通过框架群生命周期订阅及其真实处理结果投递。
++        await state.apply_member_event(event)
++        delivery.acknowledge()  # 必须在承诺的状态更新完成后调用
++
++    subscription = ctx.subscribe_recovery_events(
++        update,
++        event_types={'GROUP_MEMBER_ADD', 'GROUP_MEMBER_REMOVE',
++                     'GROUP_ADD_ROBOT', 'GROUP_DEL_ROBOT'},
++        appid='your-appid',
++        timeout=5.0,
++        max_pending=128,
++    )
++    return subscription
++```
++
++不要同时用普通群生命周期订阅重复更新同一状态。普通订阅保持原有契约，不会自动加入恢复判定。
++
++- `ctx.recovery_api_version == 1`。
++- `event_types` 是非空事件名集合，不能包含 `READY`、`RESUMED`。只覆盖显式声明的类型，框架不解释业务依赖。
++- `appid=None` 接收各 Bot 的事件，进度与失败仍按 Bot 和传输独立。
++- `timeout` 是单次回调开始执行后的有限正数秒；`max_pending` 是每 Bot/传输的最大在途确认数，默认 128。
++- `depends_on=(other_subscription,)` 声明同一应用内已有的恢复订阅依赖。创建时拒绝失效或外部应用的依赖，新增订阅只依赖已有订阅，形成无环图。
++- 返回 `RecoverySubscription`，提供 `subscription_id`、`owner`、`active`、`get_status`、`establish`、`invalidate`、幂等 `cancel`。
++
++`delivery.event`：上述四类是原有不可变 `GroupLifecycleEvent`，保留原生群/成员身份、平台事件 ID、序号、时间和连接上下文；其他 Dispatch 类型是不可变 `RecoveryEvent`，包含 `appid`、`event_type`、`event_id`、递归只读的原始 `raw` 和 `connection_context`。通用消费者和普通插件不共享可变事件对象。
++
++`delivery.context` 是实际接收时的连接上下文。`delivery.acknowledge()` 返回确认是否仍有效；超时、会话替换、取消或卸载后的迟到确认返回 False。确认只表明消费者承诺的工作已经完成；它还必须结合框架观察到的回调成功返回。先确认再抛异常仍然失败。回调返回却未确认记为 `unconfirmed`，启动后台任务后返回不能使订阅恢复。
++
++## 初次启动与重建基线
++
++首次 READY、进程重启、新会话、晚加入或重载订阅都没有自动可信的历史状态。消费者必须自行从可靠来源建立状态，再显式提交基线：
++
++```python
++checkpoint = subscription.get_status(appid)
++# 在消费者自己的锁/事务安排中完成状态重建，处理与事件回调的互斥。
++await state.rebuild_from_authoritative_source()
++if not subscription.establish(checkpoint):
++    # 期间发生相关事件、连接变化、依赖变化、尚有处理或旧回调未退出。
++    # 本次凭据已失效，需要重新取凭据并重新重建，不能只重试确认。
++    schedule_rebuild()
++```
++
++应在 `get_connection_status(appid).phase` 为 `ready` 或可信 `replay_complete` 时尝试重建。`establish` 不进行平台查询，也不验证重建算法；它是消费者对可靠基线的明确声明。重建与事件回调的状态写入互斥由消费者负责。重建期间任何相关接收、处理结果、状态/代际或依赖凭据变化都会拒绝旧 checkpoint。不能把磁盘旧数据加载完直接当作连续性证明。
++
++调用者需要主动失效共享事实时：
++
++```python
++subscription.invalidate(appid, reason='consumer_invalidated')
++```
++
++失败保持到显式重建并建立新基线。依赖者会同步失效；上游依赖恢复后，依赖者也必须重建自己的状态。框架不决定哪些业务命令暂停。
++
++## 查询进度
++
++`subscription.get_status(appid, transport='websocket')` 返回不可变 `RecoveryStatus`：
++
++| 字段 | 含义 |
++| --- | --- |
++| `subscription_id`、`appid`、`transport` | 独立消费者和来源范围 |
++| `revision`、`context` | 本地进度版本和最近连接转换上下文；不作为平台完成序号 |
++| `phase`、`reason`、`ready` | 判定及原因 |
++| `pending` | 当前会话所有在途确认数量 |
++| `boundary_pending` | 当前固定补发边界内尚未成功完成的数量，含断线前已接收但未完成的事件 |
++| `replay_end_sequence`、`replay_end_receive_index` | 来源接口提供的固定补发结束位置 |
++| `failed` | 本消费者是否存在必须重建的已知失败 |
++| `dependencies` | 声明的依赖快照，作为基线凭据的一部分 |
++
++`phase`：`needs_baseline`（含失败）、`unsupported`、`recovering`、`processing`、`ready`、`dependency_failed` 或 `closed`。`failed=False` 不代表已就绪，例如初次启动和等待处理。
++
++首次在线建立基线后，相关事件在途时暂时为 `processing`。同一会话恢复后，`ready` 明确对应固定补发边界：边界之后的新事件不会把目标无限向前移动，可能同时出现 `ready=True`、`pending>0`、`boundary_pending=0`。这不能作为“所有最新在线事件均已处理完”的证明。边界之后的新失败仍会撤销当前信任。
++
++没有通过等待所有插件、清空队列、`_on_event` 返回或异步连接通知处理成功来推断就绪。
++
++## 隔离、顺序及异常
++
++- 按 runtime、Bot 实例、会话区分基线；按连接/恢复轮次和接收位置固定补发范围。恢复同一会话时保留断线前在途记录；新会话使旧凭据失效并取消旧回调。旧确认不能改变新会话的进度。
++- 群生命周期继续使用既有 Bot/群接收顺序、回调超时及处理结果；其他事件独立并发，不占用普通插件的并发槽位。消费者自行安排其状态更新顺序；框架的未完成集合保证乱序完成不能越过任何边界内的未完成事件。
++- 群顺序预登记和恢复登记各自幂等；适配器已登记群顺序时，应用接收入口仍须登记恢复处理。普通分发被扩展接管或变换，不能替代确认，也不能改写接收时已经记录的恢复事件范围。
++- 每次确认、回调异常、自取消、超时、取消订阅、模块卸载和 setup 失败都经过实际生命周期处理。卸载/重载注销原订阅，新订阅拥有新身份和空基线。
++- 取消不合作的回调不会被无限等待；其实际运行仍占该消费者/Bot 的容量，退出前不能建立基线。注销或会话替换后，尚未退出的真实回调由管理器继续持有，按模块安装槽位、Bot、传输保留隔离屏障；同范围的新订阅及其他订阅不能建立基线，新事件不再调用这些消费者并记为 `old_callback_running`。重复取消、卸载或重载不能绕过屏障启动更多写入者，无关模块和 Bot 继续处理。单个仍有效订阅超时继续按订阅隔离；其注销后仍活跃的回调也转交上述屏障。
++- 安装槽位身份在 `ModuleContext` 创建时由模块目录捕获，独立于可修改、不保证唯一的展示名 `owner`。相对路径和父目录符号链接归一化后，同一槽位跨重载、元数据更名、更新和 `ModuleManager` 重建保持一致；不同模块目录或不同管理根目录的槽位互不影响。最后一层模块目录符号链接保留为安装入口，因此它切换到新版本目录仍受原屏障约束。直接创建 `ModuleContext(name, module_dir, hooks)` 也遵循相同规则；移到另一安装槽位视为另一模块，若确实共享状态需显式声明依赖。
++- 回调真正退出并完成记账后会更新 `revision`：仍有效订阅的超时回调只更新自身 Bot/传输的进度；注销或会话替换后的旧回调沿用上述同范围屏障。退出完成记账前不能建立基线，期间取得的 checkpoint 即使在退出后提交也会被拒绝，必须退出后重新取凭据并重新重建状态。超时失败不会因回调晚返回、晚确认、晚抛异常或自取消而清除。消费者不能让派生后台任务越过自己的确认承诺；框架无法撤销已经发生的业务写入。
++- 回调内部主动取消自己的订阅时，仍未退出的真实回调也保留上述屏障；启用 eager 任务调度不会绕过这一约束。
++- 超过容量标为 `overflow` 并撤销信任，后续成功不能抹去缺口。普通插件和无关消费者继续处理。此上限约束本机制在途凭据与通用消费者任务；既有群生命周期接收队列沿用原实现。
++- 同会话最近 256 个相关序号保留载荷摘要，用于抑制重复。相同序号但不同契约载荷标为 `conflicting_duplicate`；超出记录窗口的旧序号或倒退序号标为 `late_event` 并要求重建。没有无限去重或外部发送恰好一次承诺。
++- 缺失序号、无法匹配来源、适配器未登记实际接收、协议未知/失败、事件解析或登记异常均不能恢复。WebSocket Dispatch 的 `t` 必须为非空字符串；缺失、空值和其他类型会在解析前以 `invalid_dispatch_type` 关闭该来源的恢复信任。解析后的事件名还必须与协议 `t` 一致；兼容平铺载荷若改变类型，会在接收登记及任何消费者投递前以 `dispatch_type_mismatch` 拒绝，并撤销该来源的信任。后续 `RESUMED` 或成功处理不能自动消除这些缺口。Webhook 和直接调用事件解析器的适配器继续保留平铺入群申请兼容。单个消费者处理失败仅影响其自身 Bot/来源和显式依赖者；接收链路存在共同缺口时，同来源所有实际依赖消费者都会失效。
++
++## 适用范围
++
++连续恢复首版只支持已有连接接口认定可信的 QQ 官方 WS。Webhook、自定义 URL/网关等返回 `unsupported`，即使收到同名 RESUMED，也不能建立本契约的连续恢复保证。它们仍保持原有事件和状态事实覆盖。
++
++依据：[QQ 官方事件订阅与恢复协议](https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/interface-framework/event-emit.html)。本机制只组合实际接收、可信协议边界及已确认的本地处理，不承诺无限离线补发、发现平台尚未投递的事件、跨进程连续性、查询与发送原子一致或具体业务验收。
+diff --git a/docs/verification/module-contract-f01.md b/docs/verification/module-contract-f01.md
+new file mode 100644
+index 0000000..c38ce6c
+--- /dev/null
++++ b/docs/verification/module-contract-f01.md
+@@ -0,0 +1,56 @@
++# F01 框架公开契约验收
++
++核对日期：2026-10-20，对应 QQBotForge #20。此记录仅验收框架契约，群状态和授权接入分别由 #23、#24 完成。
++
++## 精确版本
++
++| 来源 | 固定版本 | 核对结果 |
++| --- | --- | --- |
++| [ElainaBot v2 upstream/main](https://github.com/ElainaCore/ElainaBot_v2/commit/b410938ed5aead906f9e5256228108057bb5dbd9) | `b410938ed5aead906f9e5256228108057bb5dbd9` | 已包含 #108 群事件、#110 连接及通用接收 Hook；没有本地恢复确认契约 |
++| QQBotForge origin/main | `398c6afe70055589d1f12ab35affe66ca6e2396c` | 相关事件、连接及消息入口与上游一致；本票以此为框架起点 |
++| 本地 personal | `3509cd9` | 在框架旧基线上已有本地恢复及多轮修复；消费者未接入，不能视为业务验收 |
++| 远端 personal | `19e53af82fbcc69a7a54c51ac3609f8821ef56fb` | 尚无本地恢复；业务 B01 基于此版本独立交付 |
++| 本票框架交付 | `feat/module-recovery-f01` | 将既有恢复实现及修复移植到当前 main，再修复群顺序预登记跳过恢复登记的兼容问题；最终源码提交在 PR／票据结果中固定 |
++
++复用 personal 的 `ce464e3`、`3498e71`、`dfcc431`、`0db9e37`、`8ff1a04`、`3509cd9`。上游已含的群队列优化、BotRegistry 查询、before_event 和显式类型分发不重复移植。没有取走原工作树未提交修改。
++
++## 消费接口与信任
++
++- `group_lifecycle_api_version == 1`：四类群事件保留原生身份、来源、时间、事件 ID、序号；回调完成／失败／超时／取消／卸载结果在同群后续业务派发前登记。普通插件启停、维护和黑白名单不屏蔽观察。
++- `connection_status_api_version == 1`：只报告连接及协议事实，`READY`、`RESUMED` 和 `replay_complete` 不代表本地业务已处理。
++- `recovery_api_version == 1`：同会话可靠补发边界、已建立基线、边界内处理成功和显式确认缺一不可；首次启动、新会话、已知缺口、未知来源、失败和依赖失效均需重建。
++- 群事件只通过恢复订阅应用一次，不再另订阅普通群生命周期重复写入。非群事件的恢复登记独立于群顺序登记，预登记群顺序不能跳过恢复消费者。
++- `acknowledge` 必须位于持久化及承诺工作完成之后。后台任务启动、普通插件返回及迟到确认不能恢复信任。旧写入者实际退出前，同安装槽位新订阅不能建立基线，退出也使期间取得的重建凭据失效。
++- 官方 QQ WS 是当前连续恢复支持来源；Webhook、自定义网关和未登记适配器明确不具备该证明，仍可使用其实际支持的事件事实。
++
++详细字段、订阅／卸载和依赖语义见[本地恢复契约](../module-recovery.md)、[群事件](../module-group-lifecycle.md)、[连接事实](../module-connection-status.md)与[接收 Hook](../module-event-hooks.md)。框架不能撤销消费者已经发生的外部写入，也不证明平台未投递事件或查询与发送的原子一致性。
++
++## 可复现实例与证据
++
++测试资产独立提交到 `ci-assets`，不安装到运行插件目录。`tests/fixtures/modules/recovery_consumer/main.py` 展示真实模块加载、消费与确认；`tests/core/test_recovery_application_integration.py` 从可控 WS 帧经过真实 Application、BotRegistry、ModuleContext 与 PluginManager 验证接线。网络、存储及身份使用替身和临时目录。
++
++从最终源码提交导出干净副本，叠加固定测试资产版本后运行：
++
++```bash
++mkdir -p /tmp/qqbotforge-source
++git archive SOURCE_SHA | tar -x -C /tmp/qqbotforge-source
++# 在单独测试资产 clone 中导出；不要覆盖运行目录。
++git -C /path/to/test-assets archive ASSET_SHA tests | tar -x -C /tmp/qqbotforge-source
++cd /tmp/qqbotforge-source
++python -m pytest -q
++python -m pytest tests/core/test_recovery_application_integration.py -q
++```
++
++测试版本及结果（源码、测试资产最终 SHA 在票据／PR 固定）：
++
++| 验证层 | 结果 |
++| --- | --- |
++| Python 3.11.15 全部框架测试 | 712 passed、5 skipped；跳过的是 Python 3.12+ eager 调度变体 |
++| 成员／连接／恢复专项 | 271 passed、5 skipped |
++| Python 3.13.13 eager 专项 | 4 passed、140 deselected；使用既有环境的 Python 包路径，无新增运行依赖 |
++| 静态检查 | 8 个相关框架文件 Ruff 通过；恢复实现 mypy `--check-untyped-defs --follow-imports=silent` 通过 |
++| 算法与真实框架接线 | 原始协议帧、同群前置屏障、基线、依赖、乱序／缺口、卸载／重载、超时和旧写入者均有测试；预登记跳过恢复用例先失败后通过 |
++| 浏览器 | 未执行，本票无页面改动 |
++| 真实平台许可 | 未执行，未使用真实 QQ、凭据或平台成员数据 |
++
++此结果不启用业务模块、不迁移生产数据、不改变运行实例。PR 保留 draft，合并及部署由主人决定。
+diff --git a/modules/group_state/main.py b/modules/group_state/main.py
+index bca50dd..446adf4 100644
+--- a/modules/group_state/main.py
++++ b/modules/group_state/main.py
+@@ -20,7 +20,7 @@ async def setup(ctx):
+         register_route('*', PREFIX + '*', candidate.http, auth=True)
+         register_page('group-state', '群状态', source='module', source_name='group_state', html_file=str(Path(__file__).with_name('page.html')))
+     except BaseException:
+-        candidate.close()
++        await candidate.aclose()
+         raise
+     _instance = candidate
+     return candidate
+@@ -30,6 +30,6 @@ async def teardown():
+     global _instance
+     unregister_route('*', PREFIX + '*')
+     unregister_page('group-state')
+-    if _instance is not None:
+-        _instance.close()
+-        _instance = None
++    instance, _instance = _instance, None
++    if instance is not None:
++        await instance.aclose()
+diff --git a/modules/group_state/page.html b/modules/group_state/page.html
+index 3c248ed..8670630 100644
+--- a/modules/group_state/page.html
++++ b/modules/group_state/page.html
+@@ -15,15 +15,19 @@
+ <script>
+ (()=>{
+  const bot=document.getElementById('gs-bot'), status=document.getElementById('gs-status'), output=document.getElementById('gs-output');
+- let memberPage=null;
+- async function run(action='', next=false){
+-  status.textContent='正在读取…';
++ const groupInput=document.getElementById('gs-group'), next=document.getElementById('gs-next');
++ let latestRequest=0, memberPage=null;
++ // Pagination belongs to one Bot and group; any newer selection or request retires it.
++ function clearPage(){memberPage=null;next.disabled=true;}
++ async function run(action='', nextPage=false){
++  const request=++latestRequest, appid=bot.value, group=groupInput.value.trim(), page=nextPage?memberPage:null;
++  const isCurrent=()=>request===latestRequest&&appid===bot.value&&(!action||group===groupInput.value.trim());
++  clearPage();output.textContent='';status.textContent='正在读取…';
+   try {
+-   const group=document.getElementById('gs-group').value.trim();
+-   const query=new URLSearchParams({bot:bot.value});
++   const query=new URLSearchParams({bot:appid});
+    if(action==='members'){
+     query.set('group',group);query.set('limit','30');
+-    if(next&&memberPage){for(const key of ['generation','version'])query.set(key,memberPage[key]);query.set('cursor',memberPage.next_cursor);}
++    if(page){for(const key of ['generation','version'])query.set(key,page[key]);query.set('cursor',page.next_cursor);}
+    }
+    let body={group};
+    if(action==='member'||action==='confirm-member')body.member=document.getElementById('gs-member').value.trim();
+@@ -33,16 +37,17 @@
+     method:writing?'POST':'GET',credentials:'same-origin',headers:writing?{'Content-Type':'application/json'}:{},
+     ...(writing?{body:JSON.stringify(body)}:{})});
+    const data=await response.json();
++   if(!isCurrent())return;
+    if(!response.ok||!data.success)throw Error(data.error||data.message||'读取失败');
+-   if(action==='members')memberPage=data.data;else memberPage=null;
+-   document.getElementById('gs-next').disabled=!memberPage?.next_cursor;
++   if(action==='members'&&data.data?.group===group){memberPage=data.data;next.disabled=!memberPage.next_cursor;}
+    output.textContent=JSON.stringify(data.data,null,2);status.textContent='已更新：请结合完整性、来源与历史标记查看核验结果';
+-  }catch(error){status.textContent=error.message;output.textContent='';memberPage=null;document.getElementById('gs-next').disabled=true;}
++  }catch(error){if(isCurrent()){status.textContent=error.message;output.textContent='';}}
+  }
+  document.getElementById('gs-rebuild').onclick=()=>run('rebuild');document.getElementById('gs-load').onclick=()=>run();document.getElementById('gs-refresh').onclick=()=>run('refresh');
+  document.getElementById('gs-roster').onclick=()=>run('roster');document.getElementById('gs-members').onclick=()=>run('members');
+- document.getElementById('gs-next').onclick=()=>run('members',true);document.getElementById('gs-verify').onclick=()=>run('member');
++ next.onclick=()=>run('members',true);document.getElementById('gs-verify').onclick=()=>run('member');
+  document.getElementById('gs-confirm').onclick=()=>run('confirm-member');
++ groupInput.oninput=()=>{++latestRequest;clearPage();output.textContent='';status.textContent='请选择操作读取当前群';};
+  bot.onchange=()=>run();
+  fetch('/api/bots',{credentials:'same-origin'}).then(r=>r.json()).then(data=>{
+   const rows=data.data?.bots||data.bots||[];
+diff --git a/modules/group_state/state.py b/modules/group_state/state.py
+index 6328429..3b31fee 100644
+--- a/modules/group_state/state.py
++++ b/modules/group_state/state.py
+@@ -2,6 +2,7 @@
+ 
+ import asyncio
+ import copy
++import hashlib
+ import json
+ import sqlite3
+ import time
+@@ -45,7 +46,7 @@ class GroupState:
+         self.write_locks = {}
+         self.refresh_locks = {}
+         self.roster_locks = {}
+-        self.failed_bots = set()
++        self.durable = {}
+         self.pending_writes = {}
+ 
+     @staticmethod
+@@ -67,13 +68,25 @@ class GroupState:
+             self.connection_subscription.cancel()
+         self.store.close()
+ 
++    async def aclose(self):
++        self.active = False
++        if hasattr(self, 'notifications'):
++            self.notifications.close()
++            self.recovery.cancel()
++            self.connection_subscription.cancel()
++        await asyncio.to_thread(self.store.close)
++
+     async def _state(self, bot):
+         identifier(bot)
+-        if not self.active or bot in self.failed_bots:
+-            raise RuntimeError('群状态模块未启用或该 Bot 持久化失败')
++        if not self.active:
++            raise RuntimeError('群状态模块未启用')
+         async with self.load_locks.setdefault(bot, asyncio.Lock()):
++            if not self.active:
++                raise RuntimeError('群状态模块未启用')
+             if bot not in self.states:
+                 state = await self.store.get(bot, 'group_state', 'state') or {'schema_version': 1, 'version': 0, 'groups': {}}
++                if not self.active:
++                    raise RuntimeError('群状态模块已卸载')
+                 if state.get('schema_version') != 1:
+                     raise RuntimeError('群状态数据版本不兼容')
+                 for group in state['groups'].values():
+@@ -84,24 +97,76 @@ class GroupState:
+                     for member in group['members'].values():
+                         member.update(reliable=False, status='left' if member.get('status') == 'left' else 'historical', reason='process_restart')
+                 state['version'] += 1
++                self.durable[bot] = {}
+                 self.states[bot] = state
+         return self.states[bot]
+ 
++    async def _commit(self, bot, state, native, apply):
++        """Persist a detached candidate; publish it only if its group stayed current.
++
++        Readers keep seeing the in-progress fact until the write succeeds, and a failed
++        write leaves the previous fact as history.
++        """
++        group = state['groups'][native]
++        version = group['version']
++        self.pending_writes[bot] = self.pending_writes.get(bot, 0) + 1
++        try:
++            async with self.write_locks.setdefault(bot, asyncio.Lock()):
++                if not self.active:
++                    raise RuntimeError('群状态模块已卸载')
++                if group['version'] != version:
++                    return False
++                candidate = copy.deepcopy(state)
++                apply(candidate, candidate['groups'][native])
++                await self.store.put(bot, 'group_state', 'state', candidate)
++                self.durable[bot] = {key: value['version'] for key, value in candidate['groups'].items()}
++                if not self.active:
++                    raise RuntimeError('群状态模块已卸载')
++                if group['version'] != version:
++                    return False
++                group.clear()
++                group.update(candidate['groups'][native])
++                state['version'] += 1
++                return True
++        finally:
++            self.pending_writes[bot] -= 1
++
++    def _abandon(self, state, group, version, error, label):
++        # An interrupted operation must not leave its in-progress marker as the latest fact.
++        if group['version'] != version:
++            return None
++        if isinstance(error, asyncio.CancelledError):
++            reason = label + '_cancelled'
++        elif isinstance(error, (sqlite3.Error, OSError)):
++            reason = 'persistence_failed'
++        else:
++            reason = label + '_failed'
++        self._invalidate(state, group, reason)
++        if reason == 'persistence_failed':
++            group.update(reliable=False, status='historical', reason=reason)
++            for member in group['members'].values():
++                member.update(reliable=False, reason=reason)
++        return reason
++
+     async def _save(self, bot, state):
+         self.pending_writes[bot] = self.pending_writes.get(bot, 0) + 1
+         try:
+             async with self.write_locks.setdefault(bot, asyncio.Lock()):
+-                if bot in self.failed_bots:
+-                    raise RuntimeError('该 Bot 持久化已失效，需要重载并重新核验')
+-                await self.store.put(bot, 'group_state', 'state', state)
+-        except BaseException:
+-            self.failed_bots.add(bot)
+-            for group in state['groups'].values():
+-                group.update(reliable=False, reason='persistence_failed')
+-                group['roster'].update(complete=False, reason='persistence_failed')
+-                for member in group['members'].values():
+-                    member.update(reliable=False, reason='persistence_failed')
+-            raise
++                written = {native: group['version'] for native, group in state['groups'].items()}
++                try:
++                    await self.store.put(bot, 'group_state', 'state', state)
++                except BaseException:
++                    # Retire only the facts this write carried; newer ones belong to a queued write.
++                    durable = self.durable.get(bot, {})
++                    for native, version in written.items():
++                        group = state['groups'][native]
++                        if group['version'] == version and durable.get(native) != version:
++                            self._invalidate(state, group, 'persistence_failed')
++                            group.update(reliable=False, status='historical', reason='persistence_failed')
++                            for member in group['members'].values():
++                                member.update(reliable=False, reason='persistence_failed')
++                    raise
++                self.durable[bot] = written
+         finally:
+             self.pending_writes[bot] -= 1
+ 
+@@ -200,55 +265,69 @@ class GroupState:
+             self._invalidate(state, group, 'bot_state_refreshing')
+             group.update(reliable=False, status='pending', reason='refreshing')
+             version = group['version']
+-            await self._save(bot, state)
+-            sender = self.sender_provider(bot)
+-            data, error, reason = None, None, ''
+-            if sender is None or not hasattr(sender, 'get_group_bot_state'):
+-                reason = 'unsupported'
+-            else:
+-                try:
+-                    result = await sender.get_group_bot_state(native, return_error=True)
+-                    if isinstance(result, tuple) and len(result) == 2:
+-                        data, error = result
+-                    else:
+-                        reason = 'response_unknown'
+-                except Exception:
+-                    reason = 'query_failed'
+-            if not self.active:
+-                raise RuntimeError('群状态模块已卸载')
+-            if group['version'] != version:
+-                return {**self._public_group(bot, group), 'reliable': False, 'reason': 'state_changed'}
+-            if isinstance(error, dict):
+-                reason = 'permission_denied' if str(error.get('code')) == '11253' else 'query_failed'
+-            valid = (
+-                not reason
+-                and error is None
+-                and isinstance(data, dict)
+-                and data.get('member_role') in {'owner', 'admin', 'member'}
+-                and isinstance(data.get('recv_msg_setting'), str)
+-                and bool(data['recv_msg_setting'])
+-                and isinstance(data.get('allow_proactive_msg'), bool)
+-            )
+-            self._invalidate(state, group, 'bot_state_refreshed')
+-            group.update(
+-                checked_at=self.clock(),
+-                reliable=bool(valid),
+-                status='verified' if valid else 'historical',
+-                reason='' if valid else reason or 'response_unknown',
+-            )
+-            if valid and isinstance(data, dict):
+-                group.update(
+-                    source='platform_bot_state',
+-                    bot_state={
+-                        'member_role': data['member_role'],
+-                        'recv_msg_setting': data['recv_msg_setting'],
+-                        'allow_proactive_msg': data['allow_proactive_msg'],
+-                        'in_group': True,
+-                    },
++            try:
++                await self._save(bot, state)
++                sender = self.sender_provider(bot)
++                data, error, reason = None, None, ''
++                if sender is None or not hasattr(sender, 'get_group_bot_state'):
++                    reason = 'unsupported'
++                else:
++                    try:
++                        result = await sender.get_group_bot_state(native, return_error=True)
++                        if isinstance(result, tuple) and len(result) == 2:
++                            data, error = result
++                        else:
++                            reason = 'response_unknown'
++                    except Exception:
++                        reason = 'query_failed'
++                if not self.active:
++                    raise RuntimeError('群状态模块已卸载')
++                if group['version'] != version:
++                    return {**self._public_group(bot, group), 'reliable': False, 'reason': 'state_changed'}
++                if isinstance(error, dict):
++                    reason = 'permission_denied' if str(error.get('code')) == '11253' else 'query_failed'
++                valid = (
++                    not reason
++                    and error is None
++                    and isinstance(data, dict)
++                    and isinstance(data.get('member_role'), str)
++                    and data.get('member_role') in {'owner', 'admin', 'member'}
++                    and isinstance(data.get('recv_msg_setting'), str)
++                    and bool(data['recv_msg_setting'])
++                    and isinstance(data.get('allow_proactive_msg'), bool)
+                 )
+-            await self._save(bot, state)
+-            await self._notify(bot, group, 'bot_state_refreshed')
+-            return self._public_group(bot, group)
++
++                def apply(candidate, updated):
++                    self._invalidate(candidate, updated, 'bot_state_refreshed')
++                    updated.update(
++                        checked_at=self.clock(),
++                        reliable=bool(valid),
++                        status='verified' if valid else 'historical',
++                        reason='' if valid else reason or 'response_unknown',
++                    )
++                    if valid and isinstance(data, dict):
++                        updated.update(
++                            source='platform_bot_state',
++                            bot_state={
++                                'member_role': data['member_role'],
++                                'recv_msg_setting': data['recv_msg_setting'],
++                                'allow_proactive_msg': data['allow_proactive_msg'],
++                                'in_group': True,
++                            },
++                        )
++
++                if not await self._commit(bot, state, native, apply):
++                    return {**self._public_group(bot, group), 'reliable': False, 'reason': 'state_changed'}
++                committed_version = group['version']
++                await self._notify(bot, group, 'bot_state_refreshed')
++                result = self._public_group(bot, group)
++                if group['version'] != committed_version:
++                    result.update(reliable=False, reason='state_changed')
++                return result
++            except BaseException as error:
++                if reason := self._abandon(state, group, version, error, 'refresh'):
++                    group.update(status='historical', reason=reason)
++                raise
+ 
+     @staticmethod
+     def _invalidate(state, group, reason):
+@@ -266,44 +345,51 @@ class GroupState:
+             for record in group['members'].values():
+                 record.update(reliable=False, status='historical', reason='roster_refreshing')
+             version = group['version']
+-            await self._save(bot, state)
+-            report = await self.reader.roster(bot, native_group)
+-            if not self.active:
+-                raise RuntimeError('群状态模块已卸载')
+-            changed = group['version'] != version
+-            if changed:
+-                report.update(complete=False, reason='state_changed')
+-            elif report['complete'] and known - {r['member'] for r in report['members']}:
+-                report.update(complete=False, reason='known_member_missing', missing_known_members=sorted(known - {r['member'] for r in report['members']}))
+-            checked = self.clock()
+-            if not changed:
+-                for record in report['members']:
+-                    reliable = record['member_role'] is not None
+-                    self._merge_member(
+-                        group,
+-                        {
++            try:
++                await self._save(bot, state)
++                report = await self.reader.roster(bot, native_group)
++                if not self.active:
++                    raise RuntimeError('群状态模块已卸载')
++                if group['version'] != version:
++                    report.update(complete=False, reason='state_changed')
++                    return copy.deepcopy(report)
++                if report['complete'] and known - {r['member'] for r in report['members']}:
++                    report.update(complete=False, reason='known_member_missing', missing_known_members=sorted(known - {r['member'] for r in report['members']}))
++                checked = self.clock()
++
++                def apply(candidate, updated):
++                    for record in report['members']:
++                        reliable = record['member_role'] is not None
++                        self._merge_member(updated, {
+                             **record,
+                             'reliable': reliable,
+                             'status': 'present' if reliable else 'pending',
+                             'reason': '' if reliable else 'role_missing',
+                             'source': 'platform_roster',
+                             'checked_at': checked,
+-                        },
++                        })
++                    if any(not updated['members'][r['member']]['reliable'] for r in report['members']):
++                        report.update(complete=False, reason='stale_membership')
++                    self._invalidate(candidate, updated, report['reason'])
++                    report.update(
++                        id=uuid4().hex, generation=self.generation, version=updated['version'], group=native_group, source='platform_roster', checked_at=checked
+                     )
+-            self._invalidate(state, group, report['reason'])
+-            report.update(
+-                id=uuid4().hex, generation=self.generation, version=group['version'], group=native_group, source='platform_roster', checked_at=checked
+-            )
+-            if not changed and any(not group['members'][r['member']]['reliable'] for r in report['members']):
+-                report.update(complete=False, reason='stale_membership')
+-            group['roster'] = copy.deepcopy(report)
+-            await self._save(bot, state)
+-            await self._notify(bot, group, 'roster_refreshed')
+-            if group['version'] != report['version']:
+-                report.update(complete=False, reason='state_changed')
+-            if not self._ready(bot):
+-                report.update(complete=False, continuity_reason='recovery_pending')
+-            return copy.deepcopy(report)
++                    updated['roster'] = copy.deepcopy(report)
++
++                if not await self._commit(bot, state, native_group, apply):
++                    report.update(complete=False, reason='state_changed')
++                else:
++                    await self._notify(bot, group, 'roster_refreshed')
++                    if group['version'] != report['version']:
++                        report.update(complete=False, reason='state_changed')
++                if not self._ready(bot):
++                    report.update(complete=False, continuity_reason='recovery_pending')
++                return copy.deepcopy(report)
++            except BaseException as error:
++                if reason := self._abandon(state, group, version, error, 'roster'):
++                    for record in group['members'].values():
++                        record.update(reason=reason)
++                raise
+ 
+     async def verify_member(self, bot, native_group, member):
+         identifier(native_group)
+@@ -315,26 +401,48 @@ class GroupState:
+         record = group['members'].setdefault(member, {'member': member, 'member_role': None, 'bot': None})
+         previous = copy.deepcopy(record)
+         record.update(reliable=False, status='pending', reason='verifying')
+-        await self._save(bot, state)
+-        result = await self.reader.member(bot, native_group, member)
+-        if not self.active:
+-            raise RuntimeError('群状态模块已卸载')
+-        if group['version'] != version:
+-            return {**copy.deepcopy(record), 'state': 'unknown', 'reliable': False, 'reason': 'state_changed'}
+-        record = {**record}
+-        record.update(
+-            result,
+-            source='platform_member',
+-            checked_at=self.clock(),
+-            reliable=result['state'] == 'present',
+-            status='present' if result['state'] == 'present' else 'pending',
+-        )
+-        record = self._merge_member(group, record, previous=previous)
+-        self._invalidate(state, group, 'individual_verification')
+-        version = group['version']
+-        await self._save(bot, state)
+-        await self._notify(bot, group, 'member_verified')
+-        return self._member_result(bot, group, record, version)
++        try:
++            await self._save(bot, state)
++            result = await self.reader.member(bot, native_group, member)
++            if not self.active:
++                raise RuntimeError('群状态模块已卸载')
++            if group['version'] != version:
++                return {**copy.deepcopy(record), 'state': 'unknown', 'reliable': False, 'reason': 'state_changed'}
++            fact = dict(
++                result,
++                source='platform_member',
++                checked_at=self.clock(),
++                reliable=result['state'] == 'present',
++                status='present' if result['state'] == 'present' else 'pending',
++            )
++            return await self._commit_member(bot, state, native_group, member, fact, previous=previous)
++        except BaseException as error:
++            if reason := self._abandon(state, group, version, error, 'verification'):
++                record.update(status='historical', reason=reason)
++            raise
++
++    async def _commit_member(self, bot, state, native_group, member, fact, *, previous=None, manual=False):
++        published: dict = {}
++
++        def apply(candidate, updated):
++            self._merge_member(updated, {'member': member, **fact}, manual=manual, previous=previous)
++            self._invalidate(candidate, updated, 'individual_verification')
++            published.update(updated['members'][member], group=native_group, version=updated['version'], generation=self.generation)
++
++        group = state['groups'][native_group]
++        if not await self._commit(bot, state, native_group, apply):
++            current = group['members'].get(member, {'member': member})
++            return {
++                **copy.deepcopy(current),
++                'group': native_group,
++                'version': group['version'],
++                'generation': self.generation,
++                'reliable': False,
++                'state': 'unknown',
++                'reason': 'state_changed',
++            }
++        await self._notify(bot, group, 'member_confirmed' if manual else 'member_verified')
++        return self._member_result(bot, group, published, published['version'])
+ 
+     async def confirm_member(self, bot, native_group, member, *, evidence, member_role=None):
+         identifier(native_group)
+@@ -345,25 +453,28 @@ class GroupState:
+             raise ValueError('角色须为 member、admin、owner 或 null')
+         state = await self._state(bot)
+         group = self._group(state, native_group)
+-        record = group['members'].setdefault(member, {'member': member, 'bot': None})
+-        record = {**record}
+-        record.update(
+-            member_role=member_role,
+-            reliable=True,
+-            status='present',
+-            reason='',
+-            source='owner_confirmed',
+-            checked_at=self.clock(),
+-            evidence=evidence,
+-            state='present',
+-            confirmation_generation=self.generation,
+-        )
+-        record = self._merge_member(group, record, manual=True)
+         self._invalidate(state, group, 'individual_verification')
+         version = group['version']
+-        await self._save(bot, state)
+-        await self._notify(bot, group, 'member_confirmed')
+-        return self._member_result(bot, group, record, version)
++        record = group['members'].setdefault(member, {'member': member, 'member_role': None, 'bot': None})
++        previous = copy.deepcopy(record)
++        record.update(reliable=False, status='pending', reason='confirming')
++        fact = {
++            'member_role': member_role,
++            'reliable': True,
++            'status': 'present',
++            'reason': '',
++            'source': 'owner_confirmed',
++            'checked_at': self.clock(),
++            'evidence': evidence,
++            'state': 'present',
++            'confirmation_generation': self.generation,
++        }
++        try:
++            return await self._commit_member(bot, state, native_group, member, fact, previous=previous, manual=True)
++        except BaseException as error:
++            if reason := self._abandon(state, group, version, error, 'confirmation'):
++                record.update(status='historical', reason=reason)
++            raise
+ 
+     def _member_result(self, bot, group, record, version):
+         result = {**copy.deepcopy(record), 'group': group['group'], 'version': version, 'generation': self.generation}
+@@ -373,18 +484,25 @@ class GroupState:
+             result.update(reliable=False, continuity_reason='recovery_pending')
+         return result
+ 
++    def _page_key(self, bot, native_group, version):
++        # Cursors continue only the Bot, group and snapshot version that issued them.
++        return hashlib.sha256(json.dumps([self.generation, bot, native_group, version]).encode()).hexdigest()[:16]
++
+     async def members(self, bot, native_group, *, cursor='', limit=30, version=None, generation=None):
+         identifier(native_group)
+-        if type(limit) is not int or not 1 <= limit <= 100 or not isinstance(cursor, str) or (cursor and not cursor.isdecimal()):
+-            raise ValueError('成员分页 limit 须为 1 至 100，cursor 须为非负偏移')
++        start, _, page_key = cursor.partition('.') if isinstance(cursor, str) else ('', '', '')
++        if type(limit) is not int or not 1 <= limit <= 100 or not isinstance(cursor, str) or (cursor and not (start.isdecimal() and page_key)):
++            raise ValueError('成员分页 limit 须为 1 至 100，cursor 须为上一页返回的游标')
+         state = await self._state(bot)
+         if self.pending_writes.get(bot, 0):
+             raise ValueError('群事实持久化中，请稍后从第一页读取')
+         group = state['groups'].get(native_group, {'version': 0, 'members': {}, 'roster': {'complete': False, 'reason': 'unknown_group'}})
+-        if cursor and (generation != self.generation or str(version) != str(group['version'])):
++        if cursor and (
++            generation != self.generation or str(version) != str(group['version']) or page_key != self._page_key(bot, native_group, group['version'])
++        ):
+             raise ValueError('成员快照已变化，请从第一页重新读取')
+         group = self._public_group(bot, group)
+-        rows, offset = list(group['members'].values()), int(cursor or 0)
++        rows, offset = list(group['members'].values()), int(start or 0)
+         return copy.deepcopy(
+             {
+                 'group': native_group,
+@@ -392,7 +510,7 @@ class GroupState:
+                 'version': group['version'],
+                 'roster': {key: value for key, value in group['roster'].items() if key != 'members'},
+                 'members': rows[offset : offset + limit],
+-                'next_cursor': str(offset + limit) if offset + limit < len(rows) else '',
++                'next_cursor': f'{offset + limit}.{self._page_key(bot, native_group, group["version"])}' if offset + limit < len(rows) else '',
+             }
+         )
+ 
+@@ -413,7 +531,7 @@ class GroupState:
+         status = self.recovery.get_status(bot)
+         webhook = self.recovery.get_status(bot, transport='webhook')
+         return (
+-            self.active and status.ready and not status.pending and webhook.context is None and not self.notifications.busy(bot) and bot not in self.failed_bots
++            self.active and status.ready and not status.pending and webhook.context is None and not self.notifications.busy(bot)
+         )
+ 
+     async def fact(self, bot, group, member=None):
+@@ -653,13 +771,17 @@ class GroupState:
+ 
+     async def on_event(self, event):
+         # Facts are observed independently of plugin admission; management is owner-only.
++        observation_error = None
+         if event.group_id and event.event_type not in LIFECYCLE:
+-            await self.observe(event)
++            try:
++                await self.observe(event)
++            except (RuntimeError, sqlite3.Error, OSError) as error:
++                observation_error = error
+         text = (event.content or '').strip()
+-        if event.event_type not in MESSAGE_TYPES or event.is_channel or not (text == '群状态' or text.startswith('群状态 ')):
+-            return event
+         owner_ids = (cfg.get_bot_config(event.appid) or {}).get('owner_ids', [])
+-        if event.user_id not in owner_ids:
++        if event.event_type not in MESSAGE_TYPES or event.is_channel or not (text == '群状态' or text.startswith('群状态 ')) or event.user_id not in owner_ids:
++            if observation_error is not None:
++                raise observation_error
+             return event
+         if any(identity in get_blacklist_map(event.appid, 'user') for identity in (event.user_id, event.raw_user_id)) or event.group_id in get_blacklist_map(
+             event.appid, 'group'
+@@ -669,6 +791,8 @@ class GroupState:
+         if sender is None:
+             return None
+         try:
++            if observation_error is not None:
++                raise observation_error
+             words = text.split()
+             if words == ['群状态', '恢复']:
+                 result = {'ready': await self.rebuild(event.appid)}
+diff --git a/modules/group_state/storage.py b/modules/group_state/storage.py
+index f1c33a4..079d0cc 100644
+--- a/modules/group_state/storage.py
++++ b/modules/group_state/storage.py
+@@ -45,7 +45,22 @@ class ExtensionStore:
+                 return [json.loads(row[0]) for row in cursor.fetchall()] if read else None
+ 
+     async def _execute(self, sql, params, read=False):
+-        return await asyncio.to_thread(self._run, sql, params, read)
++        operation = asyncio.create_task(asyncio.to_thread(self._run, sql, params, read))
++        cancellation: asyncio.CancelledError | None = None
++        # Cancellation cannot stop SQLite's worker. Drain it before callers release
++        # their ordering locks, including when the caller is cancelled repeatedly.
++        while not operation.done():
++            try:
++                await asyncio.shield(operation)
++            except asyncio.CancelledError as error:
++                cancellation = error
++            except Exception:
++                break
++        if cancellation is not None:
++            if not operation.cancelled():
++                operation.exception()
++            raise cancellation
++        return operation.result()
+ 
+     async def ready(self):
+         await self._execute('SELECT 1', ())
+diff --git a/plugins/account_sharing/service.py b/plugins/account_sharing/service.py
+index 60b79e8..955f4ec 100644
+--- a/plugins/account_sharing/service.py
++++ b/plugins/account_sharing/service.py
+@@ -12,11 +12,11 @@ from aiohttp import web
+ from core.base.config import cfg
+ from core.base.logger import PLUGIN, get_logger
+ from core.plugin._blacklist import get_blacklist_map
+-from .storage import ExtensionStore
+ 
+ from .group_delivery import GroupDelivery
+ from .identities import IdentityBindings
+ from .menus import MenuSessions
++from .storage import ExtensionStore
+ 
+ log = get_logger(PLUGIN, '账户共享')
+ PREFIX = '/api/ext/account-sharing/'
+diff --git a/tests/bot_modules/test_group_lifecycle.py b/tests/bot_modules/test_group_lifecycle.py
+index 30b377b..a4aee57 100644
+--- a/tests/bot_modules/test_group_lifecycle.py
++++ b/tests/bot_modules/test_group_lifecycle.py
+@@ -347,3 +347,41 @@ async def test_first_platform_query_after_manual_anchor_detects_new_cycle(group_
+     await state.verify_member('bot-a', 'group-a', 'member-a')
+     record = (await state.fact('bot-a', 'group-a', 'member-a'))['member']
+     assert record['cycle'] != cycle
++
++
++@pytest.mark.parametrize('operation', ['refresh', 'roster', 'member', 'confirm'])
++async def test_candidate_commits_wait_for_consumer_completion(group_host, operation):
++    from test_group_roster import roster_platform
++
++    host = group_host
++    state = host.state
++    roster_platform(host)
++    await state.confirm_member('bot-a', 'group-a', 'member-a', evidence='主人已核验')
++    proof = await state.fact('bot-a', 'group-a', 'member-a')
++    assert state.fact_current(proof)
++    entered, release = asyncio.Event(), asyncio.Event()
++
++    async def consumer(change):
++        assert not state.fact_current(proof)
++        entered.set()
++        await release.wait()
++
++    sub = state.subscribe(consumer)
++    actions = {
++        'refresh': lambda: state.refresh('bot-a', 'group-a'),
++        'roster': lambda: state.sync_roster('bot-a', 'group-a'),
++        'member': lambda: state.verify_member('bot-a', 'group-a', 'member-a'),
++        'confirm': lambda: state.confirm_member('bot-a', 'group-a', 'member-a', evidence='主人重新核验'),
++    }
++    pending = asyncio.create_task(actions[operation]())
++    try:
++        await until(entered.is_set)
++        assert not pending.done()
++        assert not (await state.fact('bot-a', 'group-a', 'member-a'))['usable']
++    finally:
++        release.set()
++    result = await pending
++    assert sub.results[-1].status == 'success'
++    assert result['complete'] if operation == 'roster' else result['reliable']
++    assert (await state.fact('bot-a', 'group-a', 'member-a'))['usable']
++    assert not state.fact_current(proof)
+diff --git a/tests/bot_modules/test_group_roster.py b/tests/bot_modules/test_group_roster.py
+index 1ec2063..25b9f3c 100644
+--- a/tests/bot_modules/test_group_roster.py
++++ b/tests/bot_modules/test_group_roster.py
+@@ -146,7 +146,7 @@ async def test_missing_or_conflicting_bot_and_member_fields_fail_closed(group_ho
+     assert not (await response.json())['data']['complete']
+ 
+ 
+-async def test_failed_durable_update_cannot_leave_a_complete_in_memory_proof(group_host):
++async def test_failed_durable_update_keeps_roster_unproven_until_retry(group_host):
+     import sqlite3
+ 
+     host = group_host
+@@ -158,7 +158,13 @@ async def test_failed_durable_update_cannot_leave_a_complete_in_memory_proof(gro
+             BEGIN SELECT RAISE(ABORT, 'fake persistence failure'); END""")
+     response = await host.api('POST', 'roster', body={'group': 'group-a'})
+     assert response.status == 503
+-    assert (await host.api()).status == 503
++    failed = (await (await host.api()).json())['data']['groups'][0]
++    assert not failed['roster']['complete'] and failed['roster']['reason'] == 'persistence_failed'
++    assert not any(member['reliable'] for member in failed['members'].values())
++    with sqlite3.connect(path) as connection:
++        connection.execute('DROP TRIGGER fail_complete')
++    retried = (await (await host.api('POST', 'roster', body={'group': 'group-a'})).json())['data']
++    assert retried['complete'] and retried['version'] > failed['version']
+ 
+ 
+ async def test_pending_durable_update_does_not_publish_complete_roster(group_host):
+@@ -240,3 +246,97 @@ async def test_stale_bot_refresh_cannot_publish_another_queries_uncommitted_proo
+         await refresh
+         if roster:
+             await roster
++
++
++@pytest.mark.parametrize('path', ['roster', 'member', 'confirm-member'])
++async def test_unload_during_final_write_cannot_publish_complete_or_reliable_facts(group_host, path):
++    import asyncio
++    import sqlite3
++    import threading
++    import time
++
++    host = group_host
++    roster_platform(host)
++    await host.state.snapshot('bot-a')
++    blocker = sqlite3.connect(host.modules.get_context('group_state').get_data_path('group-state.db'), check_same_thread=False)
++    entered = asyncio.Event()
++
++    async def lock_final_write(path, cursor):
++        if path.endswith(('/bot_state', '/members/member-a')):
++            blocker.execute('BEGIN IMMEDIATE')
++            entered.set()
++
++    host.sender.after_json = lock_final_write
++    body = {'group': 'group-a'} if path == 'roster' else {'group': 'group-a', 'member': 'member-a'}
++    if path == 'confirm-member':
++        body.update(evidence='fake owner checked', member_role='member')
++        blocker.execute('BEGIN IMMEDIATE')
++        entered.set()
++    operation = asyncio.create_task(host.api('POST', path, body=body))
++    await asyncio.wait_for(entered.wait(), 3)
++    await asyncio.sleep(0.05)
++    # Release from another thread: the close below waits for the same SQLite worker.
++    release = threading.Thread(target=lambda: (time.sleep(0.2), blocker.commit(), blocker.close()))
++    release.start()
++    await host.modules.disable('group_state', _persist=False)
++    response = await operation
++    release.join()
++    assert response.status == 503
++
++
++@pytest.mark.parametrize('method', ['snapshot', 'members'])
++async def test_read_queued_across_unload_returns_no_old_proof(group_host, method):
++    import asyncio
++
++    host = group_host
++    roster_platform(host)
++    old = host.state
++    assert (await old.sync_roster('bot-a', 'group-a'))['complete']
++    lock = old.load_locks['bot-a']
++    await lock.acquire()
++    operation = asyncio.create_task(old.snapshot('bot-a') if method == 'snapshot' else old.members('bot-a', 'group-a'))
++    await asyncio.sleep(0)
++    await host.modules.disable('group_state', _persist=False)
++    lock.release()
++    with pytest.raises(RuntimeError):
++        await operation
++
++
++@pytest.mark.parametrize('target', [('bot-a', 'group-b'), ('bot-b', 'group-a')])
++async def test_member_cursor_continues_only_its_own_bot_and_group(group_host, target):
++    host = group_host
++    for bot, group in {('bot-a', 'group-a'), target}:
++        for n in range(2):
++            await host.state.confirm_member(bot, group, f'{bot}-{group}-{n}', evidence='fake owner checked')
++    first = await host.state.members('bot-a', 'group-a', limit=1)
++    other = await host.state.members(*target, limit=1)
++    assert other['version'] == first['version'] and other['generation'] == first['generation']
++    with pytest.raises(ValueError, match='快照已变化'):
++        await host.state.members(*target, cursor=first['next_cursor'], version=first['version'], generation=first['generation'], limit=1)
++    with pytest.raises(ValueError, match='cursor'):
++        await host.state.members('bot-a', 'group-a', cursor='1', version=first['version'], generation=first['generation'])
++    second = await host.state.members('bot-a', 'group-a', cursor=first['next_cursor'], version=first['version'], generation=first['generation'], limit=1)
++    assert [m['member'] for m in second['members']] == ['bot-a-group-a-1']
++
++
++async def test_cancelled_roster_query_ends_without_in_progress_markers(group_host):
++    import asyncio
++
++    host = group_host
++    roster_platform(host)
++    await host.state.confirm_member('bot-a', 'group-a', 'member-a', evidence='fake owner checked')
++    entered = asyncio.Event()
++
++    async def hold(path, cursor):
++        entered.set()
++        await asyncio.Event().wait()
++
++    host.sender.after_json = hold
++    operation = asyncio.create_task(host.state.sync_roster('bot-a', 'group-a'))
++    await asyncio.wait_for(entered.wait(), 3)
++    operation.cancel()
++    with pytest.raises(asyncio.CancelledError):
++        await operation
++    group = (await host.state.snapshot('bot-a'))['groups'][0]
++    assert not group['roster']['complete'] and group['roster']['reason'] == 'roster_cancelled'
++    assert group['members']['member-a']['reason'] == 'roster_cancelled' and not group['members']['member-a']['reliable']
+diff --git a/tests/bot_modules/test_group_state.py b/tests/bot_modules/test_group_state.py
+index 8257387..d1b65e0 100644
+--- a/tests/bot_modules/test_group_state.py
++++ b/tests/bot_modules/test_group_state.py
+@@ -1,8 +1,24 @@
+ """Independent module installation and owner management behavior."""
+ 
++import asyncio
++import json
++import shutil
++import sqlite3
++import subprocess
++import threading
++from pathlib import Path
++
+ import pytest
+ 
+ 
++def test_group_state_page_request_ordering():
++    node = shutil.which('node')
++    if node is None:
++        pytest.skip('页面脚本回归需要 Node.js；不使用额外 npm 依赖')
++    result = subprocess.run([node, '--test', str(Path(__file__).with_name('test_group_state_page.cjs'))], capture_output=True, text=True, timeout=15)
++    assert result.returncode == 0, result.stdout + result.stderr
++
++
+ async def test_independent_known_groups_owner_entry_refresh_and_restart(group_host):
+     host = group_host
+     assert (await host.api(authenticated=False)).status == 401
+@@ -75,3 +91,441 @@ async def test_refresh_completion_changes_snapshot_version(group_host):
+     assert pending[0]['groups'][0]['status'] == 'pending'
+     assert final['version'] > pending[0]['version']
+     assert final['groups'][0]['version'] > pending[0]['groups'][0]['version']
++
++
++@pytest.mark.parametrize('entry', ['http', 'qq'])
++async def test_failed_commit_keeps_previous_bot_state_untrusted_until_retry(group_host, entry):
++    host = group_host
++    host.sender.response = ({'member_role': 'member', 'recv_msg_setting': 'all', 'allow_proactive_msg': False}, None)
++    await host.api('POST', 'refresh', body={'group': 'group-a'})
++    database = host.modules.get_context('group_state').get_data_path('group-state.db')
++    with sqlite3.connect(database) as connection:
++        connection.execute("""CREATE TRIGGER reject_verified BEFORE INSERT ON extension_records
++            WHEN EXISTS (SELECT 1 FROM json_each(NEW.payload, '$.groups') WHERE json_extract(value, '$.reliable') = 1)
++            BEGIN SELECT RAISE(ABORT, 'fake disk failure'); END""")
++    host.sender.response = ({'member_role': 'admin', 'recv_msg_setting': 'all', 'allow_proactive_msg': True}, None)
++    if entry == 'http':
++        response = await host.api('POST', 'refresh', body={'group': 'group-a'})
++        assert response.status == 503
++    else:
++        await host.event('群状态 刷新 group-a')
++        assert '存储暂不可用' in host.sender.messages[-1][2]
++    failed = (await (await host.api()).json())['data']['groups'][0]
++    assert not failed['reliable']
++    assert failed['status'] == 'historical' and failed['reason'] == 'persistence_failed'
++    assert failed['bot_state']['member_role'] == 'member'
++    assert (await (await host.api(bot='bot-b')).json())['data']['groups'] == []
++    with sqlite3.connect(database) as connection:
++        connection.execute('DROP TRIGGER reject_verified')
++    result = (await (await host.api('POST', 'refresh', body={'group': 'group-a'})).json())['data']
++    assert result['reliable'] and result['bot_state']['member_role'] == 'admin'
++    assert result['version'] > failed['version']
++
++
++@pytest.mark.parametrize('observed_group', ['', 'group-a', 'group-b'])
++async def test_pending_commit_does_not_publish_or_overwrite_new_observations(group_host, observed_group):
++    host = group_host
++    entered = asyncio.Event()
++    database = host.modules.get_context('group_state').get_data_path('group-state.db')
++    blocker = sqlite3.connect(database)
++
++    async def lock_final_write():
++        blocker.execute('BEGIN IMMEDIATE')
++        entered.set()
++
++    host.sender.after_query = lock_final_write
++    pending = asyncio.create_task(host.api('POST', 'refresh', body={'group': 'group-a'}))
++    observation = None
++    try:
++        await asyncio.wait_for(entered.wait(), 2)
++        during = (await (await host.api()).json())['data']
++        assert not during['groups'][0]['reliable'] and during['groups'][0]['status'] == 'pending'
++        if observed_group:
++            observation = asyncio.create_task(host.event('普通消息', user='member-a', group=observed_group))
++            await asyncio.sleep(0)
++            observed = (await (await host.api()).json())['data']
++            assert any(group['group'] == observed_group and group['source'] == 'native_event' for group in observed['groups'])
++    finally:
++        blocker.rollback()
++        blocker.close()
++        response = await pending
++        if observation:
++            await observation
++    result = (await response.json())['data']
++    final = (await (await host.api()).json())['data']
++    if observed_group == 'group-a':
++        assert not result['reliable'] and result['reason'] == 'state_changed'
++        assert final['groups'][0]['source'] == 'native_event' and not final['groups'][0]['reliable']
++    else:
++        assert final['version'] > during['version']
++        if observed_group:
++            # G03 also gates public results while another group in this Bot is persisting.
++            assert not result['reliable'] and result['reason'] == 'persistence_pending'
++        else:
++            assert result['reliable']
++        assert final['groups'][0]['reliable']
++        assert final['groups'][0]['version'] > during['groups'][0]['version']
++    if observed_group == 'group-b':
++        assert [group['group'] for group in final['groups']] == ['group-a', 'group-b']
++    assert await host.modules.reload('group_state')
++    restored = (await (await host.api()).json())['data']
++    assert [group['group'] for group in restored['groups']] == [group['group'] for group in final['groups']]
++    assert all(not group['reliable'] for group in restored['groups'])
++
++
++@pytest.mark.parametrize('command', ['群状态', '群状态 刷新 group-a'])
++async def test_group_owner_command_reports_observation_storage_failure_and_can_retry(group_host, command):
++    host = group_host
++    previous = (await (await host.api('POST', 'refresh', body={'group': 'group-a'})).json())['data']
++    other_bot = await host.state.snapshot('bot-b')
++    database = host.modules.get_context('group_state').get_data_path('group-state.db')
++    with sqlite3.connect(database) as connection:
++        connection.execute("""CREATE TRIGGER reject_observation BEFORE INSERT ON extension_records
++            WHEN NEW.bot = 'bot-a' BEGIN SELECT RAISE(ABORT, 'fake disk failure'); END""")
++    try:
++        host.sender.messages.clear()
++        await host.event(command, group='group-a')
++        assert host.sender.messages == [('bot-a', 'group-a', '群状态存储暂不可用，请检查后台')]
++        failed = (await (await host.api()).json())['data']['groups'][0]
++        assert not failed['reliable'] and failed['status'] == 'historical'
++        assert failed['reason'] == 'persistence_failed' and failed['source'] == 'native_event'
++        assert failed['bot_state'] == previous['bot_state'] and failed['version'] > previous['version']
++        assert await host.state.snapshot('bot-b') == other_bot
++    finally:
++        with sqlite3.connect(database) as connection:
++            connection.execute('DROP TRIGGER reject_observation')
++    host.sender.messages.clear()
++    await host.event('群状态 刷新 group-a', group='group-a')
++    assert len(host.sender.messages) == 1 and '已处理' in host.sender.messages[0][2]
++    assert (await host.state.snapshot('bot-a'))['groups'][0]['reliable']
++
++
++async def test_observation_storage_failure_preserves_admission_and_message_dispatch(group_host):
++    from core.application import get_app
++    from core.plugin._blacklist import get_blacklist_map, set_blacklist_map
++
++    host = group_host
++    await host.event('ordinary', group='group-a', user='member-a')
++    database = host.modules.get_context('group_state').get_data_path('group-state.db')
++    downstream = []
++
++    async def receive(event):
++        downstream.append((event.appid, event.user_id, event.content))
++        return event
++
++    get_app().hook_manager.register('before_event', receive, owner='observation-failure-test', priority=20)
++    with sqlite3.connect(database) as connection:
++        connection.execute("""CREATE TRIGGER reject_observation BEFORE INSERT ON extension_records
++            WHEN NEW.bot = 'bot-a' BEGIN SELECT RAISE(ABORT, 'fake disk failure'); END""")
++    users = get_blacklist_map('bot-a', 'user')
++    try:
++        host.sender.messages.clear()
++        await host.event('ordinary', group='group-a', user='member-a')
++        await host.event('群状态', group='group-a', user='member-a')
++        await host.event('群状态', bot='bot-b', group='group-b', user='owner-a')
++        assert downstream == [('bot-a', 'member-a', 'ordinary'), ('bot-a', 'member-a', '群状态'), ('bot-b', 'owner-a', '群状态')]
++        assert host.sender.messages == []
++        set_blacklist_map('bot-a', 'user', {**users, 'owner-a': 'test denial'})
++        await host.event('群状态', group='group-a')
++        assert len(downstream) == 3 and host.sender.messages == []
++        assert (await host.state.snapshot('bot-a'))['groups'][0]['reason'] == 'persistence_failed'
++    finally:
++        set_blacklist_map('bot-a', 'user', users)
++        get_app().hook_manager.unregister_owner('observation-failure-test')
++        with sqlite3.connect(database) as connection:
++            connection.execute('DROP TRIGGER reject_observation')
++
++
++@pytest.mark.parametrize('newer_action', ['observe', 'refresh'])
++async def test_late_observation_save_failure_preserves_newer_same_group_facts(group_host, monkeypatch, newer_action):
++    host = group_host
++    await host.api('POST', 'refresh', body={'group': 'group-a'})
++    entered, release = threading.Event(), threading.Event()
++    attempts = []
++    connect = sqlite3.connect
++
++    def fail_first_write():
++        attempts.append(True)
++        if len(attempts) == 1:
++            entered.set()
++            if not release.wait(2):
++                raise RuntimeError('fake storage scheduling timeout')
++            return 1
++        return 0
++
++    def test_connection(*args, **kwargs):
++        connection = connect(*args, **kwargs)
++        connection.create_function('audit_fail_first_write', 0, fail_first_write)
++        return connection
++
++    monkeypatch.setattr(sqlite3, 'connect', test_connection)
++    assert await host.modules.reload('group_state')
++    assert await host.state.rebuild('bot-a')
++    database = host.modules.get_context('group_state').get_data_path('group-state.db')
++    with sqlite3.connect(database) as connection:
++        connection.execute("""CREATE TRIGGER fail_first_observation BEFORE INSERT ON extension_records
++            WHEN audit_fail_first_write() = 1 BEGIN SELECT RAISE(ABORT, 'fake disk failure'); END""")
++    old = asyncio.create_task(host.event('old observation', group='group-a', user='member-a'))
++    newer = None
++    try:
++        assert await asyncio.to_thread(entered.wait, 2)
++        before = await host.state.snapshot('bot-a')
++        newer = asyncio.create_task(
++            host.state.refresh('bot-a', 'group-a') if newer_action == 'refresh' else host.event('new observation', group='group-a', user='member-b')
++        )
++        await asyncio.sleep(0)
++        assert (await host.state.snapshot('bot-a'))['version'] > before['version']
++    finally:
++        release.set()
++        await old
++        if newer is not None:
++            await newer
++        with sqlite3.connect(database) as connection:
++            connection.execute('DROP TRIGGER fail_first_observation')
++    fact = (await host.state.snapshot('bot-a'))['groups'][0]
++    if newer_action == 'refresh':
++        assert fact['reliable'] and fact['status'] == 'verified' and fact['reason'] == ''
++    else:
++        assert not fact['reliable'] and fact['reason'] == 'observed_event_requires_refresh'
++
++
++async def test_initial_save_failure_ends_refresh_and_allows_retry(group_host):
++    host = group_host
++    previous = (await (await host.api('POST', 'refresh', body={'group': 'group-a'})).json())['data']
++    database = host.modules.get_context('group_state').get_data_path('group-state.db')
++    with sqlite3.connect(database) as connection:
++        connection.execute("""CREATE TRIGGER reject_all BEFORE INSERT ON extension_records
++            BEGIN SELECT RAISE(ABORT, 'fake disk failure'); END""")
++    try:
++        assert (await host.api('POST', 'refresh', body={'group': 'group-a'})).status == 503
++        failed = (await (await host.api()).json())['data']['groups'][0]
++        assert failed['status'] == 'historical' and failed['reason'] == 'persistence_failed'
++        assert not failed['reliable'] and failed['bot_state'] == previous['bot_state']
++        assert failed['version'] > previous['version']
++        assert (await (await host.api(bot='bot-b')).json())['data']['groups'] == []
++    finally:
++        with sqlite3.connect(database) as connection:
++            connection.execute('DROP TRIGGER reject_all')
++    retried = (await (await host.api('POST', 'refresh', body={'group': 'group-a'})).json())['data']
++    assert retried['reliable'] and retried['version'] > failed['version']
++
++
++@pytest.mark.parametrize('observed_group', ['', 'group-a', 'group-b'])
++async def test_cancelled_query_ends_refresh_without_overwriting_new_facts(group_host, observed_group):
++    host = group_host
++    previous = (await (await host.api('POST', 'refresh', body={'group': 'group-a'})).json())['data']
++    entered = asyncio.Event()
++
++    async def wait_for_cancellation():
++        entered.set()
++        await asyncio.Event().wait()
++
++    host.sender.after_query = wait_for_cancellation
++    pending = asyncio.create_task(host.state.refresh('bot-a', 'group-a'))
++    try:
++        await asyncio.wait_for(entered.wait(), 2)
++        during = await host.state.snapshot('bot-a')
++        if observed_group:
++            await host.event('普通消息', user='member-a', group=observed_group)
++    finally:
++        pending.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await pending
++    ended = await host.state.snapshot('bot-a')
++    fact = ended['groups'][0]
++    assert not fact['reliable'] and fact['status'] == 'historical'
++    assert fact['bot_state'] == previous['bot_state']
++    assert ended['version'] > during['version']
++    if observed_group == 'group-a':
++        assert fact['reason'] == 'observed_event_requires_refresh' and fact['source'] == 'native_event'
++    else:
++        assert fact['reason'] == 'refresh_cancelled'
++    assert [group['group'] for group in ended['groups']] == (['group-a', 'group-b'] if observed_group == 'group-b' else ['group-a'])
++    assert (await host.state.snapshot('bot-b'))['groups'] == []
++    host.sender.after_query = None
++    assert (await host.state.refresh('bot-a', 'group-a'))['reliable']
++
++
++@pytest.mark.parametrize('role', [[], {}])
++@pytest.mark.parametrize('entry', ['http', 'qq'])
++async def test_malformed_platform_role_is_a_historical_error(group_host, role, entry):
++    host = group_host
++    previous = (await (await host.api('POST', 'refresh', body={'group': 'group-a'})).json())['data']
++    host.sender.response = ({'member_role': role, 'recv_msg_setting': 'all', 'allow_proactive_msg': True}, None)
++    if entry == 'http':
++        response = await host.api('POST', 'refresh', body={'group': 'group-a'})
++        assert response.status == 200
++        result = (await response.json())['data']
++    else:
++        host.sender.messages.clear()
++        await host.event('群状态 刷新 group-a')
++        assert len(host.sender.messages) == 1
++        result = json.loads(host.sender.messages[-1][2].split('\n', 1)[1])
++    assert not result['reliable'] and result['status'] == 'historical'
++    assert result['reason'] == 'response_unknown' and result['bot_state'] == previous['bot_state']
++    assert (await host.state.snapshot('bot-a'))['groups'][0] == result
++
++
++async def test_reload_during_final_commit_rejects_old_http_result(group_host, monkeypatch):
++    host = group_host
++    entered, release = asyncio.Event(), asyncio.Event()
++    old = host.state
++    original = old.store.put
++
++    async def delayed_return(bot, collection, key, record):
++        await original(bot, collection, key, record)
++        if record['groups']['group-a']['reliable']:
++            entered.set()
++            await release.wait()
++
++    monkeypatch.setattr(old.store, 'put', delayed_return)
++    pending = asyncio.create_task(host.api('POST', 'refresh', body={'group': 'group-a'}))
++    try:
++        await asyncio.wait_for(entered.wait(), 2)
++        assert await host.modules.reload('group_state')
++        current = (await (await host.api()).json())['data']
++        assert not current['groups'][0]['reliable'] and current['groups'][0]['reason'] == 'process_restart'
++    finally:
++        release.set()
++        response = await pending
++    assert response.status == 503
++    with pytest.raises(RuntimeError):
++        await old.snapshot('bot-a')
++
++
++@pytest.mark.parametrize('entry', ['http', 'snapshot'])
++@pytest.mark.parametrize('lifecycle', ['disable', 'reload'])
++async def test_cold_and_queued_reads_are_rejected_across_unload(group_host, monkeypatch, entry, lifecycle):
++    host = group_host
++    await host.state.refresh('bot-a', 'group-a')
++    entered, release = threading.Event(), threading.Event()
++    connect = sqlite3.connect
++
++    class DelayedReadConnection(sqlite3.Connection):
++        def execute(self, sql, parameters=()):
++            cursor = super().execute(sql, parameters)
++            if sql.startswith('SELECT payload') and parameters[0] == 'bot-a':
++                entered.set()
++                if not release.wait(3):
++                    raise RuntimeError('fake storage scheduling timeout')
++            return cursor
++
++    def test_connection(*args, **kwargs):
++        return connect(*args, **kwargs, factory=DelayedReadConnection)
++
++    monkeypatch.setattr(sqlite3, 'connect', test_connection)
++    assert await host.modules.reload('group_state')
++    old = host.state
++
++    async def read():
++        return await host.api() if entry == 'http' else await old.snapshot('bot-a')
++
++    first = asyncio.create_task(read())
++    queued = transition = None
++    try:
++        assert await asyncio.to_thread(entered.wait, 2)
++        queued = asyncio.create_task(old.snapshot('bot-a'))
++        await asyncio.sleep(0)
++        assert not queued.done()
++        transition = asyncio.create_task(host.modules.reload('group_state') if lifecycle == 'reload' else host.modules.disable('group_state', _persist=False))
++        await asyncio.sleep(0)
++        assert (await host.api()).status == 404
++    finally:
++        release.set()
++        results = await asyncio.gather(first, *([queued] if queued is not None else []), return_exceptions=True)
++        if transition is not None:
++            assert await transition
++    assert len(results) == 2
++    if entry == 'http':
++        assert results[0].status == 503
++        assert (await results[0].json())['success'] is False
++    else:
++        assert isinstance(results[0], RuntimeError)
++    assert isinstance(results[1], RuntimeError)
++    with pytest.raises(RuntimeError):
++        await old.snapshot('bot-a')
++    if lifecycle == 'disable':
++        assert (await host.api()).status == 404
++        assert await host.modules.enable('group_state', _skip_deps=True, _persist=False)
++    current = await host.state.snapshot('bot-a')
++    assert current['generation'] != old.generation
++    assert current['groups'][0]['group'] == 'group-a'
++    assert not current['groups'][0]['reliable'] and current['groups'][0]['reason'] == 'process_restart'
++    pending = await host.state.refresh('bot-a', 'group-a')
++    assert not pending['reliable'] and pending['continuity_reason'] == 'recovery_pending'
++    assert await host.state.rebuild('bot-a')
++    assert (await host.state.refresh('bot-a', 'group-a'))['reliable']
++
++
++async def test_disable_allows_event_loop_to_run_while_sqlite_finishes(group_host, monkeypatch):
++    host = group_host
++    entered, release = threading.Event(), threading.Event()
++    released_before_timeout = []
++    connect = sqlite3.connect
++
++    def pause_write():
++        entered.set()
++        released_before_timeout.append(release.wait(2))
++        return 1
++
++    def test_connection(*args, **kwargs):
++        connection = connect(*args, **kwargs)
++        connection.create_function('audit_pause', 0, pause_write)
++        return connection
++
++    monkeypatch.setattr(sqlite3, 'connect', test_connection)
++    assert await host.modules.reload('group_state')
++    database = host.modules.get_context('group_state').get_data_path('group-state.db')
++    with sqlite3.connect(database) as connection:
++        connection.execute("""CREATE TRIGGER delay_verified BEFORE INSERT ON extension_records
++            WHEN EXISTS (SELECT 1 FROM json_each(NEW.payload, '$.groups') WHERE json_extract(value, '$.reliable') = 1)
++            BEGIN SELECT audit_pause(); END""")
++    pending = asyncio.create_task(host.api('POST', 'refresh', body={'group': 'group-a'}))
++    try:
++        assert await asyncio.to_thread(entered.wait, 2)
++        asyncio.get_running_loop().call_later(0.01, release.set)
++        assert await host.modules.disable('group_state', _persist=False)
++    finally:
++        release.set()
++        response = await pending
++    assert released_before_timeout == [True]
++    assert response.status == 503
++    assert (await host.api()).status == 404
++
++
++@pytest.mark.parametrize('cancellations', [1, 2])
++async def test_cancelled_refresh_finishes_its_write_before_new_facts_are_saved(group_host, monkeypatch, cancellations):
++    host = group_host
++    entered, release = threading.Event(), threading.Event()
++    original = host.state.store._run
++
++    def pause_before_database_lock(sql, params, read):
++        # Fix thread scheduling at the SQLite boundary while retaining real writes.
++        if sql.startswith('INSERT') and json.loads(params[3])['groups']['group-a']['reliable']:
++            entered.set()
++            if not release.wait(2):
++                raise RuntimeError('fake storage scheduling timeout')
++        return original(sql, params, read)
++
++    monkeypatch.setattr(host.state.store, '_run', pause_before_database_lock)
++    pending = asyncio.create_task(host.state.refresh('bot-a', 'group-a'))
++    observation = None
++    try:
++        assert await asyncio.to_thread(entered.wait, 2)
++        for _ in range(cancellations):
++            pending.cancel()
++            await asyncio.sleep(0)
++        observation = asyncio.create_task(host.event('普通消息', user='member-a', group='group-b'))
++        during = (await (await host.api()).json())['data']
++        assert not during['groups'][0]['reliable']
++        assert not pending.done()  # Cancellation must drain the underlying write.
++    finally:
++        release.set()
++        with pytest.raises(asyncio.CancelledError):
++            await pending
++        if observation:
++            await observation
++    assert await host.modules.reload('group_state')
++    restored = (await (await host.api()).json())['data']
++    assert [group['group'] for group in restored['groups']] == ['group-a', 'group-b']
++    assert all(not group['reliable'] for group in restored['groups'])
+diff --git a/tests/bot_modules/test_group_state_audit.py b/tests/bot_modules/test_group_state_audit.py
+new file mode 100644
+index 0000000..3d6a38c
+--- /dev/null
++++ b/tests/bot_modules/test_group_state_audit.py
+@@ -0,0 +1,147 @@
++"""Persistence failure boundaries through public group-state operations and real SQLite."""
++
++import asyncio
++import sqlite3
++
++import pytest
++from test_group_roster import roster_platform
++
++
++async def wait_until(predicate):
++    async def poll():
++        while not predicate():
++            await asyncio.sleep(0.001)
++    await asyncio.wait_for(poll(), 3)
++
++
++async def complete_roster(host):
++    roster_platform(host)
++    assert (await host.state.snapshot('bot-b'))['groups'] == []
++    assert (await (await host.api('POST', 'roster', body={'group': 'group-a'})).json())['data']['complete']
++    return await host.state.members('bot-a', 'group-a', limit=1)
++
++
++async def assert_retired(host, earlier):
++    group = next(g for g in (await host.state.snapshot('bot-a'))['groups'] if g['group'] == 'group-a')
++    assert not group['roster']['complete']
++    assert not group['members']['member-a']['reliable']
++    assert group['members']['member-a']['member_role'] == 'member'
++    assert group['version'] > earlier['version']
++    with pytest.raises(ValueError):
++        await host.state.members('bot-a', 'group-a', cursor=earlier['next_cursor'], version=earlier['version'], generation=earlier['generation'])
++    return group
++
++
++async def test_failed_confirmation_retires_old_proof_until_new_roster(group_host):
++    host = group_host
++    earlier = await complete_roster(host)
++    path = host.modules.get_context('group_state').get_data_path('group-state.db')
++    with sqlite3.connect(path) as db:
++        db.execute("CREATE TRIGGER fail_confirmation BEFORE INSERT ON extension_records BEGIN SELECT RAISE(ABORT, 'fake disk failure'); END")
++    try:
++        response = await host.api('POST', 'confirm-member', body={'group': 'group-a', 'member': 'member-a', 'evidence': '主人核对角色变化', 'member_role': 'owner'})
++        assert response.status == 503
++        group = await assert_retired(host, earlier)
++        assert group['members']['member-a']['reason'] == 'persistence_failed'
++    finally:
++        with sqlite3.connect(path) as db:
++            db.execute('DROP TRIGGER fail_confirmation')
++    retry = await host.api('POST', 'confirm-member', body={'group': 'group-a', 'member': 'member-a', 'evidence': '主人重新核对', 'member_role': 'owner'})
++    result = (await retry.json())['data']
++    assert result['reliable'] and result['member_role'] == 'owner'
++    assert not (await host.state.snapshot('bot-a'))['groups'][0]['roster']['complete']
++    assert (await host.state.snapshot('bot-b'))['groups'] == []
++    assert (await host.state.sync_roster('bot-a', 'group-a'))['complete']
++
++
++@pytest.mark.parametrize('cancelled', [False, True])
++async def test_confirmation_wait_and_cancel_never_publish_old_proof(group_host, cancelled):
++    host = group_host
++    earlier = await complete_roster(host)
++    blocker = sqlite3.connect(host.modules.get_context('group_state').get_data_path('group-state.db'))
++    blocker.execute('BEGIN IMMEDIATE')
++    operation = asyncio.create_task(host.state.confirm_member('bot-a', 'group-a', 'member-a', evidence='主人核对角色', member_role='owner'))
++    try:
++        await wait_until(lambda: host.state.pending_writes.get('bot-a'))
++        await assert_retired(host, earlier)
++        if cancelled:
++            operation.cancel()
++            await asyncio.sleep(0.01)
++            assert not operation.done()  # SQLite's real worker still owns the write order.
++    finally:
++        blocker.commit()
++        blocker.close()
++        if cancelled:
++            with pytest.raises(asyncio.CancelledError):
++                await operation
++        else:
++            assert (await operation)['reliable']
++    if cancelled:
++        group = await assert_retired(host, earlier)
++        assert group['members']['member-a']['status'] == 'historical'
++        assert group['members']['member-a']['reason'] == 'confirmation_cancelled'
++        assert await host.modules.reload('group_state')
++        restored = (await host.state.snapshot('bot-a'))['groups'][0]
++        assert not restored['roster']['complete'] and not restored['members']['member-a']['reliable']
++
++
++@pytest.mark.parametrize('operation', ['refresh', 'roster', 'member'])
++async def test_cancelling_initial_queued_write_ends_current_operation(group_host, operation):
++    host = group_host
++    earlier = await complete_roster(host)
++    blocker = sqlite3.connect(host.modules.get_context('group_state').get_data_path('group-state.db'))
++    blocker.execute('BEGIN IMMEDIATE')
++    first = asyncio.create_task(host.state.refresh('bot-a', 'group-blocker'))
++    second = None
++    try:
++        await wait_until(lambda: host.state.pending_writes.get('bot-a'))
++        method = {'refresh': host.state.refresh, 'roster': host.state.sync_roster, 'member': host.state.verify_member}[operation]
++        args = ('bot-a', 'group-a', 'member-a') if operation == 'member' else ('bot-a', 'group-a')
++        second = asyncio.create_task(method(*args))
++        await wait_until(lambda: host.state.pending_writes.get('bot-a', 0) >= 2)
++        second.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await second
++    finally:
++        blocker.commit()
++        blocker.close()
++        await first
++        if second is not None and not second.done():
++            second.cancel()
++            await asyncio.gather(second, return_exceptions=True)
++    group = next(g for g in (await host.state.snapshot('bot-a'))['groups'] if g['group'] == 'group-a')
++    assert not group['roster']['complete'] and group['version'] > earlier['version']
++    if operation == 'refresh':
++        assert group['status'] == 'historical' and group['reason'] == 'refresh_cancelled'
++    elif operation == 'roster':
++        assert group['roster']['reason'] == 'roster_cancelled'
++        assert group['members']['member-a']['reason'] == 'roster_cancelled'
++    else:
++        record = group['members']['member-a']
++        assert record['status'] == 'historical' and record['reason'] == 'verification_cancelled'
++    assert (await host.state.snapshot('bot-b'))['groups'] == []
++
++
++
++async def test_cancelled_confirmation_preserves_newer_same_group_observation(group_host):
++    host = group_host
++    earlier = await complete_roster(host)
++    blocker = sqlite3.connect(host.modules.get_context('group_state').get_data_path('group-state.db'))
++    blocker.execute('BEGIN IMMEDIATE')
++    operation = asyncio.create_task(host.state.confirm_member('bot-a', 'group-a', 'member-a', evidence='主人核对角色', member_role='owner'))
++    observation = None
++    try:
++        await wait_until(lambda: host.state.pending_writes.get('bot-a'))
++        observation = asyncio.create_task(host.event('新的群消息', user='member-new', group='group-a'))
++        await wait_until(lambda: host.state.pending_writes.get('bot-a', 0) >= 2)
++        operation.cancel()
++    finally:
++        blocker.commit()
++        blocker.close()
++        with pytest.raises(asyncio.CancelledError):
++            await operation
++        if observation is not None:
++            await observation
++    group = await assert_retired(host, earlier)
++    assert group['source'] == 'native_event' and group['reason'] == 'observed_event_requires_refresh'
++    assert group['members']['member-new']['reason'] == 'requires_verification'
+diff --git a/tests/bot_modules/test_group_state_page.cjs b/tests/bot_modules/test_group_state_page.cjs
+new file mode 100644
+index 0000000..ce82ac4
+--- /dev/null
++++ b/tests/bot_modules/test_group_state_page.cjs
+@@ -0,0 +1,184 @@
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const path = require('node:path');
++const test = require('node:test');
++const vm = require('node:vm');
++const {setImmediate: tick} = require('node:timers/promises');
++
++// Run the shipped page script, replacing only the DOM and network boundaries.
++async function page() {
++    const html = fs.readFileSync(path.join(__dirname, '../../modules/group_state/page.html'), 'utf8');
++    const nodes = {};
++    for (const [, id] of html.matchAll(/id="([^"]+)"/g)) {
++        nodes[id] = {
++            value: id === 'gs-group' ? 'group-a' : '', textContent: '', disabled: false, options: [],
++            append(option) {
++                this.options.push(option);
++                if (!this.value) this.value = option.value;
++            },
++        };
++    }
++    const requests = [];
++    vm.runInNewContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], {
++        document: {getElementById: id => nodes[id], createElement: () => ({})}, URLSearchParams,
++        fetch: (url, options) => url === '/api/bots'
++            ? Promise.resolve({json: async () => ({data: {bots: [{appid: 'bot-a'}, {appid: 'bot-b'}]}})})
++            : new Promise((resolve, reject) => requests.push({url, options, resolve, reject})),
++    });
++    await tick();
++    return {
++        nodes, requests,
++        output: () => nodes['gs-output'].textContent,
++        async reply(request, data) {
++            request.resolve({ok: true, json: async () => ({success: true, data})});
++            await tick();
++        },
++    };
++}
++
++test('an earlier GET cannot restore verified facts after a failed refresh', async () => {
++    const host = await page();
++    const earlier = host.requests[0];
++    host.nodes['gs-refresh'].onclick();
++    const latest = {group: 'group-a', version: 4, reliable: false, status: 'historical', reason: 'permission_denied'};
++    await host.reply(host.requests.at(-1), latest);
++    assert.deepEqual(JSON.parse(host.output()), latest);
++    await host.reply(earlier, {bot: 'bot-a', version: 3, groups: [{group: 'group-a', reliable: true}]});
++    assert.deepEqual(JSON.parse(host.output()), latest);
++});
++
++test('changing Bot clears old facts and loads only the selected Bot', async () => {
++    const host = await page();
++    await host.reply(host.requests[0], {bot: 'bot-a', groups: [{reliable: true}]});
++    host.nodes['gs-load'].onclick();
++    const earlier = host.requests.at(-1);
++    host.nodes['gs-bot'].value = 'bot-b';
++    host.nodes['gs-bot'].onchange?.();
++    assert.equal(host.output(), '');
++    const selected = host.requests.at(-1);
++    assert.match(selected.url, /bot=bot-b$/);
++    await host.reply(earlier, {bot: 'bot-a', groups: [{reliable: true}]});
++    assert.equal(host.output(), '');
++    const latest = {bot: 'bot-b', groups: []};
++    await host.reply(selected, latest);
++    assert.deepEqual(JSON.parse(host.output()), latest);
++});
++
++test('returning to a Bot cannot revive a request from the earlier selection', async () => {
++    const host = await page();
++    const earlierA = host.requests[0];
++    host.nodes['gs-bot'].value = 'bot-b';
++    host.nodes['gs-bot'].onchange();
++    const earlierB = host.requests.at(-1);
++    host.nodes['gs-bot'].value = 'bot-a';
++    host.nodes['gs-bot'].onchange();
++    const latest = {bot: 'bot-a', version: 8, groups: [{reliable: false}]};
++    await host.reply(host.requests.at(-1), latest);
++    await host.reply(earlierA, {bot: 'bot-a', version: 3, groups: [{reliable: true}]});
++    await host.reply(earlierB, {bot: 'bot-b', groups: []});
++    assert.deepEqual(JSON.parse(host.output()), latest);
++});
++
++for (const failure of ['network', 'http', 'json']) {
++    test(`a late ${failure} error cannot clear a newer successful result`, async () => {
++        const host = await page();
++        const earlier = host.requests[0];
++        host.nodes['gs-load'].onclick();
++        const latest = {bot: 'bot-a', version: 8, groups: []};
++        await host.reply(host.requests.at(-1), latest);
++        const status = host.nodes['gs-status'].textContent;
++        if (failure === 'network') earlier.reject(new Error('old network failure'));
++        else earlier.resolve({
++            ok: false,
++            json: async () => {
++                if (failure === 'json') throw new Error('old invalid JSON');
++                return {success: false, error: 'old HTTP error'};
++            },
++        });
++        await tick();
++        assert.deepEqual(JSON.parse(host.output()), latest);
++        assert.equal(host.nodes['gs-status'].textContent, status);
++    });
++}
++
++test('starting a request clears old verified facts and current errors remain visible', async () => {
++    const host = await page();
++    await host.reply(host.requests[0], {bot: 'bot-a', groups: [{reliable: true}]});
++    host.nodes['gs-refresh'].onclick();
++    assert.equal(host.output(), '');
++    assert.equal(host.nodes['gs-status'].textContent, '正在读取…');
++    host.requests.at(-1).reject(new Error('current network failure'));
++    await tick();
++    assert.equal(host.output(), '');
++    assert.equal(host.nodes['gs-status'].textContent, 'current network failure');
++});
++
++test('a late complete roster cannot overwrite a newer failed member verification', async () => {
++    const host = await page();
++    host.nodes['gs-roster'].onclick();
++    const earlier = host.requests.at(-1);
++    host.nodes['gs-verify'].onclick();
++    const latest = {group: 'group-a', reliable: false, state: 'unknown', reason: 'permission_denied'};
++    await host.reply(host.requests.at(-1), latest);
++    await host.reply(earlier, {group: 'group-a', complete: true, version: 3});
++    assert.deepEqual(JSON.parse(host.output()), latest);
++});
++
++test('a late member page from an earlier Bot cannot enable the next page', async () => {
++    const host = await page();
++    host.nodes['gs-members'].onclick();
++    const earlier = host.requests.at(-1);
++    host.nodes['gs-bot'].value = 'bot-b';
++    host.nodes['gs-bot'].onchange();
++    await host.reply(host.requests.at(-1), {bot: 'bot-b', groups: []});
++    await host.reply(earlier, {group: 'group-a', version: 2, generation: 'g', members: [{member: 'old'}], next_cursor: '1.key'});
++    assert.equal(host.nodes['gs-next'].disabled, true);
++    assert.deepEqual(JSON.parse(host.output()), {bot: 'bot-b', groups: []});
++});
++
++test('editing the group retires the earlier member page and its late response', async () => {
++    const host = await page();
++    host.nodes['gs-members'].onclick();
++    await host.reply(host.requests.at(-1), {group: 'group-a', version: 2, generation: 'g', members: [], next_cursor: '1.key'});
++    assert.equal(host.nodes['gs-next'].disabled, false);
++    host.nodes['gs-members'].onclick();
++    const earlier = host.requests.at(-1);
++    host.nodes['gs-group'].value = 'group-b';
++    host.nodes['gs-group'].oninput();
++    assert.equal(host.nodes['gs-next'].disabled, true);
++    await host.reply(earlier, {group: 'group-a', version: 2, generation: 'g', members: [], next_cursor: '1.key'});
++    assert.equal(host.nodes['gs-next'].disabled, true);
++    assert.equal(host.output(), '');
++});
++
++test('the next page carries the cursor, version and generation of the current group page', async () => {
++    const host = await page();
++    host.nodes['gs-members'].onclick();
++    await host.reply(host.requests.at(-1), {group: 'group-a', version: 2, generation: 'g', members: [], next_cursor: '1.key'});
++    host.nodes['gs-next'].onclick();
++    const query = new URL(host.requests.at(-1).url, 'http://host').searchParams;
++    assert.deepEqual(Object.fromEntries(query), {bot: 'bot-a', group: 'group-a', limit: '30', generation: 'g', version: '2', cursor: '1.key'});
++});
++
++test('editing a group clears already displayed results immediately', async () => {
++    const host = await page();
++    host.nodes['gs-members'].onclick();
++    await host.reply(host.requests.at(-1), {group: 'group-a', members: [{member: 'old'}], next_cursor: '1.key'});
++    host.nodes['gs-group'].value = 'group-b';
++    host.nodes['gs-group'].oninput();
++    assert.equal(host.output(), '');
++    assert.equal(host.nodes['gs-next'].disabled, true);
++});
++
++test('returning to a group cannot restore a request from its earlier selection', async () => {
++    const host = await page();
++    host.nodes['gs-members'].onclick();
++    const earlier = host.requests.at(-1);
++    host.nodes['gs-group'].value = 'group-b';
++    host.nodes['gs-group'].oninput();
++    host.nodes['gs-group'].value = 'group-a';
++    host.nodes['gs-group'].oninput();
++    await host.reply(earlier, {group: 'group-a', members: [{member: 'old'}], next_cursor: '1.key'});
++    assert.equal(host.output(), '');
++    assert.equal(host.nodes['gs-next'].disabled, true);
++});

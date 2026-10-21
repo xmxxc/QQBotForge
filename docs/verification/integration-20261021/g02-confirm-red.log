@@ -1,0 +1,33 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_________ test_failed_confirmation_retires_old_proof_until_new_roster __________
+
+group_host = <conftest.group_host.<locals>.Host object at 0x739f991c7230>
+
+    async def test_failed_confirmation_retires_old_proof_until_new_roster(group_host):
+        host = group_host
+        earlier = await complete_roster(host)
+        path = host.modules.get_context('group_state').get_data_path('group-state.db')
+        with sqlite3.connect(path) as db:
+            db.execute("CREATE TRIGGER fail_confirmation BEFORE INSERT ON extension_records BEGIN SELECT RAISE(ABORT, 'fake disk failure'); END")
+        try:
+            response = await host.api('POST', 'confirm-member', body={'group': 'group-a', 'member': 'member-a', 'evidence': '主人核对角色变化', 'member_role': 'owner'})
+            assert response.status == 503
+>           group = await assert_retired(host, earlier)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/bot_modules/test_group_state_audit.py:44: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+host = <conftest.group_host.<locals>.Host object at 0x739f991c7230>
+earlier = {'group': 'group-a', 'generation': 'a76589051ddc4b81a3b34b353fa73701', 'version': 2, 'roster': {'complete': True, 'reason': '', 'self_member': 'this-bot', 'id': 'a749b6f093ac4f0597e8331d41285e41', ...}, ...}
+
+    async def assert_retired(host, earlier):
+        group = next(g for g in (await host.state.snapshot('bot-a'))['groups'] if g['group'] == 'group-a')
+>       assert not group['roster']['complete']
+E       assert not True
+
+tests/bot_modules/test_group_state_audit.py:26: AssertionError
+=========================== short test summary info ============================
+FAILED tests/bot_modules/test_group_state_audit.py::test_failed_confirmation_retires_old_proof_until_new_roster
+1 failed in 0.41s

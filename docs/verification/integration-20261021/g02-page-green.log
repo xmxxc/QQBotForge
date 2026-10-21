@@ -1,0 +1,75 @@
+TAP version 13
+# Subtest: an earlier GET cannot restore verified facts after a failed refresh
+ok 1 - an earlier GET cannot restore verified facts after a failed refresh
+  ---
+  duration_ms: 10.725645
+  ...
+# Subtest: changing Bot clears old facts and loads only the selected Bot
+ok 2 - changing Bot clears old facts and loads only the selected Bot
+  ---
+  duration_ms: 2.452049
+  ...
+# Subtest: returning to a Bot cannot revive a request from the earlier selection
+ok 3 - returning to a Bot cannot revive a request from the earlier selection
+  ---
+  duration_ms: 2.811922
+  ...
+# Subtest: a late network error cannot clear a newer successful result
+ok 4 - a late network error cannot clear a newer successful result
+  ---
+  duration_ms: 1.659151
+  ...
+# Subtest: a late http error cannot clear a newer successful result
+ok 5 - a late http error cannot clear a newer successful result
+  ---
+  duration_ms: 1.485817
+  ...
+# Subtest: a late json error cannot clear a newer successful result
+ok 6 - a late json error cannot clear a newer successful result
+  ---
+  duration_ms: 1.673341
+  ...
+# Subtest: starting a request clears old verified facts and current errors remain visible
+ok 7 - starting a request clears old verified facts and current errors remain visible
+  ---
+  duration_ms: 1.452454
+  ...
+# Subtest: a late complete roster cannot overwrite a newer failed member verification
+ok 8 - a late complete roster cannot overwrite a newer failed member verification
+  ---
+  duration_ms: 2.637546
+  ...
+# Subtest: a late member page from an earlier Bot cannot enable the next page
+ok 9 - a late member page from an earlier Bot cannot enable the next page
+  ---
+  duration_ms: 1.993392
+  ...
+# Subtest: editing the group retires the earlier member page and its late response
+ok 10 - editing the group retires the earlier member page and its late response
+  ---
+  duration_ms: 1.923147
+  ...
+# Subtest: the next page carries the cursor, version and generation of the current group page
+ok 11 - the next page carries the cursor, version and generation of the current group page
+  ---
+  duration_ms: 2.058494
+  ...
+# Subtest: editing a group clears already displayed results immediately
+ok 12 - editing a group clears already displayed results immediately
+  ---
+  duration_ms: 1.498545
+  ...
+# Subtest: returning to a group cannot restore a request from its earlier selection
+ok 13 - returning to a group cannot restore a request from its earlier selection
+  ---
+  duration_ms: 1.551728
+  ...
+1..13
+# tests 13
+# suites 0
+# pass 13
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 94.184353

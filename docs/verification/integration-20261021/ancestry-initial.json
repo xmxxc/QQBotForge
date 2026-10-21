@@ -1,0 +1,178 @@
+[
+  {
+    "pr": 40,
+    "ticket": 21,
+    "branch": "feat/group-state-g01",
+    "head": "09feaaa91c278fd126c9d570f9975e1df9bdeb73",
+    "previous": "origin/personal",
+    "merge_base": "0585773f9ae0ff1a60533d01de04f910fc6201d0",
+    "previous_is_ancestor": false,
+    "unique": "09feaaa91c278fd126c9d570f9975e1df9bdeb73 fix(group-state): reject reads across module unload (#21)\n85f53f7924105b6f0a46903ce6434f9ff4aa5395 fix(group-state): report observation failures to group owners (#21)\n6c3a4f98fe0dab1dabf053a4a89fa7fe8673d2bb fix(group-state): end failed refreshes and ignore stale page results (#21)\n3392592ff5c8d5fa8c4c60440118bd84179eb642 fix(group-state): publish committed facts and drain cancelled writes (#21)\n75c76e8c0d1c8e72f9153fc119a943145642f414 feat(group-state): independently manage known groups and bot facts (#21)",
+    "changed": "docs/group-state.md                         |  30 ++\n modules/group_state/main.py                 |  34 ++\n modules/group_state/page.html               |  37 ++\n modules/group_state/state.py                | 248 ++++++++++++\n modules/group_state/storage.py              |  89 ++++\n plugins/account_sharing/service.py          |   2 +-\n tests/bot_modules/test_group_state.py       | 608 ++++++++++++++++++++++++++++\n tests/bot_modules/test_group_state_page.cjs | 114 ++++++\n 8 files changed, 1161 insertions(+), 1 deletion(-)"
+  },
+  {
+    "pr": 41,
+    "ticket": 22,
+    "branch": "feat/group-state-g02",
+    "head": "95b05058f323caaf5ff83f29a460cb2823c438a5",
+    "previous": "09feaaa91c278fd126c9d570f9975e1df9bdeb73",
+    "merge_base": "09feaaa91c278fd126c9d570f9975e1df9bdeb73",
+    "previous_is_ancestor": true,
+    "unique": "95b05058f323caaf5ff83f29a460cb2823c438a5 fix(group-state): sync G01 fixes and close G02 audit gaps (#22)\n4498f0dab8851058912922e286307bc80c0b1bdc feat(group-state): verify paginated rosters and member roles (#22)",
+    "changed": "docs/group-state.md                         |  33 ++-\n modules/group_state/page.html               |  47 ++-\n modules/group_state/reader.py               | 107 +++++++\n modules/group_state/state.py                | 435 +++++++++++++++++++++++-----\n tests/bot_modules/conftest.py               | 117 ++++++++\n tests/bot_modules/test_group_roster.py      | 342 ++++++++++++++++++++++\n tests/bot_modules/test_group_state.py       | 109 +------\n tests/bot_modules/test_group_state_page.cjs |  55 +++-\n 8 files changed, 1059 insertions(+), 186 deletions(-)"
+  },
+  {
+    "pr": 42,
+    "ticket": 23,
+    "branch": "feat/group-state-g03",
+    "head": "0a83634cb3864d63435c28158da315abf5838146",
+    "previous": "95b05058f323caaf5ff83f29a460cb2823c438a5",
+    "merge_base": "4498f0dab8851058912922e286307bc80c0b1bdc",
+    "previous_is_ancestor": false,
+    "unique": "0a83634cb3864d63435c28158da315abf5838146 fix(group-state): anchor manually verified membership cycles\nfe873acf8a319346705268711379c9bffde7a22c feat(group-state): publish lifecycle facts behind recovery and consumer completion\n660ff7f7083ec6d96e2254f55ebf8af30aad3d1c docs: preserve approved bot module plan and implementation progress",
+    "changed": "AGENTS.md                                          |   6 +\n GLOSSARY.md                                        |  35 +++\n docs/account-sharing-management.md                 |   2 +\n docs/account-sharing.md                            |   2 +\n docs/agents/issue-tracker.md                       |  17 +\n docs/archive/account-sharing-v1/README.md          |   5 +\n .../account-sharing-extension-boundary.md          |  35 +++\n .../account-sharing-v1/account-sharing-progress.md |  31 ++\n .../account-sharing-v1/account-sharing-tickets.md  |  82 +++++\n .../account-sharing-v1/account-sharing-worker.md   |  94 ++++++\n docs/archive/account-sharing-v1/account-sharing.md | 274 ++++++++++++++++\n docs/group-state.md                                |  27 +-\n .../account-sharing/01-owner-account-preview.md    |   2 +\n .../account-sharing/02-group-member-access.md      |   2 +\n .../account-sharing/03-binding-private-query.md    |   2 +\n .../account-sharing/04-qa-keyword-query.md         |   2 +\n .../account-sharing/05-account-buttons.md          |   2 +\n .../account-sharing/06-bulk-scoped-grants.md       |   2 +\n .../account-sharing/07-deny-expiry-explanation.md  |   2 +\n .../account-sharing/08-leave-revocation.md         |   2 +\n .../account-sharing/09-membership-revalidation.md  |   2 +\n .../10-all-members-group-delivery.md               |   2 +\n .../account-sharing/11-group-mode-diagnostics.md   |   2 +\n .../account-sharing/12-owner-workflow-results.md   |   2 +\n docs/issue-drafts/bot-modules/a01.md               |  36 +++\n docs/issue-drafts/bot-modules/a02.md               |  36 +++\n docs/issue-drafts/bot-modules/a03.md               |  36 +++\n docs/issue-drafts/bot-modules/a04.md               |  36 +++\n docs/issue-drafts/bot-modules/b01.md               |  36 +++\n docs/issue-drafts/bot-modules/c01.md               |  37 +++\n docs/issue-drafts/bot-modules/c02.md               |  37 +++\n docs/issue-drafts/bot-modules/c03.md               |  37 +++\n docs/issue-drafts/bot-modules/c04.md               |  36 +++\n docs/issue-drafts/bot-modules/f01.md               |  36 +++\n docs/issue-drafts/bot-modules/g01.md               |  36 +++\n docs/issue-drafts/bot-modules/g02.md               |  36 +++\n docs/issue-drafts/bot-modules/g03.md               |  37 +++\n docs/issue-drafts/bot-modules/q01.md               |  36 +++\n docs/issue-drafts/bot-modules/q02.md               |  36 +++\n docs/issue-drafts/bot-modules/q03.md               |  37 +++\n docs/issue-drafts/bot-modules/q04.md               |  36 +++\n docs/issue-drafts/bot-modules/q05.md               |  39 +++\n docs/plans/account-sharing-extension-boundary.md   |  41 ++-\n docs/plans/account-sharing-progress.md             |  55 ++--\n docs/plans/account-sharing-tickets.md              |  81 +----\n docs/plans/bot-modules-tickets.md                  | 128 ++++++++\n docs/prompts/account-sharing-worker.md             | 125 +++-----\n docs/specs/account-sharing.md                      | 224 ++-----------\n docs/specs/bot-modules.md                          | 152 +++++++++\n modules/group_state/lifecycle.py                   |  20 ++\n modules/group_state/main.py                        |   1 +\n modules/group_state/notifications.py               | 146 +++++++++\n modules/group_state/page.html                      |   5 +-\n modules/group_state/state.py                       | 280 ++++++++++++++++-\n tests/bot_modules/conftest.py                      |  65 +++-\n tests/bot_modules/socket_platform.py               |  67 ++++\n tests/bot_modules/test_group_lifecycle.py          | 349 +++++++++++++++++++++\n 57 files changed, 2596 insertions(+), 433 deletions(-)"
+  },
+  {
+    "pr": 43,
+    "ticket": 24,
+    "branch": "feat/access-control-a01",
+    "head": "bfab97f584a2cde94b6c1013fd3ae0229af0ddc7",
+    "previous": "0a83634cb3864d63435c28158da315abf5838146",
+    "merge_base": "0a83634cb3864d63435c28158da315abf5838146",
+    "previous_is_ancestor": true,
+    "unique": "bfab97f584a2cde94b6c1013fd3ae0229af0ddc7 feat(access-control): manage isolated consumer policies with current group facts",
+    "changed": "docs/access-control.md                   |  41 +++\n docs/group-state.md                      |   4 +-\n docs/plans/account-sharing-progress.md   |   6 +-\n modules/access_control/authorization.py  | 478 +++++++++++++++++++++++++++++++\n modules/access_control/main.py           |  22 +-\n modules/access_control/management.py     |  97 +++++++\n modules/access_control/page.html         |  29 ++\n modules/access_control/storage.py        |   9 +-\n modules/group_state/main.py              |   3 +\n modules/group_state/state.py             |  42 ++-\n tests/bot_modules/test_access_control.py | 351 +++++++++++++++++++++++\n 11 files changed, 1060 insertions(+), 22 deletions(-)"
+  },
+  {
+    "pr": 44,
+    "ticket": 25,
+    "branch": "feat/access-control-a02",
+    "head": "57debf6d66c37d655da7d5437879881397115f20",
+    "previous": "bfab97f584a2cde94b6c1013fd3ae0229af0ddc7",
+    "merge_base": "bfab97f584a2cde94b6c1013fd3ae0229af0ddc7",
+    "previous_is_ancestor": true,
+    "unique": "57debf6d66c37d655da7d5437879881397115f20 feat(access-control): scope grant sources and batch owner operations",
+    "changed": "docs/access-control.md                  |  19 ++-\n docs/plans/account-sharing-progress.md  |   4 +-\n modules/access_control/authorization.py | 205 +++++++++++++++++++++----\n modules/access_control/page.html        |  26 +++-\n tests/bot_modules/test_access_scopes.py | 264 ++++++++++++++++++++++++++++++++\n 5 files changed, 482 insertions(+), 36 deletions(-)"
+  },
+  {
+    "pr": 45,
+    "ticket": 26,
+    "branch": "feat/access-control-a03",
+    "head": "7159d4c344b014b5eb025f9b4b97c7f6781a5133",
+    "previous": "57debf6d66c37d655da7d5437879881397115f20",
+    "merge_base": "57debf6d66c37d655da7d5437879881397115f20",
+    "previous_is_ancestor": true,
+    "unique": "7159d4c344b014b5eb025f9b4b97c7f6781a5133 docs: record A03 delivery and requested pause\nb8d32979a56ab1200e6e9b96af7d778da35193ea feat(access-control): share verified bindings and scoped private contexts",
+    "changed": "docs/access-control.md                  |  28 ++-\n docs/plans/account-sharing-progress.md  |  13 +-\n modules/access_control/authorization.py |  13 ++\n modules/access_control/bindings.py      | 352 ++++++++++++++++++++++++++++++++\n modules/access_control/management.py    |  62 +++++-\n modules/access_control/page.html        |   7 +-\n tests/bot_modules/test_bindings.py      | 303 +++++++++++++++++++++++++++\n 7 files changed, 772 insertions(+), 6 deletions(-)"
+  },
+  {
+    "pr": 46,
+    "ticket": 27,
+    "branch": "feat/access-control-a04",
+    "head": "6a73456f052c3f763e11581386306ec487283bc7",
+    "previous": "7159d4c344b014b5eb025f9b4b97c7f6781a5133",
+    "merge_base": "7159d4c344b014b5eb025f9b4b97c7f6781a5133",
+    "previous_is_ancestor": true,
+    "unique": "6a73456f052c3f763e11581386306ec487283bc7 docs: record A04 delivery and next ticket\nf26aff005a58af5bbf668e938dd2d2273807f5d0 feat(access-control): whole-group qualification reports and pre-send checks (#27)",
+    "changed": "docs/access-control.md                  |  23 +++-\n docs/group-state.md                     |   2 +-\n docs/plans/account-sharing-progress.md  |  10 +-\n modules/access_control/audience.py      | 136 +++++++++++++++++++\n modules/access_control/authorization.py |  17 ++-\n modules/access_control/management.py    |   4 +\n modules/access_control/page.html        |   6 +-\n modules/group_state/state.py            |  14 ++\n tests/bot_modules/test_audience.py      | 225 ++++++++++++++++++++++++++++++++\n 9 files changed, 428 insertions(+), 9 deletions(-)"
+  },
+  {
+    "pr": 48,
+    "ticket": 28,
+    "branch": "feat/self-qa-q01",
+    "head": "a7e58746b41f91b294dee4d7477ef1e8fbd339a0",
+    "previous": "6a73456f052c3f763e11581386306ec487283bc7",
+    "merge_base": "6a73456f052c3f763e11581386306ec487283bc7",
+    "previous_is_ancestor": true,
+    "unique": "a7e58746b41f91b294dee4d7477ef1e8fbd339a0 docs: record Q01 delivery and framework hook prerequisite\n6461759925571730d73add19e742eb67618e4bce feat(self-qa): standalone public Q&A with owner configuration (#28)",
+    "changed": "docs/bot-modules-installation.md       |   2 +-\n docs/plans/account-sharing-progress.md |   8 +-\n docs/self-qa.md                        |  33 +++++\n modules/self_qa/entry.py               | 117 +++++++++++++++\n modules/self_qa/main.py                |  23 ++-\n modules/self_qa/matching.py            |  50 ++++++-\n modules/self_qa/page.html              |  36 +++++\n tests/bot_modules/test_self_qa.py      | 257 +++++++++++++++++++++++++++++++++\n 8 files changed, 512 insertions(+), 14 deletions(-)"
+  },
+  {
+    "pr": 49,
+    "ticket": 29,
+    "branch": "feat/self-qa-q02",
+    "head": "68330979c689b5e4fed0348c1886808d87867156",
+    "previous": "a7e58746b41f91b294dee4d7477ef1e8fbd339a0",
+    "merge_base": "a7e58746b41f91b294dee4d7477ef1e8fbd339a0",
+    "previous_is_ancestor": true,
+    "unique": "68330979c689b5e4fed0348c1886808d87867156 feat(self-qa): regex rules, unified ranking and candidate menus (#29)",
+    "changed": "docs/self-qa.md                             |  15 ++-\n modules/self_qa/entry.py                    | 143 +++++++++++++++++++++++++--\n modules/self_qa/main.py                     |   2 +\n modules/self_qa/matching.py                 |  54 ++++++++--\n modules/self_qa/menus.py                    |  67 +++++++++++++\n modules/self_qa/page.html                   |  10 +-\n modules/self_qa/regex_runner.py             | 100 +++++++++++++++++++\n tests/bot_modules/test_self_qa.py           |  29 ++++++\n tests/bot_modules/test_self_qa_selection.py | 146 ++++++++++++++++++++++++++++\n 9 files changed, 547 insertions(+), 19 deletions(-)"
+  },
+  {
+    "pr": 50,
+    "ticket": 30,
+    "branch": "feat/self-qa-q03",
+    "head": "e33def9685bedbdae429c465147b9f875dbe9dcd",
+    "previous": "68330979c689b5e4fed0348c1886808d87867156",
+    "merge_base": "68330979c689b5e4fed0348c1886808d87867156",
+    "previous_is_ancestor": true,
+    "unique": "e33def9685bedbdae429c465147b9f875dbe9dcd feat(self-qa): per-rule authorization and per-group delegation (#30)",
+    "changed": "docs/self-qa.md                          |  24 ++++-\n modules/self_qa/access.py                | 130 ++++++++++++++++++++++++\n modules/self_qa/entry.py                 | 112 ++++++++++++++++++---\n modules/self_qa/matching.py              |  69 +++++++------\n modules/self_qa/page.html                |  15 ++-\n tests/bot_modules/test_self_qa_access.py | 165 +++++++++++++++++++++++++++++++\n 6 files changed, 471 insertions(+), 44 deletions(-)"
+  },
+  {
+    "pr": 51,
+    "ticket": 31,
+    "branch": "feat/self-qa-q04",
+    "head": "00be98b991d51f5060038257bfb8668a173b6acd",
+    "previous": "e33def9685bedbdae429c465147b9f875dbe9dcd",
+    "merge_base": "e33def9685bedbdae429c465147b9f875dbe9dcd",
+    "previous_is_ancestor": true,
+    "unique": "00be98b991d51f5060038257bfb8668a173b6acd feat(self-qa): Markdown, image and button answers with confirmed fallback (#31)\n387a33202cdb8c383d5f75aa1e0cc372acd1b2e0 fix(access-control): classify binding receipts from real reply results (#26)",
+    "changed": "docs/self-qa.md                          |  10 +++\n modules/access_control/management.py     |  12 +++-\n modules/self_qa/delivery.py              | 120 +++++++++++++++++++++++++++++++\n modules/self_qa/entry.py                 |  40 ++++++++---\n modules/self_qa/matching.py              |   5 +-\n modules/self_qa/menus.py                 |   7 ++\n modules/self_qa/page.html                |   7 +-\n tests/bot_modules/conftest.py            |   3 +-\n tests/bot_modules/test_bindings.py       |  22 +++---\n tests/bot_modules/test_self_qa.py        |  21 +++++-\n tests/bot_modules/test_self_qa_access.py |   7 +-\n tests/bot_modules/test_self_qa_rich.py   | 118 ++++++++++++++++++++++++++++++\n 12 files changed, 345 insertions(+), 27 deletions(-)"
+  },
+  {
+    "pr": 52,
+    "ticket": 32,
+    "branch": "feat/self-qa-q05",
+    "head": "e6718346f08a1bcb523a37aa5c8e24f9ebe34297",
+    "previous": "00be98b991d51f5060038257bfb8668a173b6acd",
+    "merge_base": "00be98b991d51f5060038257bfb8668a173b6acd",
+    "previous_is_ancestor": true,
+    "unique": "e6718346f08a1bcb523a37aa5c8e24f9ebe34297 docs: record Q02-Q05 delivery and account migration notes\n1e169ffba3cca439ce7221b7907f19c40fcc9462 feat(self-qa): restricted group answers go private; private group contexts (#32)\n00e4c8c1f29c6358efaff8865667703a392d479e feat(access-control): verified private context for a group member (#32)",
+    "changed": "docs/access-control.md                    |   4 +\n docs/plans/account-sharing-progress.md    |  10 +-\n docs/self-qa.md                           |   8 ++\n modules/access_control/authorization.py   |  11 +++\n modules/access_control/bindings.py        |  21 +++++\n modules/self_qa/access.py                 |  33 ++++++-\n modules/self_qa/delivery.py               | 112 ++++++++++++++++-------\n modules/self_qa/entry.py                  | 107 +++++++++++++++++-----\n modules/self_qa/menus.py                  |   8 +-\n tests/bot_modules/conftest.py             |  13 +++\n tests/bot_modules/test_self_qa_access.py  |   7 +-\n tests/bot_modules/test_self_qa_private.py | 146 ++++++++++++++++++++++++++++++\n tests/bot_modules/test_self_qa_rich.py    |   3 +-\n 13 files changed, 413 insertions(+), 70 deletions(-)"
+  },
+  {
+    "pr": 53,
+    "ticket": 33,
+    "branch": "feat/account-sharing-c01",
+    "head": "2b99c372a725ed7e73d56a99e8f372476863d003",
+    "previous": "e6718346f08a1bcb523a37aa5c8e24f9ebe34297",
+    "merge_base": "e6718346f08a1bcb523a37aa5c8e24f9ebe34297",
+    "previous_is_ancestor": true,
+    "unique": "2b99c372a725ed7e73d56a99e8f372476863d003 feat(account-sharing): compose group state, authorization and Q&A (#33)\nad70979ebd5497b05fb8567aaf008c68726e752d feat(access-control): import legacy sources inactive until owner adoption (#33)",
+    "changed": "docs/account-sharing.md                            |   19 +\n modules/access_control/authorization.py            |  117 +-\n plugins/account_sharing/group_delivery.py          |  131 +-\n plugins/account_sharing/identities.py              |  103 --\n plugins/account_sharing/page.html                  |    7 +-\n plugins/account_sharing/service.py                 | 1334 +++++++++-----------\n tests/account_sharing/conftest.py                  |  202 ---\n tests/account_sharing/test_access.py               |  138 --\n tests/account_sharing/test_accounts.py             |   85 --\n tests/account_sharing/test_binding.py              |  165 ---\n tests/account_sharing/test_buttons.py              |  195 ---\n tests/account_sharing/test_expiry_denies.py        |  173 ---\n tests/account_sharing/test_group_delivery.py       |  222 ----\n tests/account_sharing/test_membership.py           |  190 ---\n tests/account_sharing/test_qa.py                   |  129 --\n tests/account_sharing/test_revalidation.py         |  128 --\n tests/account_sharing/test_scoped_grants.py        |  174 ---\n .../account_sharing/test_storage_compatibility.py  |  114 --\n tests/account_sharing/test_workflows.py            |   63 -\n tests/bot_modules/account_host.py                  |   71 ++\n tests/bot_modules/conftest.py                      |    4 +\n tests/bot_modules/test_account_c01.py              |  175 +++\n .../test_extension_install.py}                     |   91 +-\n 23 files changed, 1074 insertions(+), 2956 deletions(-)"
+  },
+  {
+    "pr": 54,
+    "ticket": 34,
+    "branch": "feat/account-sharing-c02",
+    "head": "6f4483768b53d83fe70e8043d297ea210c81ada0",
+    "previous": "2b99c372a725ed7e73d56a99e8f372476863d003",
+    "merge_base": "2b99c372a725ed7e73d56a99e8f372476863d003",
+    "previous_is_ancestor": true,
+    "unique": "6f4483768b53d83fe70e8043d297ea210c81ada0 feat(account-sharing): one query path for directory, keywords and buttons (#34)",
+    "changed": "docs/account-sharing.md                   |   4 +\n plugins/account_sharing/group_delivery.py |  18 ++-\n plugins/account_sharing/service.py        |  41 +++++--\n tests/bot_modules/account_host.py         |  34 ++++++\n tests/bot_modules/conftest.py             |   8 ++\n tests/bot_modules/test_account_c02.py     | 192 ++++++++++++++++++++++++++++++\n 6 files changed, 285 insertions(+), 12 deletions(-)"
+  },
+  {
+    "pr": 55,
+    "ticket": 35,
+    "branch": "feat/account-sharing-c03",
+    "head": "1fc289a44bb2254f0db7ef5ccaca375f8a9fc89c",
+    "previous": "6f4483768b53d83fe70e8043d297ea210c81ada0",
+    "merge_base": "6f4483768b53d83fe70e8043d297ea210c81ada0",
+    "previous_is_ancestor": true,
+    "unique": "1fc289a44bb2254f0db7ef5ccaca375f8a9fc89c feat(account-sharing): strict per-account group delivery and restore choices (#35)\na0de711fa1476e5babf9dd51a20de4ffb6f6ffca feat(access-control): tell group-fact changes apart in a whole-group report (#35)",
+    "changed": "docs/account-sharing.md                   |  10 ++\n modules/access_control/audience.py        |   3 +\n modules/access_control/authorization.py   |   4 +\n plugins/account_sharing/group_delivery.py |  20 +--\n tests/bot_modules/test_account_c03.py     | 237 ++++++++++++++++++++++++++++++\n 5 files changed, 264 insertions(+), 10 deletions(-)"
+  },
+  {
+    "pr": 56,
+    "ticket": 36,
+    "branch": "feat/account-sharing-c04",
+    "head": "291d759911bd91a3e1f8219fca5e96fb7cb72751",
+    "previous": "1fc289a44bb2254f0db7ef5ccaca375f8a9fc89c",
+    "merge_base": "1fc289a44bb2254f0db7ef5ccaca375f8a9fc89c",
+    "previous_is_ancestor": true,
+    "unique": "291d759911bd91a3e1f8219fca5e96fb7cb72751 feat(account-sharing): owner to-dos across modules and whole-system acceptance (#36)",
+    "changed": "docs/bot-modules-installation.md       |  80 +++++++++++++++-----\n docs/plans/account-sharing-progress.md |  23 ++++--\n plugins/account_sharing/service.py     |  24 ++++--\n tests/bot_modules/test_account_c04.py  | 129 +++++++++++++++++++++++++++++++++\n 4 files changed, 226 insertions(+), 30 deletions(-)"
+  }
+]
