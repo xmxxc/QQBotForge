@@ -3,24 +3,57 @@
 Consumers submit function, resource and actions; they never read platform
 responses, roster internals or authorization versions. ``current`` is the
 non-awaiting final gate before a group send.
+
+A report is a display copy plus an opaque ``credential``. The roster proof,
+per-recipient decisions, deadline and the context the report was built for
+live inside that credential, which only its issuing instance accepts, so
+rewriting any report field cannot widen or extend it, and a reload
+invalidates every earlier credential.
 """
 
 import copy
+import weakref
 
 from .policy import identifier
 
 ACTIONS = ('invoke', 'view')
 
 
+class Credential:
+    """Opaque verification material of one report; copies keep the same object."""
+
+    __slots__ = ('_record', '__weakref__')
+
+    def __init__(self, record):
+        self._record = record
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __repr__(self):
+        return '<audience credential>'
+
+
+def normalized_actions(actions):
+    if not isinstance(actions, (list, tuple)) or not actions or set(actions) - set(ACTIONS):
+        return None
+    return tuple(action for action in ACTIONS if action in actions)
+
+
 class Audience:
     def __init__(self, access):
         self.access = access
+        self.issued: weakref.WeakSet[Credential] = weakref.WeakSet()
 
     async def report(self, bot, consumer, function, group, resource='', *, actions=('view',)):
         identifier(group)
-        if not isinstance(actions, (list, tuple)) or not actions or set(actions) - set(ACTIONS):
+        ordered = normalized_actions(actions)
+        if ordered is None:
             raise ValueError('动作须为 invoke/view 的非空列表')
-        actions = [action for action in ACTIONS if action in actions]
+        actions = list(ordered)
         state = await self.access._scope(bot, consumer)
         if function not in state['functions']:
             raise ValueError('消费方功能尚未声明')
@@ -40,7 +73,7 @@ class Audience:
             'failures_complete': False,
             'checked_at': self.access.clock(),
             'valid_until': None,
-            '_proof': None,
+            'credential': None,
         }
         try:
             group_proof, member_proofs = await self.access._facts().facts(bot, group)
@@ -87,53 +120,70 @@ class Audience:
                 result['failures'].append({'member': member, 'bot': row['bot'], 'reasons': {a: row['actions'][a]['reason'] for a in actions}})
         result['failures_complete'] = result['complete']
         result['valid_until'] = min(deadlines) if deadlines else None
-        result['_proof'] = {
+        issued = {
+            'context': (bot, consumer, function, group, resource, ordered),
             'roster': {**group_proof, 'group_state': None, 'usable': result['complete']},
-            'roster_id': roster.get('id'),
             'decisions': decisions,
             'members': {row['member']: [d for d in decisions if d['member'] == row['member']] for row in result['members']},
+            'valid_until': result['valid_until'],
+            'eligible': False,
         }
         if not result['complete']:
             result['reason'] = 'roster_incomplete'
         elif result['failures']:
             result['reason'] = 'member_ineligible'
-        elif not self.current(bot, result):
+        elif not self._current(bot, {**issued, 'eligible': True}):
             result['reason'] = 'state_changed'
         else:
+            issued['eligible'] = True
             result.update(eligible=True, reason='eligible')
+        result['credential'] = Credential(issued)
+        self.issued.add(result['credential'])
         return result
 
-    def _roster_current(self, bot, report):
-        proof = report.get('_proof') if isinstance(report, dict) else None
+    def _issued(self, bot, report, consumer, function, group, resource, actions):
+        """The issued record, only for the exact context the caller is about to act on."""
+        credential = report.get('credential') if isinstance(report, dict) else None
+        if not isinstance(credential, Credential) or credential not in self.issued:
+            return None
+        issued = credential._record
+        return issued if issued['context'] == (bot, consumer, function, group, resource, normalized_actions(actions)) else None
+
+    def _roster_current(self, issued):
         source = self.access.group_state()
-        return bool(proof and proof['roster']['usable'] and source and source.fact_current(proof['roster'])), proof
+        return bool(issued['roster']['usable'] and source and source.fact_current(issued['roster']))
 
-    def facts_current(self, bot, report):
-        return self._roster_current(bot, report)[0]
-
-    def current(self, bot, report):
-        """Every recipient decision and the roster proof are still the latest."""
-        current, proof = self._roster_current(bot, report)
+    def _current(self, bot, issued):
         return bool(
-            current
-            and report.get('bot') == bot
-            and proof['decisions']
-            and (report['valid_until'] is None or self.access.clock() < report['valid_until'])
-            and all(self.access.decision_current(bot, decision) for decision in proof['decisions'])
+            issued['eligible']
+            and self._roster_current(issued)
+            and issued['decisions']
+            and (issued['valid_until'] is None or self.access.clock() < issued['valid_until'])
+            and all(self.access.decision_current(bot, decision) for decision in issued['decisions'])
         )
 
-    def member_current(self, bot, report, member):
-        """One recipient, for example the asker, without reading report internals."""
-        proof = report.get('_proof') if isinstance(report, dict) else None
-        decisions = proof['members'].get(member) if proof else None
+    def facts_current(self, bot, report, *, consumer, function, group, resource, actions):
+        """Only the group facts behind this report (roster, members, roles, recovery) are unchanged."""
+        issued = self._issued(bot, report, consumer, function, group, resource, actions)
+        return bool(issued and self._roster_current(issued))
+
+    def current(self, bot, report, *, consumer, function, group, resource, actions):
+        """Every recipient decision and the roster proof still hold for this exact send."""
+        issued = self._issued(bot, report, consumer, function, group, resource, actions)
+        return bool(issued and self._current(bot, issued))
+
+    def member_current(self, bot, report, member, *, consumer, function, group, resource, actions):
+        """One recipient, for example the asker, for this exact context."""
+        issued = self._issued(bot, report, consumer, function, group, resource, actions)
+        decisions = issued['members'].get(member) if issued else None
         return bool(
             decisions
-            and report.get('bot') == bot
-            and len(decisions) == len(report['actions'])
+            and issued
+            and {decision['action'] for decision in decisions} == set(actions)
             and all(self.access.decision_current(bot, decision) for decision in decisions)
         )
 
     @staticmethod
     def owner_view(report):
-        """Management copy without decision internals; only owner entry points use it."""
-        return {key: copy.deepcopy(value) for key, value in report.items() if key != '_proof'}
+        """Management copy without the verification credential; only owner entry points use it."""
+        return {key: copy.deepcopy(value) for key, value in report.items() if key != 'credential'}

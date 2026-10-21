@@ -1,5 +1,6 @@
 """Owner HTTP and QQ management share the scoped authorization operations."""
 
+import asyncio
 import json
 import sqlite3
 
@@ -9,6 +10,27 @@ from core.base.config import cfg
 from core.plugin._blacklist import get_blacklist_map
 
 PREFIX = '/api/ext/access-control/'
+
+
+def classify_receipt(reply):
+    """Classify a Sender.reply result as (notification, error).
+
+    reply returns the platform response dict on success ({} for an empty body),
+    the error dict on failure (``code`` -1 is the framework's network failure),
+    and None when nothing was sent or the framework suppressed the error. It
+    drops the success flag, so an error-shaped body (a code, an err_code, or a
+    message without a message id) counts as rejected, never as sent.
+    """
+    if not isinstance(reply, dict):
+        return 'send_failed', 'no_response'
+    code = next((reply[key] for key in ('code', 'err_code') if reply.get(key) not in (None, 0, '', '0')), None)
+    if str(code) == '-1':
+        return 'send_failed', 'network_error'
+    if code is not None:
+        return 'platform_rejected', str(code)[:128]
+    if 'message' in reply and 'id' not in reply:
+        return 'platform_rejected', 'unknown'
+    return 'sent', None
 
 
 class Management:
@@ -116,20 +138,15 @@ class Management:
                     raise ValueError('身份绑定 申请 <群原生ID> <成员原生ID> / 身份绑定 群资格 <消费方> <功能> [群] [资源]')
             except (ValueError, RuntimeError, sqlite3.Error, OSError):
                 content = '绑定申请暂不可用，请核对原生身份或联系主人'
-            status, error = 'send_failed', None
             try:
-                # Sender.reply returns the platform response dict: an error carries
-                # ``code`` (-1 is the framework's network failure), otherwise sent.
-                reply = await instance.sender.reply(event, content)
-                code = reply.get('code') if isinstance(reply, dict) else None
-                if reply is None or str(code) == '-1':
-                    status, error = 'send_failed', 'network_error'
-                elif code not in (None, 0):
-                    status, error = 'platform_rejected', str(code)[:128]
-                else:
-                    status = 'sent'
-            except Exception:
-                status, error = 'send_failed', 'network_error'
+                status, error = classify_receipt(await instance.sender.reply(event, content))
+            except asyncio.CancelledError:
+                # The platform may or may not have received it; never record it as sent.
+                if result:
+                    await self.service.bindings.delivery(event.appid, result['id'], 'send_unknown', 'cancelled')
+                raise
+            except Exception as failure:
+                status, error = 'send_failed', type(failure).__name__[:128]
             if result:
                 await self.service.bindings.delivery(event.appid, result['id'], status, error)
             return None
