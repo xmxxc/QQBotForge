@@ -98,12 +98,13 @@ class AccessBridge:
 
     async def group_view(self, bot, rule, group):
         """Whole-group view eligibility for a restricted answer (A04 report)."""
+        context = dict(consumer=CONSUMER, function=rule_function(rule), group=group, resource=resource(rule), actions=['view'])
         try:
             acl = await self.ensure(bot)
-            report = await acl.audience_report(bot, CONSUMER, rule_function(rule), group, resource(rule), actions=['view'])
+            report = await acl.audience_report(bot, context['consumer'], context['function'], group, context['resource'], actions=context['actions'])
         except FAILURES:
             return None
-        return report if report['eligible'] and acl.report_current(bot, report) else None
+        return report if report['eligible'] and acl.report_current(bot, report, **context) else None
 
     async def delegate(self, bot, group, member):
         """Current delegated-manager decision for this group, or None."""
