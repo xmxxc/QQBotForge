@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import sys
+from pathlib import Path
 from weakref import WeakSet
 
 from core.base.context import BaseContext
@@ -37,13 +38,18 @@ _DEFAULT_MANIFEST = {
 class ModuleContext(BaseContext):
     """模块上下文 — 继承 BaseContext, 额外提供 Hook 注册"""
 
-    __slots__ = ('_hooks', '_group_subscriptions', '_subscriptions_closed', '_connection_subscriptions')
+    __slots__ = ('_hooks', '_group_subscriptions', '_subscriptions_closed', '_connection_subscriptions', '_recovery_subscriptions', '_recovery_scope')
 
     def __init__(self, name, module_dir, hook_manager):
         super().__init__(name, module_dir, EXTENSION)
         self._hooks = hook_manager
+        # 绑定安装槽位而非展示名；入口 symlink 切换版本后仍属于同一模块。
+        module_path = Path(module_dir)
+        # 先按真实文件系统解析父路径，不能先折叠 symlink/..。
+        self._recovery_scope = str(module_path.resolve() if module_path.name == '..' else module_path.parent.resolve() / module_path.name)
         self._group_subscriptions = WeakSet()
         self._connection_subscriptions = WeakSet()
+        self._recovery_subscriptions = WeakSet()
         self._subscriptions_closed = False
 
     @property
@@ -91,8 +97,24 @@ class ModuleContext(BaseContext):
         self._connection_subscriptions.add(subscription)
         return subscription
 
+    @property
+    def recovery_api_version(self):
+        return self._hooks.recovery.api_version
+
+    def subscribe_recovery_events(self, callback, *, event_types, appid=None, timeout=5.0, max_pending=128, depends_on=()):
+        """显式参与状态恢复；回调需在更新完成后调用 delivery.acknowledge()。"""
+        if self._subscriptions_closed:
+            raise RuntimeError('module context is unloaded')
+        subscription = self._hooks.recovery.subscribe(callback, owner=self.name, event_types=event_types, appid=appid,
+                                                       timeout=timeout, max_pending=max_pending, depends_on=depends_on, _scope=self._recovery_scope)
+        self._recovery_subscriptions.add(subscription)
+        return subscription
+
     def _close_subscriptions(self):
         self._subscriptions_closed = True
+        for subscription in self._recovery_subscriptions:
+            subscription._close('unloaded')
+        self._recovery_subscriptions.clear()
         for subscription in self._group_subscriptions:
             subscription._close('unloaded')
         self._group_subscriptions.clear()
