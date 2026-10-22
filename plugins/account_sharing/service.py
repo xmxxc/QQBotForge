@@ -11,6 +11,7 @@ import asyncio
 import json
 import sqlite3
 import time
+from types import SimpleNamespace
 from uuid import uuid4
 
 from aiohttp import web
@@ -95,6 +96,8 @@ class AccountSharing:
         self.notification_locks = {}
         self.declared = {}
         self.inventory_version = {}
+        self.inventory_writes = set()
+        self.context_versions = {}
         self.clock = clock
         self.menus = MenuSessions(self.store, lambda: self.clock())
         self.group_delivery = GroupDelivery(self)
@@ -188,16 +191,29 @@ class AccountSharing:
             if operation == 'list':
                 return await self.accounts(bot)
             old = await self.store.get(bot, 'accounts', key) if key else None
-            if operation in {'update', 'delete', 'preview'} and not old:
+            cleanup = await self.store.get(bot, 'account_cleanup', key) if operation == 'delete' else None
+            if operation in {'update', 'delete', 'preview'} and not old and not cleanup:
                 raise BusinessError('账户不存在', 404)
             if operation == 'preview':
                 if not old['enabled']:
                     raise BusinessError('账户已停用', 409)
                 return old
             if operation == 'delete':
-                await self.store.delete(bot, 'accounts', key)
+                # Journal first, remove the account before cross-module cleanup. A
+                # failed cleanup stays inaccessible and DELETE of this ID retries it.
+                await self.store.put(bot, 'account_cleanup', key, {'id': key})
                 self.accounts_changed(bot)
-                await self._sync_resources(bot)
+                self.inventory_writes.add(bot)
+                try:
+                    await self.store.delete(bot, 'accounts', key)
+                finally:
+                    self.inventory_writes.discard(bot)
+                    self.accounts_changed(bot)
+                try:
+                    await self.cleanup_account(bot, key)
+                except (BusinessError, RuntimeError, ValueError, sqlite3.Error, OSError) as error:
+                    raise BusinessError(f'账户 {key} 已删除，关联清理未完成；请重试删除此 ID', 503) from error
+                await self.store.delete(bot, 'account_cleanup', key)
                 log.info(f'[{bot}] 删除账户 {key}')
                 return {'id': key}
             if operation not in {'create', 'update'}:
@@ -205,11 +221,30 @@ class AccountSharing:
             validate_account(data, create=operation == 'create')
             account = old or {'id': uuid4().hex, 'enabled': True, 'description': '', 'url': '', 'groups': []}
             account.update(data)
-            await self.store.put(bot, 'accounts', account['id'], account)
-            self.accounts_changed(bot)
+            self.inventory_writes.add(bot)
+            try:
+                await self.store.put(bot, 'accounts', account['id'], account)
+            finally:
+                self.inventory_writes.discard(bot)
+                self.accounts_changed(bot)
             await self._sync_resources(bot)
             log.info(f'[{bot}] 保存账户 {account["id"]}')
             return account
+
+    async def cleanup_account(self, bot, resource):
+        qa = self.qa()
+        for rule in await qa.manage(bot, FUNCTION, 'list'):
+            if rule['kind'] == 'resource' and rule['target'] == resource:
+                await qa.manage(bot, FUNCTION, 'delete', key=rule['id'])
+        for menu in await self.store.all(bot, 'menus'):
+            if any(a.get('resource') == resource for a in menu['actions'].values()):
+                await self.store.delete(bot, 'menus', menu['id'])
+        for mode in await self.store.all(bot, 'group_delivery'):
+            if mode['resource'] == resource:
+                await self.store.delete(bot, 'group_delivery', mode['id'])
+                self.group_delivery.modes.pop((bot, mode['id']), None)
+                self.group_delivery.reports.pop((bot, mode['id']), None)
+        await self.ensure(bot)
 
     async def _sync_resources(self, bot):
         """Deleting an account removes it as a resource: its direct grants lose it, a new ID inherits nothing."""
@@ -252,6 +287,10 @@ class AccountSharing:
     # ---------- rules (Q&A namespace account_sharing) ----------
 
     async def rule_management(self, bot, operation, data=None, key=''):
+        async with self.lock:
+            return await self._rule_management(bot, operation, data, key)
+
+    async def _rule_management(self, bot, operation, data=None, key=''):
         try:
             if operation in {'create', 'update'} and isinstance(data, dict):
                 old = await self.qa().manage(bot, FUNCTION, 'get', key=key) if key else None
@@ -275,15 +314,31 @@ class AccountSharing:
         values = dict(data)
         operation = values.pop('operation', '')
         operation = {'set_expiry': 'expiry'}.get(operation, operation)
-        values.pop('scope', None)  # legacy deny scope; scoped denies use function_scope
+        scope = values.pop('scope', None)
+        if scope is not None and (operation not in {'deny', 'allow'} or scope not in {'group', 'member'}):
+            raise BusinessError('拒绝范围须为 group/member')
         if operation in MOVED:
             raise BusinessError(MOVED[operation])
         values.pop('function', None)
-        values.pop('identity_type', None)
+        identity_type = values.pop('identity_type', 'group_member_openid')
+        if identity_type != 'group_member_openid':
+            raise BusinessError('成员须使用群原生成员 OpenID')
+        values.pop('confirmed', None)  # UI acknowledgement never substitutes for group facts.
+        if isinstance(values.get('members'), list):
+            values['members'] = [
+                {k: v for k, v in target.items() if k not in {'identity_type', 'confirmed'}}
+                if isinstance(target, dict) and target.get('identity_type', 'group_member_openid') == 'group_member_openid'
+                else target
+                for target in values['members']
+            ]
         values.pop('resource_namespace', None)
         try:
             acl = await self.ensure(bot)
             group, member = values.pop('group', ''), values.pop('member', '')
+            if scope == 'group':
+                if not group:
+                    raise BusinessError('群拒绝须指定群')
+                member = ''
             if operation == 'whitelist':
                 enabled = values.pop('enabled', None)
                 if values or not isinstance(enabled, bool) or not group:
@@ -481,7 +536,7 @@ class AccountSharing:
         acl = await self.ensure(bot)
         return await acl.evaluate(bot, CONSUMER, FUNCTION, context['group'], context['member'], resource, action=action)
 
-    async def resolve_context(self, event, *, select=''):
+    async def resolve_context(self, event, *, select='', page=0):
         """Group: the asker's native member identity. Private: an authorization-verified group context."""
         if event.is_channel or not (event.is_group or event.is_direct):
             return None
@@ -492,10 +547,12 @@ class AccountSharing:
         found = await acl.private_contexts(event.appid, CONSUMER, FUNCTION, event.raw_user_id, group=chosen, action='invoke')
         if found['selected']:
             if select:
+                key = (event.appid, event.raw_user_id)
+                self.context_versions[key] = self.context_versions.get(key, 0) + 1
                 await self.store.put(event.appid, 'contexts', event.raw_user_id, {'group': select})
             return {'group': found['selected']['group'], 'member': found['selected']['member'], 'private': True}
         if found['reason'] == 'choose_group' and not select:
-            await self.show_groups(event, found['candidates'])
+            await self.show_groups(event, found['candidates'], page=page)
             return {'selection_required': True}
         return None
 
@@ -504,21 +561,30 @@ class AccountSharing:
         if not items:
             await self.deny(event)
             return
-        await self.present_menu(event, {'menu': 'groups'}, items, page=page, title='请选择授权群')
+        await self.present_menu(event, {'menu': 'groups', 'candidates': [c['group'] for c in candidates]}, items, page=page, title='请选择授权群')
 
     async def keyword_query(self, event, *, text=None, page=0):
         module = self.qa_provider()
         if module is None or not module.active:
             return
+        inventory = self.inventory_version.get(event.appid, 0)
+        rules_version = module.version(event.appid, FUNCTION)
         match_text = event.content or '' if text is None else text
+
         # Cheap pre-check: no account rule matches at all → not ours.
-        if not await module.match(event.appid, FUNCTION, match_text):
+        async def live_rule(rule):
+            return rule['kind'] != 'resource' or bool(await self.store.get(event.appid, 'accounts', rule['target']))
+
+        if not await module.match(event.appid, FUNCTION, match_text, group=event.group_id if event.is_group else None, admit=live_rule):
             return
         context = await self.resolve_context(event)
         if not context:
             await self.deny(event)
             return
         if context.get('selection_required'):
+            return
+
+        if not await module.match(event.appid, FUNCTION, match_text, group=context['group'], admit=live_rule):
             return
 
         async def admit(rule):
@@ -546,9 +612,17 @@ class AccountSharing:
                 (m['name'], {'kind': 'query', 'resource': m['target']}) if m['kind'] == 'resource' else (m['name'], {'kind': 'reply', 'rule': m['rule_id']})
                 for m in candidates
             ]
-            await self.present_menu(event, {**context, 'menu': 'candidates', 'keyword': match_text}, items, page=page, title='请选择有权候选')
+            await self.present_menu(
+                event,
+                {**context, 'menu': 'candidates', 'keyword': match_text, 'inventory': inventory, 'rules_version': rules_version},
+                items,
+                page=page,
+                title='请选择有权候选',
+            )
 
     async def directory(self, event, *, page=0):
+        inventory = self.inventory_version.get(event.appid, 0)
+        rules_version = self.qa().version(event.appid, FUNCTION)
         context = await self.resolve_context(event)
         if not context:
             await self.deny(event)
@@ -562,9 +636,25 @@ class AccountSharing:
         if not visible:
             await self.deny(event)
             return
-        await self.present_menu(event, {**context, 'menu': 'accounts'}, visible, page=page)
+        await self.present_menu(event, {**context, 'menu': 'accounts', 'inventory': inventory, 'rules_version': rules_version}, visible, page=page)
 
     async def present_menu(self, event, context, items, *, page=0, title='账户列表'):
+        bot = event.appid
+        acl = await self.ensure(bot)
+        inventory = context.get('inventory', self.inventory_version.get(bot, 0))
+        qa = self.qa()
+        rules_version = context.get('rules_version', qa.version(bot, FUNCTION))
+        target = None
+        menu_event = event
+        if event.is_group:
+            # A caller's qualification never proves qualification of bystanders.
+            await self.safe_reply(event, '将尝试私发个人目录，请留意本 Bot 私聊。')
+            found = await acl.member_context(bot, CONSUMER, FUNCTION, context['group'], context['member'], action='invoke')
+            target = found['context']
+            if target is None:
+                await self.safe_reply(event, '目录私发未完成，请先确认私聊身份绑定。')
+                return
+            menu_event = SimpleNamespace(appid=bot, raw_user_id=target['private_id'], is_group=False, group_id='')
         size = 6
         last = max((len(items) - 1) // size, 0)
         page = max(0, min(page, last))
@@ -584,18 +674,77 @@ class AccountSharing:
         text = title + f'（{page + 1}/{last + 1}）\n' + '\n'.join(lines)
         if context['menu'] == 'accounts':
             text += f'\n文字翻页：账户列表 {page + 2}' if page < last else '\n发送“账户列表”刷新当前资格'
-        rows = await self.menus.issue(event, context, selected)
+        rows = await self.menus.issue(menu_event, context, selected)
         for row in rows:
             for button in row:
                 if button['text'] in {'上一页', '下一页'}:
                     text += f'\n{button["text"]}：账户翻页 {button["data"]}'
-        # Menus hold only names the caller may see; only a definite rejection falls back.
-        if cfg.get_bot_setting(event.appid, 'message.use_markdown', True) and self.reply_outcome(await self.safe_reply(event, text, buttons=rows)) != 'failed':
-            return
-        await self.safe_reply(event, text + '\n按钮暂不可用，请使用以上文字命令。')
+        # Refresh after menu persistence and all identity lookups. The synchronous
+        # gate below checks every decision after the last preparatory await.
+        if context['menu'] == 'groups':
+            found = await acl.private_contexts(bot, CONSUMER, FUNCTION, event.raw_user_id, action='invoke')
+            contexts = found['candidates']
+            if [c['group'] for c in contexts] != context['candidates']:
+                await self.safe_reply(event, '菜单已失效，请重新发送：账户列表')
+                return
+            decisions = []
+        else:
+            if event.is_group:
+                found = await acl.member_context(bot, CONSUMER, FUNCTION, context['group'], context['member'], action='invoke')
+                fresh = found['context']
+                contexts = [fresh] if fresh and fresh['private_id'] == menu_event.raw_user_id else []
+            else:
+                found = await acl.private_contexts(bot, CONSUMER, FUNCTION, event.raw_user_id, group=context['group'], action='invoke')
+                contexts = [found['selected']] if found['selected'] else []
+            decisions = [
+                await self.decision(bot, context, action.get('resource', ''), 'view' if action['kind'] == 'query' else 'invoke') for _, action in items
+            ]
 
-    async def query(self, event, resource, *, rule_id=None):
+        def current():
+            return (
+                self.active
+                and bot not in self.inventory_writes
+                and self.access_provider() is acl
+                and qa.active
+                and self.qa_provider() is qa
+                and inventory == self.inventory_version.get(bot, 0)
+                and rules_version == qa.version(bot, FUNCTION)
+                and bool(contexts)
+                and all(acl.context_current(bot, c) for c in contexts)
+                and all(acl.decision_current(bot, d) for d in decisions)
+            )
+
+        if not current():
+            await self.safe_reply(event, '菜单已失效，请重新发送：账户列表')
+            return
+        sender = self.sender_provider(bot)
+
+        async def send(content, **kwargs):
+            try:
+                return (
+                    await sender.send_to_user(menu_event.raw_user_id, content, **kwargs) if event.is_group else await self.safe_reply(event, content, **kwargs)
+                )
+            except Exception:  # noqa: BLE001 - a push failure never falls back to the group
+                return {'code': -1}
+
+        if cfg.get_bot_setting(bot, 'message.use_markdown', True):
+            outcome = self.reply_outcome(await send(text, buttons=rows))
+            if outcome != 'failed':
+                if event.is_group and outcome == 'unknown':
+                    await self.safe_reply(event, '目录私发结果未知，请先查看本 Bot 私聊，核对接收许可或身份绑定后再重试。')
+                return
+        # A rejected platform send is another await; do not fall back with stale text.
+        if current():
+            outcome = self.reply_outcome(await send(text + '\n按钮暂不可用，请使用以上文字命令。'))
+            if event.is_group and outcome != 'sent':
+                await self.safe_reply(event, '目录私发未完成，请检查私聊接收许可或身份绑定。')
+
+    async def query(self, event, resource, *, rule_id=None, expected_context=None):
+        context_version = self.context_versions.get((event.appid, event.raw_user_id), 0)
         context = await self.resolve_context(event)
+        if expected_context and context and any(context.get(k) != expected_context.get(k) for k in ('group', 'member')):
+            await self.safe_reply(event, '菜单已失效，请重新发送：账户列表')
+            return
         if context is None:
             await self.deny(event)
             return
@@ -626,7 +775,12 @@ class AccountSharing:
                 return
         content = await self.query_content(bot, resource, rule_id)
         # Final gate right before sending: binding, private denial, decision, current content.
-        if content is None or not self.active or not acl.context_current(bot, target):
+        if (
+            content is None
+            or not self.active
+            or not acl.context_current(bot, target)
+            or context_version != self.context_versions.get((bot, event.raw_user_id), 0)
+        ):
             await self.deny(event)
             return
         sender = self.sender_provider(bot)
@@ -687,11 +841,15 @@ class AccountSharing:
             context, action = await self.menus.resolve(event, payload)
             if event.is_group and context.get('group') and (context['group'] != event.group_id or context['member'] != event.raw_user_id):
                 raise PermissionError('群上下文不匹配')
+            if not event.is_group and context.get('group'):
+                chosen = await self.resolve_context(event)
+                if not chosen or chosen.get('group') != context['group'] or chosen.get('member') != context['member']:
+                    raise ValueError('菜单已失效，请重新发送：账户列表')
             # Every action re-resolves the clicker's own context and current eligibility.
             if action['kind'] == 'query':
-                await self.query(event, action['resource'])
+                await self.query(event, action['resource'], expected_context=context)
             elif action['kind'] == 'reply':
-                await self.query(event, '', rule_id=action['rule'])
+                await self.query(event, '', rule_id=action['rule'], expected_context=context)
             elif action['kind'] == 'group':
                 if await self.resolve_context(event, select=action['group']):
                     await self.directory(event)
@@ -701,7 +859,7 @@ class AccountSharing:
                 if context['menu'] == 'candidates':
                     await self.keyword_query(event, text=context['keyword'], page=action['page'])
                 elif context['menu'] == 'groups':
-                    await self.resolve_context(event)
+                    await self.resolve_context(event, page=action['page'])
                 else:
                     await self.directory(event, page=action['page'])
         except PermissionError:

@@ -62,6 +62,40 @@ async def account_host(access_host):
         return result
 
     host.event = event
+
+    async def click(data, *, bot='bot-a', user='member-a', group=''):
+        from core.message.event import Event
+
+        interaction = Event.from_websocket(
+            bot,
+            {
+                't': 'INTERACTION_CREATE',
+                'd': {
+                    'id': 'fake-interaction',
+                    'type': 11,
+                    'application_id': bot,
+                    'chat_type': 1 if group else 2,
+                    'scene': 'group' if group else 'c2c',
+                    'group_openid': group,
+                    'group_member_openid': user if group else '',
+                    'user_openid': '' if group else user,
+                    'data': {'type': 11, 'resolved': {'button_data': data}},
+                },
+            },
+        )
+        interaction.start_ack_countdown()
+        before = set(tasks._background_tasks)
+        host.application._prepare_event(interaction)
+        await host.application._on_event(interaction)
+        for _ in range(20):
+            started = set(tasks._background_tasks) - before
+            if not started:
+                break
+            await asyncio.gather(*started, return_exceptions=True)
+            before |= started
+        return await interaction.wait_ack_code()
+
+    host.click = click
     host.account_api, host.create, host.texts = account_api, create, texts
     try:
         yield host
