@@ -88,7 +88,9 @@ class AccessBridge:
                 decision = await acl.evaluate(bot, CONSUMER, 'public', group, member)
             except FAILURES:
                 return {'allowed': True, 'reason': 'public'}
-            return None if decision['reason'] in {'denied', 'framework_denied'} else {'allowed': True, 'reason': 'public'}
+            if decision['reason'] in {'denied', 'framework_denied'}:
+                return None
+            return {'allowed': True, 'reason': 'public', 'evaluated': decision}
         try:
             acl = await self.ensure(bot)
             if not group:
@@ -104,9 +106,12 @@ class AccessBridge:
         return decision if decision['allowed'] else None
 
     def current(self, bot, decision):
-        if decision.get('reason') == 'public' and 'consumer' not in decision:
-            return True
         acl = self.module()
+        if decision.get('reason') == 'public' and 'consumer' not in decision:
+            if 'evaluated' not in decision:
+                return True
+            # Not a grant: only that the public evaluation (denies, policy, generation) is still current.
+            return bool(acl and acl.decision_current(bot, {**decision['evaluated'], 'allowed': True}))
         if acl is None:
             return False
         return bool(acl.context_current(bot, decision['context']) if 'context' in decision else acl.decision_current(bot, decision))
@@ -123,9 +128,18 @@ class AccessBridge:
         acl = self.module()
         return bool(acl and acl.context_current(bot, context))
 
+    @staticmethod
+    def view_context(rule, group):
+        return dict(consumer=CONSUMER, function=rule_function(rule), group=group, resource=resource(rule), actions=['view'])
+
+    def report_current(self, bot, rule, group, report):
+        """Non-awaiting re-check of a ``group_view`` report for this rule and group."""
+        acl = self.module()
+        return bool(acl and acl.report_current(bot, report, **self.view_context(rule, group)))
+
     async def group_view(self, bot, rule, group):
         """Whole-group view eligibility for a restricted answer (A04 report)."""
-        context = dict(consumer=CONSUMER, function=rule_function(rule), group=group, resource=resource(rule), actions=['view'])
+        context = self.view_context(rule, group)
         try:
             acl = await self.ensure(bot)
             report = await acl.audience_report(bot, context['consumer'], context['function'], group, context['resource'], actions=context['actions'])
