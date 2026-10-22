@@ -69,6 +69,10 @@ class Management:
             if set(values) - {'function', 'group', 'member', 'resource', 'action'} or not {'function', 'group', 'member'} <= values.keys():
                 raise ValueError('解释须明确功能、群和成员')
             return await self.service.evaluate(bot, consumer, **values)
+        if operation == 'audience':
+            if set(values) - {'function', 'group', 'resource', 'actions'} or not {'function', 'group'} <= values.keys():
+                raise ValueError('全员报告须明确功能和群')
+            return self.service.audience.owner_view(await self.service.audience_report(bot, consumer, **values))
         return await self.service.manage_access(bot, consumer, operation, **values)
 
     async def http(self, request):
