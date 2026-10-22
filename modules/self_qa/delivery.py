@@ -12,8 +12,10 @@ current. Buttons carry session references, never answer content.
 import time
 
 from core.base.config import cfg
+from core.message.media import upload_media_via_url
 
 TEXT, MARKDOWN = 0, 2
+IMAGE = 1
 ACTIONS = {'command', 'link', 'rule'}
 
 
@@ -22,7 +24,7 @@ def unknown_code(code):
     return str(code) == '-1' or isinstance(code, int) and 500 <= code <= 599
 
 
-def outcome(result, *, media=False):
+def outcome(result):
     """'sent', 'rejected' or 'unknown' for one reply or push result."""
     if isinstance(result, tuple) and result and isinstance(result[0], bool):
         if result[0]:
@@ -30,8 +32,8 @@ def outcome(result, *, media=False):
         data = result[1] if len(result) > 1 else None
         return 'unknown' if isinstance(data, dict) and unknown_code(data.get('code')) else 'rejected'
     if result is None:
-        # Media helpers return None when the upload failed before any send.
-        return 'rejected' if media else 'unknown'
+        # before_send interception or an ignored platform code: nothing is known.
+        return 'unknown'
     if not isinstance(result, dict):
         return 'unknown'
     code = result.get('code')
@@ -78,12 +80,9 @@ class EventTarget:
             return 'unknown', None
         return outcome(result), result if isinstance(result, dict) else None
 
-    async def image(self, url):
+    async def upload(self, url):
         sender = self.entry.sender(self.event.appid)
-        try:
-            return outcome(await sender.reply_image(self.event, url) if sender else None, media=True)
-        except Exception:  # noqa: BLE001
-            return 'unknown'
+        return await upload_media_via_url(sender, self.event, url, IMAGE) if sender else None
 
 
 class UserTarget:
@@ -101,11 +100,8 @@ class UserTarget:
         data = result[1] if isinstance(result, tuple) and len(result) > 1 else None
         return outcome(result), data
 
-    async def image(self, url):
-        try:
-            return outcome(await self.sender.send_image('user', self.private_id, url), media=True)
-        except Exception:  # noqa: BLE001
-            return 'unknown'
+    async def upload(self, url):
+        return await upload_media_via_url(self.sender, None, url, IMAGE, target_user_id=self.private_id)
 
 
 class Delivery:
@@ -171,7 +167,14 @@ class Delivery:
             return state, error
         if not check():
             return 'partial', error
-        image_state = await target.image(rule['image'])
+        # Upload, check again, then post: the upload is a wait like any other.
+        try:
+            file_info = await target.upload(rule['image'])
+        except Exception:  # noqa: BLE001 - an exception leaves the delivery unknown
+            return 'unknown', error
+        if file_info and not check():
+            return 'partial', error
+        image_state = (await target.text(None, media={'file_info': file_info}))[0] if file_info else 'rejected'
         if image_state == 'rejected':
             self._reject(bot, 'image', None)
             if not check():
