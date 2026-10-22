@@ -63,13 +63,14 @@ async def wired(tmp_path, monkeypatch):
     config = tmp_path / 'config'
     config.mkdir()
     secrets = {bot: f'fake-secret-{bot}' for bot in BOTS}
-    owners = {bot: 'owner' for bot in BOTS}
+    owner_ids = {bot: 'owner' for bot in BOTS}
+    ws_enabled = dict.fromkeys(BOTS, True)
 
     def write_config():
         (config / 'bot.yaml').write_text(
             'bots:\n'
             + ''.join(
-                f'  - appid: {bot}\n    secret: {secrets[bot]}\n    owner_ids: [{owners[bot]}]\n    websocket: {{enabled: true, reconnect_interval: 0}}\n'
+                f'  - appid: {bot}\n    secret: {secrets[bot]}\n    owner_ids: [{owner_ids[bot]}]\n    websocket: {{enabled: {str(ws_enabled[bot]).lower()}, reconnect_interval: 0}}\n'
                 for bot in BOTS
             )
         )
@@ -144,13 +145,15 @@ async def wired(tmp_path, monkeypatch):
                 socket.feed(0, t='READY', s=1, d={'session_id': session or 'session-' + bot})
             await until(lambda: self.status(bot).phase == 'ready')
 
-        def reconfigure(self, bot, *, secret=None, owner=None):
+        def reconfigure(self, bot, *, secret=None, owner=None, websocket=None):
             """Edit bot.yaml and reload the config; the caller runs BotRegistry._sync (one or overlapping)."""
             if secret is not None:
                 secrets[bot] = secret
                 sockets[bot] = gateways[bot].add()
             if owner is not None:
-                owners[bot] = owner
+                owner_ids[bot] = owner
+            if websocket is not None:
+                ws_enabled[bot] = websocket
             write_config()
             cfg.reload_all()
 
@@ -504,3 +507,93 @@ async def test_failed_webhook_status_delivery_during_replacement_needs_rebuild_t
     ok, fact = await usable(wired.state, 'bot-a')
     assert ok and not wired.state._connection_pending('bot-a'), fact
     assert wired.state.fact_current(proof_b)
+
+
+async def overlapping_ws_toggle(host, bot, secret, *, first_ws=False):
+    """Two real config edits: slow credential replacement, then a WS toggle.
+
+    Only the fake platform's /users/@me await controls completion order. The first
+    config is read by the first formal _sync before the second file edit is made.
+    """
+    platform, gates, calls = host.platforms[bot], [asyncio.Event(), asyncio.Event()], []
+    real_get = platform.get
+
+    async def get(url, **kwargs):
+        if url.endswith('/users/@me'):
+            position = len(calls)
+            calls.append(url)
+            await gates[position].wait()
+        return await real_get(url, **kwargs)
+
+    platform.get = get
+    try:
+        host.reconfigure(bot, secret=secret, websocket=first_ws)
+        first = asyncio.create_task(host.registry._sync())
+        await until(lambda: len(calls) == 1)
+        host.reconfigure(bot, websocket=not first_ws)
+        second = asyncio.create_task(host.registry._sync())
+        await until(lambda: len(calls) == 2)
+        gates[1].set()
+        await second
+        orphan = host.registry.get(bot)
+        gates[0].set()
+        await first
+    finally:
+        platform.get = real_get
+    return orphan
+
+
+@pytest.mark.parametrize('first_ws', [False, True])
+async def test_ws_toggle_with_slow_replacement_rejects_orphan_sources(wired, first_ws):
+    await wired.load_module()
+    await wired.start_bots()
+    proof_a, proof_b = await trusted(wired, *BOTS)
+    orphan = await overlapping_ws_toggle(wired, 'bot-a', 'fake-secret-bot-a-2', first_ws=first_ws)
+    try:
+        serving, webhook_owner, ws_owner = owners(wired, 'bot-a')
+        if first_ws:
+            assert serving == ws_owner != webhook_owner  # original N5
+        else:
+            assert serving != webhook_owner == ws_owner  # N5b: both sources are orphaned
+            assert wired.registry.get('bot-a').ws_client is None
+        assert not wired.state.fact_current(proof_a)
+        assert wired.state.fact_current(proof_b)
+        await wired.ready_ws('bot-a', session='session-a-2')
+        await wired.settle('bot-a')
+        await confirm(wired.state, 'bot-a')
+        assert not await wired.state.rebuild('bot-a')
+        proof = await wired.state.fact('bot-a', 'group-a', 'member-a')
+        assert not proof['usable'] and proof['reason'] == 'recovery_required'
+        await wired.post_webhook('bot-a', 9, kind='GROUP_MEMBER_REMOVE', member='member-a', counted=False)
+        assert not (await usable(wired.state, 'bot-a'))[0]
+        assert not wired.state.fact_current(proof_a)
+        assert await wired.modules.reload('group_state')
+        await confirm(wired.state, 'bot-a')
+        assert not await wired.state.rebuild('bot-a')
+        wired.reconfigure('bot-a', websocket=True)
+        await wired.change_secret('bot-a', 'fake-secret-bot-a-3')
+        await wired.ready_ws('bot-a', session='session-a-3')
+        await trusted(wired, *BOTS)
+    finally:
+        await orphan.stop()
+
+
+@pytest.mark.parametrize('missing', ['serving', 'generation', 'runtime', 'http_source'])
+async def test_serving_identity_is_required_for_http_sources(wired, monkeypatch, missing):
+    await wired.load_module()
+    await wired.start_bots()
+    proof_a, proof_b = await trusted(wired, *BOTS)
+    instance = wired.registry.get('bot-a')
+    with monkeypatch.context() as patch:
+        if missing == 'serving':
+            patch.delitem(wired.registry._bots, 'bot-a')
+        elif missing == 'generation':
+            patch.setattr(instance, 'bot_generation', None)
+        elif missing == 'runtime':
+            patch.setattr(instance, 'connection_status', None)
+        else:
+            real_status = wired.state.webhook_status
+            patch.setattr(wired.state, 'webhook_status', lambda bot: None if bot == 'bot-a' else real_status(bot))
+        assert not wired.state.fact_current(proof_a)
+        assert not (await usable(wired.state, 'bot-a'))[0]
+        assert wired.state.fact_current(proof_b)
