@@ -6,7 +6,7 @@
 
 使用相同版本的框架，将所需目录放入 `modules/` 或 `plugins/`。每个目录必须完整复制，包括 `storage.py`，不能只复制入口文件。
 
-- `modules/self_qa/`：通过模块管理器启用，公开静态回复接口无需授权目录。调用 `manage(bot, namespace, 'create', {'name':'帮助','kind':'text','target':'公开说明','keywords':['帮助']})` 保存规则，然后 `answer(bot, namespace, '帮助', send, allowed=True)` 回复。`allowed=True` 由调用者确认启用范围；当前基础接口不自动订阅消息。面向主人的独立配置与消息入口由 #28 完成。
+- `modules/self_qa/`：通过模块管理器启用，公开静态回复接口无需授权目录。调用 `manage(bot, namespace, 'create', {'name':'帮助','kind':'text','target':'公开说明','keywords':['帮助']})` 保存规则，然后 `answer(bot, namespace, '帮助', send, allowed=True)` 回复。`allowed=True` 由调用者确认启用范围；当前基础接口不自动订阅消息。面向主人的独立配置与消息入口见[自助问答](self-qa.md)（#28），需要框架 `before_handler` Hook。
 - `modules/access_control/`：可单独加载和管理授权存储。当前真实成员事件尚未接入，敏感查询默认拒绝；人工核验不能打开事件接入标记。
 - `plugins/account_sharing/`：主人账户 CRUD／私聊预览的存储不依赖其他目录。成员查询和关键词仍分别需要授权、问答的运行能力；依赖缺失时不能发送密码。
 
