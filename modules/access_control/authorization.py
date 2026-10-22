@@ -549,11 +549,7 @@ class Authorization(AccessControl):
         """
         legacy_function = legacy_function or function
         legacy = await self._state(bot)
-        current = await self._scope(bot, consumer)
-        # Build on a copy; the live row changes only after the merged result validates.
-        state = copy.deepcopy(current)
-        if function not in state['functions']:
-            raise ValueError('消费方功能尚未声明')
+        await self._scope(bot, consumer)  # Load before taking the same scope lock.
         report = {'grants': 0, 'denies': 0, 'revocations': 0, 'policy_groups': [], 'skipped': 0, 'dropped_resources': 0}
 
         def covers(record):
@@ -588,6 +584,12 @@ class Authorization(AccessControl):
             return converted
 
         async with self.scope_locks.setdefault((bot, consumer), asyncio.Lock()):
+            # Management and migration share this lock. Read only after earlier
+            # writers finish, including revocations and failed/cancelled writes.
+            current = await self._scope(bot, consumer)
+            state = copy.deepcopy(current)
+            if function not in state['functions']:
+                raise ValueError('消费方功能尚未声明')
             known = {r['id'] for field in ('grants', 'denies', 'revocations') for r in state[field]}
             for field, revoked in (('revocations', True), ('grants', False)):
                 for record in legacy.get(field, []):
