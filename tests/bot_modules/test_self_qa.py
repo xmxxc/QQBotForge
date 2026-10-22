@@ -61,28 +61,47 @@ async def qa_host(tmp_path, monkeypatch):
             # Per-format platform behaviour: kinds rejected, or with unknown results.
             self.reject = set()
             self.unknown = set()
+            # Kinds answered with an HTTP 5xx body (code = status) or raising in transport.
+            self.server_error = set()
+            self.raises = set()
+            # Awaited after each delivered message: owner changes between parts.
+            self.after_send = None
             self.sent = []
 
         async def reply(self, event, content=None, **kwargs):
+            if kwargs.get('media'):
+                # An uploaded image posted as a media reply.
+                self.messages.append((event.appid, event.group_id if event.is_group else event.raw_user_id, 'image:' + kwargs['media']['file_info'][5:]))
+                if self.after_send:
+                    await self.after_send('image')
+                return {'id': 'fake-image'}
             kind = 'buttons' if kwargs.get('buttons') else 'markdown' if kwargs.get('msg_type') == 2 else 'template' if content is None else 'text'
             if kind == 'buttons' and self.reject_buttons or kind in self.reject:
                 return {'code': 'fake-' + kind + '-rejected', 'message': 'rejected'}
             if kind in self.unknown:
                 return {'code': -1, 'message': '框架网络层请求超时'}
+            if kind in self.server_error:
+                return {'code': 502, 'message': 'Bad Gateway'}
+            if kind in self.raises:
+                raise ConnectionResetError('fake transport reset')
             if kwargs.get('buttons') is not None:
                 self.buttons.append(kwargs['buttons'])
             self.sent.append({'kind': kind, 'content': content, 'buttons': kwargs.get('buttons')})
             # Framework template replies (default/blacklist/maintenance) are recorded by name.
             content = content if content is not None else 'template:' + str(kwargs.get('template_name'))
             self.messages.append((event.appid, event.group_id if event.is_group else event.raw_user_id, content))
+            if self.after_send:
+                await self.after_send(kind)
             # Same shape as Sender.reply: the platform response dict.
             return {'id': 'fake-reply'}
 
-        async def reply_image(self, event, image, content='', **kwargs):
+        async def post_json(self, endpoint, data):
+            # Media URL upload (POST .../files, srv_send_msg false): file_info names the URL.
             if 'image' in self.reject:
-                return None
-            self.messages.append((event.appid, event.group_id if event.is_group else event.raw_user_id, 'image:' + image))
-            return {'id': 'fake-image'}
+                return False, {'code': 'fake-upload-rejected', 'message': 'rejected'}
+            if self.after_send:
+                await self.after_send('upload')
+            return True, {'file_info': 'file:' + data['url']}
 
     platform = Platform()
     for bot in ('bot-a', 'bot-b'):
