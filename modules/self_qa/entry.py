@@ -30,6 +30,7 @@ CALLBACK = 'qa:'
 # Rules changed while an answer was prepared: re-resolve from current rules this often.
 ATTEMPTS = 3
 CHANGING = '答案正在更新，请稍后重新提问。'
+MANAGER_CHANGED = '管理资格已变化，请重新发送'
 STALE = object()
 
 
@@ -467,22 +468,8 @@ class PublicEntry:
             def guard():
                 return self.access.current(bot, decision)
 
-            def still_manager(note=''):
-                """Re-check before replying after a wait (reads have no store lock to guard them)."""
-                if not (self.qa.active and guard()):
-                    raise PermissionError('管理资格已变化，请重新发送' + note)
-
             if operation == 'list':
-                version = self.qa.version(bot, NAMESPACE)
-                rules = [r for r in await self.qa.manage(bot, NAMESPACE, 'list') if own(r)]
-                still_manager()
-                # Managing is not disclosure: the group sees public rules and only a count of restricted ones.
-                fields = ('id', 'name', 'keywords', 'mode', 'enabled')
-                public = [{k: r[k] for k in fields} for r in rules if r.get('access') != 'restricted']
-                hidden = [{k: r[k] for k in fields} for r in rules if r.get('access') == 'restricted']
-                result = {'rules': public, 'restricted': len(hidden)}
-                if hidden:
-                    result['restricted_detail'] = await self.manager_details(event, hidden, still_manager, version)
+                result = await self.delegated_list(event, own, decision)
             elif operation == 'create':
                 if 'id' in values:
                     raise ValueError('新增不接受 id')
@@ -504,29 +491,64 @@ class PublicEntry:
         await self.reply(event, content)
         return None
 
-    async def manager_details(self, event, details, still_manager, version):
-        """Restricted rule details to the delegate's verified private identity; returns the status for the group."""
+    async def delegated_list(self, event, own, decision):
+        """This group's rules for the group, read and authorized again while they change before anything is sent.
+
+        Restricted details go to the delegate's verified private identity; the
+        group only learns their count and what happened to that push. Reads
+        have no store lock to guard them, so every reply re-checks after its waits.
+        """
+        bot, group, member = event.appid, event.group_id, event.raw_user_id or event.user_id
+        for attempt in range(ATTEMPTS):
+            if attempt:
+                # Rule changes also renew the authorization inventory: decide again before re-reading.
+                decision = await self.access.delegate(bot, group, member)
+            if not (self.qa.active and decision):
+                raise PermissionError(MANAGER_CHANGED)
+            version = self.qa.version(bot, NAMESPACE)
+            rules = [r for r in await self.qa.manage(bot, NAMESPACE, 'list') if own(r)]
+            # Managing is not disclosure: the group sees public rules and only a count of restricted ones.
+            fields = ('id', 'name', 'keywords', 'mode', 'enabled')
+            public = [{k: r[k] for k in fields} for r in rules if r.get('access') != 'restricted']
+            hidden = [{k: r[k] for k in fields} for r in rules if r.get('access') == 'restricted']
+            result = {'rules': public, 'restricted': len(hidden)}
+            status = await self.manager_details(event, hidden, decision, version) if hidden else None
+            if status is STALE:
+                continue
+            # Final non-awaiting gate: the manager still qualifies and no listed title or keyword changed.
+            manager = self.qa.active and self.access.current(bot, decision)
+            if manager and self.fresh(bot, version):
+                return {**result, 'restricted_detail': status} if status else result
+            if status:
+                # The push cannot be undone; the group gets no list, only what happened to the push.
+                raise PermissionError(('规则已变化，请重新发送' if manager else MANAGER_CHANGED) + f'（受限详情：{status}）')
+        if not (self.qa.active and await self.access.delegate(bot, group, member)):
+            raise PermissionError(MANAGER_CHANGED)
+        raise PermissionError('规则正在变化，请稍后重新发送')
+
+    async def manager_details(self, event, details, decision, version):
+        """Restricted rule details to the delegate's verified private identity.
+
+        Returns the status for the group, or STALE when the manager decision or
+        the rules changed before anything was pushed.
+        """
         bot, group, member = event.appid, event.group_id, event.raw_user_id or event.user_id
         found = await self.access.manager_context(bot, group, member)
         context, sender = found['context'], self.sender(bot)
-        still_manager()
+        if not (self.qa.active and self.access.current(bot, decision) and self.fresh(bot, version)):
+            return STALE
         if context is None or sender is None:
             if found['reason'] == 'binding_missing':
                 return f'受限规则详情只私聊发送，请先私聊 Bot 发送：身份绑定 申请 {group} {member}'
             return '受限规则详情只私聊发送，暂不能私聊发送'
         if not self.access.context_current(bot, context):
-            raise PermissionError('管理资格已变化，请重新发送')
-        if not self.fresh(bot, version):
-            raise PermissionError('规则已变化，请重新发送')
+            raise PermissionError(MANAGER_CHANGED)
         state, error = await UserTarget(sender, bot, context['private_id']).text(json.dumps(details, ensure_ascii=False), msg_type=TEXT)
-        status = {
+        return {
             'sent': '已私聊发送',
             'rejected': f'私聊发送失败（平台代码 {(error or {}).get("code", "未知")}）',
             'unknown': '私聊发送结果未知，请先查看私聊',
         }[state]
-        # The push cannot be undone; the group still learns what happened to it.
-        still_manager(f'（受限详情：{status}）')
-        return status
 
     async def command(self, event, text):
         sender = self.sender(event.appid)

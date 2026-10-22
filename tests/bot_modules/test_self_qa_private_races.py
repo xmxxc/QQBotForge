@@ -269,11 +269,13 @@ async def test_delegated_details_follow_rule_changes_and_report_late_revocation(
     await delegated(host)
     await bind(host, 'group-a', 'admin-a', 'private-admin')
     secret = next(r for r in (await host.qa())[1]['data']['rules'] if r['access'] == 'restricted')
-    # A restricted rule renamed while the identity was looked up: no stale details pushed.
+    # A restricted rule renamed while the identity was looked up: no stale details pushed, current ones are.
     restore = after(host, 'member_context', owner(host, {'operation': 'update', 'id': secret['id'], 'name': '改名'}))
-    await host.event('问答管理 ' + json.dumps({'operation': 'list'}), user='admin-a', group='group-a')
+    listed, private = await list_in_group(host)
     restore()
-    assert pushes(host) == [] and host.said() == ['规则已变化，请重新发送']
+    ((_, to, content),) = private
+    assert to == 'private-admin' and [r['name'] for r in json.loads(content)] == ['改名']
+    assert listed['restricted_detail'] == '已私聊发送' and [r['name'] for r in listed['rules']] == ['本群公开']
     # Revoked right after the push: the group hears that, and that the push went out.
     original = host.sender.send_to_user
 
@@ -287,3 +289,91 @@ async def test_delegated_details_follow_rule_changes_and_report_late_revocation(
     host.sender.send_to_user = original
     assert [m[1] for m in pushes(host)] == ['private-admin']
     assert host.said() == ['管理资格已变化，请重新发送（受限详情：已私聊发送）']
+
+
+async def test_delegated_list_rechecks_rules_and_manager_after_the_private_push(qa_host):
+    host = qa_host
+    await delegated(host)
+    await bind(host, 'group-a', 'admin-a', 'private-admin')
+    original = host.sender.send_to_user
+
+    def during_push(change):
+        async def send_to_user(user_id, content=None, **kwargs):
+            result = await original(user_id, content, **kwargs)
+            host.sender.send_to_user = original
+            await change()
+            return result
+
+        host.sender.send_to_user = send_to_user
+
+    def public_id():
+        return next(r['id'] for r in rules if r['name'] == '本群公开')
+
+    async def reload():
+        await host.modules.disable('self_qa', _persist=False)
+        assert await host.modules.enable('self_qa', _skip_deps=True, _persist=False)
+
+    async def demote():
+        await host.state.confirm_member('bot-a', 'group-a', 'admin-a', evidence='demoted', member_role='member')
+
+    rules = (await host.qa())[1]['data']['rules']
+    for update in (
+        {'access': 'restricted', 'name': '刚改为受限的标题'},
+        {'enabled': False},
+        {'name': '新标题', 'keywords': ['新问法']},
+        {'groups': ['group-b']},
+    ):
+        during_push(owner(host, {'operation': 'update', 'id': public_id(), **update}))
+        await host.event('问答管理 ' + json.dumps({'operation': 'list'}), user='admin-a', group='group-a')
+        # The push went out and cannot be undone; the group gets only that status, no old public listing.
+        assert [m[1] for m in pushes(host)] == ['private-admin'], update
+        assert host.said() == ['规则已变化，请重新发送（受限详情：已私聊发送）'], update
+        await host.qa({'operation': 'delete', 'id': public_id()})
+        await rule(host, name='本群公开', target='P', keywords=['本群'], groups=['group-a'])
+        rules = (await host.qa())[1]['data']['rules']
+
+    during_push(owner(host, {'operation': 'delete', 'id': public_id()}))
+    await host.event('问答管理 ' + json.dumps({'operation': 'list'}), user='admin-a', group='group-a')
+    assert len(pushes(host)) == 1 and host.said() == ['规则已变化，请重新发送（受限详情：已私聊发送）']
+    await rule(host, name='本群公开', target='P', keywords=['本群'], groups=['group-a'])
+
+    for change in (demote, reload):
+        during_push(change)
+        await host.event('问答管理 ' + json.dumps({'operation': 'list'}), user='admin-a', group='group-a')
+        assert len(pushes(host)) == 1 and host.said() == ['管理资格已变化，请重新发送（受限详情：已私聊发送）'], change
+        await host.state.confirm_member('bot-a', 'group-a', 'admin-a', evidence='checked', member_role='admin')
+
+    # Another Bot's rules change during the push: the list stands.
+    async def other_bot():
+        assert (await host.qa({'operation': 'create', 'name': 'x', 'target': 'X', 'keywords': ['x']}, bot='bot-b'))[0] == 200
+
+    during_push(other_bot)
+    listed, private = await list_in_group(host)
+    assert listed['restricted_detail'] == '已私聊发送' and [r['name'] for r in listed['rules']] == ['本群公开'] and len(private) == 1
+
+
+async def test_delegated_list_still_changing_returns_only_a_status(qa_host):
+    host = qa_host
+    await delegated(host)
+    await bind(host, 'group-a', 'admin-a', 'private-admin')
+    counter = {'n': 0}
+
+    async def churn():
+        counter['n'] += 1
+        assert (await host.qa({'operation': 'create', 'name': f'变化{counter["n"]}', 'target': 'T', 'keywords': [f'问{counter["n"]}'], 'groups': ['group-a']}))[
+            0
+        ] == 200
+
+    acl = host.modules.get('access_control')
+    original = acl.member_context
+
+    async def member_context(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        await churn()
+        return result
+
+    acl.member_context = member_context
+    await host.event('问答管理 ' + json.dumps({'operation': 'list'}), user='admin-a', group='group-a')
+    acl.member_context = original
+    # Changed before every push: nothing pushed, no titles in the group.
+    assert pushes(host) == [] and host.said() == ['规则正在变化，请稍后重新发送'] and counter['n'] == 3
