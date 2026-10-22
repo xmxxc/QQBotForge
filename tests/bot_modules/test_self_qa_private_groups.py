@@ -188,3 +188,16 @@ async def test_leftover_private_group_function_from_development_data_is_ignored(
     await host.event('群规', user='private-a')
     assert host.said('private-a') == ['GROUP-A']
     assert 'private_groups' not in (await host.qa())[1]['data']['capabilities']
+
+
+async def test_a_group_rule_refused_in_its_context_never_points_to_another_group(qa_host):
+    host = qa_host
+    # Restricted rule of group-a whose own policy also covers group-b.
+    await restricted(host, policy=MEMBERS, name='甲群受限', target='SECRET-A', keywords=['群密'], groups=['group-a'])
+    await bind(host, 'group-a', 'member-a')
+    await bind(host, 'group-b', 'member-b')
+    await host.state.confirm_member('bot-a', 'group-a', 'member-a', evidence='demoted', member_role='member')
+    await host.event('问答群 group-a', user='private-a')
+    host.said('private-a')
+    await host.event('群密', user='private-a')
+    assert host.said('private-a') == []

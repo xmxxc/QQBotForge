@@ -155,7 +155,8 @@ class AccessBridge:
                 selected = found['selected']
                 if selected and (not selected['group'] or selected['group'] in groups):
                     return {'allowed': True, 'reason': found['reason'], 'context': selected}
-                choices = [c['group'] for c in found['candidates'] if c['group'] in groups]
+                # A group rule is only answered in its own groups: never point to another one.
+                choices = [c['group'] for c in found['candidates'] if c['group'] in groups and (not rule.get('groups') or c['group'] in rule['groups'])]
                 if not choices:
                     return None
                 if context or len(choices) > 1:
