@@ -610,7 +610,12 @@ class AccountSharing:
             await self.deny(event)
         elif len(candidates) == 1:
             match = candidates[0]
-            await self.query(event, match['target'] if match['kind'] == 'resource' else '', rule_id=match['rule_id'] if match['kind'] == 'text' else None)
+            await self.query(
+                event,
+                match['target'] if match['kind'] == 'resource' else '',
+                rule_id=match['rule_id'] if match['kind'] == 'text' else None,
+                expected_context=context,
+            )
         else:
             items = [
                 (m['name'], {'kind': 'query', 'resource': m['target']}) if m['kind'] == 'resource' else (m['name'], {'kind': 'reply', 'rule': m['rule_id']})
