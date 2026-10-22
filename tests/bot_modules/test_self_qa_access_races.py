@@ -208,7 +208,8 @@ async def test_delegated_list_follows_rule_changes_made_after_reading(qa_host):
     await host.event('问答管理 ' + json.dumps({'operation': 'list'}), user='admin-a', group='group-a')
     qa.manage = original
     (out,) = host.said()
-    assert json.loads(out) == {'rules': [], 'restricted': 1}
+    result = json.loads(out)
+    assert (result['rules'], result['restricted']) == ([], 1)
 
     # Still changing after every bounded re-read: only a status, no titles.
     reading(lambda left: {'operation': 'create', 'name': f'变化{left}', 'target': 'T', 'keywords': [f'问{left}'], 'groups': ['group-a']}, times=10)

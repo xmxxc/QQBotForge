@@ -109,3 +109,7 @@ access.report_current(bot, report, **send)          # 群发前的非等待最�
 主人管理：后台“全员资格报告”或 `授权管理 {"consumer":"reports","operation":"audience","function":"read","group":"假群","resource":"report-r","actions":["invoke","view"]}`。HTTP 与私聊返回去除 `credential` 的管理副本；群里只给简短状态，普通成员命令不处理。
 
 A04 验证：实际 ModuleManager 独立加载授权、群状态及一个测试消费模块，Application 群消息入口在报告后、发送前检查；原始 WS 退群／入群、临时 SQLite、平台分页替身。覆盖两个 Bot 成员、Bot 不合格、分页失败、检查中退群、新人入群、到期、角色变化、拒绝、消费方与 Bot 隔离及主人鉴权。浏览器无可用实例，未做视觉核查；未连接真实 QQ 或核查平台许可。账户群发改用本接口由 C03 #35 交付，受限问答由 Q05 #32 使用。
+
+## 群成员转私聊上下文（Q05 扩展）
+
+`await access.member_context(bot, consumer, function, group, member, resource='', action='view')` 先按群成员身份计算当前决定，再查找主人已确认的该成员私聊身份，返回 `{context, reason}`。`reason` 为 `selected`、成员不合格原因、`binding_missing`、`binding_unavailable` 或 `private_denied_or_changed`。上下文与 `private_contexts` 候选同形，私发前用 `context_current(bot, context)` 复查绑定版本、私聊拒绝和决定。用于受限问答群内不满足全员可见时私发提问者，也供账户共享群发降级使用；平台是否允许私发仍由发送结果决定。

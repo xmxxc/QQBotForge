@@ -8,11 +8,19 @@ module is enabled, Q&A registers as consumer ``self_qa``:
 - ``rule-<id>-policy``: optional per-rule policy chosen by the owner.
 - ``manage``: delegation; role owner/admin in the groups the owner opened.
 
+Private chat may answer one Q&A enabled group's rules through a group context:
+an owner-confirmed binding of the private identity to a member currently and
+reliably present in that group. A context grants nothing; every rule still
+needs its own decision.
+
 Restricted rules are resources ``rule-<id>``. Without authorization, public
 rules keep answering and restricted rules and delegation are refused.
 """
 
 import sqlite3
+from collections import Counter
+
+from core.plugin._blacklist import get_blacklist_map
 
 CONSUMER = 'self_qa'
 OWNER = 'module:self_qa'
@@ -72,21 +80,89 @@ class AccessBridge:
             'delegated_groups': snapshot['functions']['manage']['groups'],
         }
 
-    async def admit(self, bot, rule, group, member):
-        """Decision for one rule and asker, or None. Public rules without authorization pass."""
+    async def group_contexts(self, bot, private_id, groups):
+        """Private chat group contexts of ``private_id`` among the Q&A enabled ``groups``, by group.
+
+        Each needs an owner-confirmed binding (one member per group) and that
+        member's current reliable presence. ``decision`` holds the public
+        evaluation as that member, so ``context_current`` re-checks the binding,
+        the group facts, denies and the private identity before every send.
+        """
+        try:
+            acl = await self.ensure(bot)
+            source = acl.group_state()
+            if source is None or not groups:
+                return {}
+            snapshot = await acl.binding_snapshot(bot)
+            rows = [b for b in snapshot['bindings'] if b['private_id'] == private_id and b['group'] in groups]
+            counts = Counter(b['group'] for b in rows)
+            contexts = {}
+            for binding in rows:
+                if counts[binding['group']] != 1:
+                    continue  # ambiguous in this group: never pick a member
+                group, member = binding['group'], binding['member']
+                evaluated = await acl.evaluate(bot, CONSUMER, 'public', group, member, framework_allowed=private_id not in get_blacklist_map(bot, 'user'))
+                proof = await source.fact(bot, group, member)
+                if not proof['usable'] or (proof['member'] or {}).get('status') != 'present':
+                    continue
+                contexts[group] = {
+                    'group': group,
+                    'member': member,
+                    'private_id': private_id,
+                    'binding_id': binding['id'],
+                    'binding_version': snapshot['version'],
+                    # Not a grant: currency of the public evaluation and the group facts behind this context.
+                    'decision': {**evaluated, 'allowed': True, 'fact': proof},
+                    'evaluated': evaluated,
+                }
+        except FAILURES:
+            return {}
+        return {group: context for group, context in contexts.items() if acl.context_current(bot, context)}
+
+    async def admit(self, bot, rule, group, member, *, context=None, groups=()):
+        """Decision for one rule and asker, or None. Public rules without authorization pass.
+
+        In private chat (group == '') ``context`` is the selected group context
+        and ``groups`` the groups with a valid context. A public group rule is
+        decided as the bound member in that group and as the private identity;
+        restricted rules use the authorization module's private contexts within
+        ``groups``: ``{'context': ...}`` when one is selected,
+        ``{'allowed': False, 'choose': [groups]}`` when the asker must pick
+        another or one of several.
+        """
         if rule.get('access', 'public') == 'public':
+            in_context = bool(context and rule.get('groups'))
             if self.module() is None:
-                return {'allowed': True, 'reason': 'public'}
+                return None if in_context else {'allowed': True, 'reason': 'public'}
             try:
                 acl = await self.ensure(bot)
                 decision = await acl.evaluate(bot, CONSUMER, 'public', group, member)
             except FAILURES:
-                return {'allowed': True, 'reason': 'public'}
+                return None if in_context else {'allowed': True, 'reason': 'public'}
             if decision['reason'] in {'denied', 'framework_denied'}:
                 return None
+            if in_context:
+                # A group's own denies follow its member into that group's private context.
+                if context['evaluated']['reason'] in {'denied', 'framework_denied'}:
+                    return None
+                return {'allowed': True, 'reason': 'public', 'evaluated': decision, 'scope': context}
             return {'allowed': True, 'reason': 'public', 'evaluated': decision}
         try:
             acl = await self.ensure(bot)
+            if not group:
+                function, target = rule_function(rule), resource(rule)
+                found = await acl.private_contexts(bot, CONSUMER, function, member, group=context['group'] if context else '', resource=target, action='view')
+                selected = found['selected']
+                if selected and (not selected['group'] or selected['group'] in groups):
+                    return {'allowed': True, 'reason': found['reason'], 'context': selected}
+                # A group rule is only answered in its own groups: never point to another one.
+                choices = [c['group'] for c in found['candidates'] if c['group'] in groups and (not rule.get('groups') or c['group'] in rule['groups'])]
+                if not choices:
+                    return None
+                if context or len(choices) > 1:
+                    return {'allowed': False, 'choose': choices}
+                found = await acl.private_contexts(bot, CONSUMER, function, member, group=choices[0], resource=target, action='view')
+                return {'allowed': True, 'reason': found['reason'], 'context': found['selected']} if found['selected'] else None
             decision = await acl.evaluate(bot, CONSUMER, rule_function(rule), group, member, resource(rule), action='view')
         except FAILURES:
             return None
@@ -94,12 +170,37 @@ class AccessBridge:
 
     def current(self, bot, decision):
         acl = self.module()
+        if 'scope' in decision and not (acl and acl.context_current(bot, decision['scope'])):
+            # A group rule answered in private chat also needs its group context to stay current.
+            return False
         if decision.get('reason') == 'public' and 'consumer' not in decision:
             if 'evaluated' not in decision:
                 return True
             # Not a grant: only that the public evaluation (denies, policy, generation) is still current.
             return bool(acl and acl.decision_current(bot, {**decision['evaluated'], 'allowed': True}))
-        return bool(acl and acl.decision_current(bot, decision))
+        if acl is None:
+            return False
+        return bool(acl.context_current(bot, decision['context']) if 'context' in decision else acl.decision_current(bot, decision))
+
+    async def member_context(self, bot, rule, group, member):
+        """The asker's verified private identity for a restricted group answer."""
+        try:
+            acl = await self.ensure(bot)
+            return await acl.member_context(bot, CONSUMER, rule_function(rule), group, member, resource(rule), action='view')
+        except FAILURES:
+            return {'context': None, 'reason': 'authorization_unavailable'}
+
+    async def manager_context(self, bot, group, member):
+        """A delegated manager's verified private identity, for details not shown to the group."""
+        try:
+            acl = await self.ensure(bot)
+            return await acl.member_context(bot, CONSUMER, 'manage', group, member, action='invoke')
+        except FAILURES:
+            return {'context': None, 'reason': 'authorization_unavailable'}
+
+    def context_current(self, bot, context):
+        acl = self.module()
+        return bool(acl and acl.context_current(bot, context))
 
     @staticmethod
     def view_context(rule, group):

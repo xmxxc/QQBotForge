@@ -62,10 +62,11 @@ async def test_restricted_rules_are_filtered_before_ranking_and_need_whole_group
     assert host.said() == ['P']
     await host.event('规则', user='member-a', group='group-a')
     menu = host.said()[0]
-    assert '公开' in menu and '内部' in menu
-    # The admin may see it, but the whole group may not: status only, no content.
+    # The admin may choose it, but the group may not all view it: its title is masked.
+    assert '公开' in menu and '受限答案' in menu and '内部' not in menu
     await host.event('问答选择 2', user='member-a', group='group-a')
-    assert host.said() == ['「内部」仅限有权成员查看，不能在本群公开发送。']
+    (status,) = host.said()
+    assert status.startswith('该答案仅限有权成员查看，不能在本群发送。请先私聊 Bot 发送：身份绑定 申请 group-a member-a') and 'R' not in status
     # Every roster member (both Bots included) may view: group send is allowed.
     await host.qa({'operation': 'rule_policy', 'id': restricted['id'], 'policy': {'kind': 'group', 'groups': ['group-a']}})
     roster_platform(host)

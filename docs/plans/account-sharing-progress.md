@@ -17,7 +17,7 @@
 | 基础兼容与框架契约 | [#19](https://github.com/xmxxc/QQBotForge/issues/19)、[#20](https://github.com/xmxxc/QQBotForge/issues/20) | 已实现与验证，票据关闭；draft PR #37、#38、#39 保持待审核 |
 | 完整群状态 | [#21](https://github.com/xmxxc/QQBotForge/issues/21)—[#23](https://github.com/xmxxc/QQBotForge/issues/23) | G01—G03 已实现／验证，票据关闭；draft PR #40、#41、#42 保持待审核 |
 | 通用授权 | [#24](https://github.com/xmxxc/QQBotForge/issues/24)—[#27](https://github.com/xmxxc/QQBotForge/issues/27) | A01 #24 已实现／验证，draft PR #43；A02 #25 已实现／验证，draft PR #44；A03 #26 已实现／验证，draft PR #45；A04 #27 已实现／验证，draft PR #46 |
-| 独立问答 | [#28](https://github.com/xmxxc/QQBotForge/issues/28)—[#32](https://github.com/xmxxc/QQBotForge/issues/32) | Q01 #28 已实现／验证，draft PR #48（框架前置 draft PR #47，已同步 #39）；Q02—Q05 待实施 |
+| 独立问答 | [#28](https://github.com/xmxxc/QQBotForge/issues/28)—[#32](https://github.com/xmxxc/QQBotForge/issues/32) | Q01—Q05 已实现／验证，draft PR #48—#52（框架前置 draft PR #47，已同步 #39） |
 | 账户组合 | [#33](https://github.com/xmxxc/QQBotForge/issues/33)—[#36](https://github.com/xmxxc/QQBotForge/issues/36) | 已有业务基础；待接口迁移和完整验收 |
 
 已有实现与新票完成是不同状态。框架提供接口、消费者接入、自动测试和真实平台许可分别报告。当前发布动作及原票关闭读回结果记录在实施清单与 GitHub 时间线。
@@ -47,8 +47,10 @@ G03 #23：`fe873ac` 及成员周期锚点修正 `0a83634`，draft [PR #42](https
 
 ## 当前位置
 
-A04 #27：代码 `f26aff0`，draft [PR #46](https://github.com/xmxxc/QQBotForge/pull/46)。Q01 #28：业务 `6461759`，draft [PR #48](https://github.com/xmxxc/QQBotForge/pull/48)，分支 `feat/self-qa-q01`；框架前置 `before_handler` Hook `bf462cf`，draft [PR #47](https://github.com/xmxxc/QQBotForge/pull/47) 目标 main，已合入同步分支 `integrate/bot-modules-framework` `e501c95`（PR #39）。新规划 18 票中 #19—#28 共 10 票完成，#29—#36 待实施。
+授权 A04 #27：`f26aff0`，PR #46。问答 Q01 #28 `6461759` PR #48；Q02 #29 `6833097` PR #49；Q03 #30 `e33def9` PR #50；Q04 #31 `00be98b` PR #51（含 #26 回执修复 `387a332`）；Q05 #32 `00e4c8c`＋`1e169ff` PR #52。框架前置 `before_handler` Hook `bf462cf`，draft PR #47 目标 main，已合入同步分支 `integrate/bot-modules-framework` `e501c95`（PR #39）。业务分支依次叠加，最新 `feat/self-qa-q05`。新规划 18 票中 #19—#32 共 14 票完成，#33—#36（账户组合）待实施。
 
-验证组合：框架同步 `e501c95` + 业务 `6461759`，`/tmp/qqbotforge-a01-runner` 指向同步工作树 core/web 和业务工作树 `/opt/qqbot/QQBotForge-access-control-a01` 的 modules/plugins/tests；命令 `/opt/qqbot/QQBotForge-account-sharing/.venv/bin/python -m pytest -q`，195 passed。推送使用 SSH 地址 `git@github.com:xmxxc/QQBotForge.git`。浏览器和真实 QQ／平台许可未验收；未迁移生产数据、合并或部署，全部 PR 保持 draft。
+验证组合：框架同步 `e501c95` + 业务 `feat/self-qa-q05`，`/tmp/qqbotforge-a01-runner` 指向同步工作树 core/web 和业务工作树 `/opt/qqbot/QQBotForge-access-control-a01` 的 modules/plugins/tests；命令 `/opt/qqbot/QQBotForge-account-sharing/.venv/bin/python -m pytest -q`，213 passed。推送使用 SSH 地址 `git@github.com:xmxxc/QQBotForge.git`。浏览器和真实 QQ／平台许可未验收；未迁移生产数据、合并或部署，全部 PR 保持 draft。
 
-下一张：Q02 #29（正则、统一排序和多答案选择），之后 Q03／Q04、Q05，再到账户 C01—C04。
+账户迁移须知：旧账户插件多处把 `Sender.reply` 结果当作 `(success, data)` 元组（真实返回平台响应 dict；`send_to_user` 返回 `(ok, data, payload)`），C01—C03 改用新接口时一并修正。授权已提供 `audience_report`／`report_current`、`member_context`／`context_current` 与 `private_contexts`，问答提供 `match(admit=…)`。
+
+下一张：C01 #33（账户插件迁移为组合消费者），之后 C02—C04。

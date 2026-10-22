@@ -1,11 +1,12 @@
 """Rich answers (text, Markdown, image, buttons) with confirmed-only fallback.
 
 ``Sender.reply`` returns the platform response dict: an error carries ``code``
-(``-1`` is the framework's network failure; an HTTP 5xx without a JSON body
-carries the status), otherwise the message was sent. Only a definite rejection
-falls back to plain text; an unknown result never re-sends the answer. Every
-part is sent only after ``check()`` confirms the answer is still current.
-Buttons carry session references, never answer content.
+(``-1`` is the framework's network failure), otherwise the message was sent.
+Pushes (``send_to_user``/``send_image``) return ``(ok, data, ...)``. An HTTP
+5xx without a JSON body carries the status as ``code``. Only a definite
+rejection falls back to plain text; an unknown result never re-sends the
+answer. Every part is sent only after ``check()`` confirms the answer is still
+current. Buttons carry session references, never answer content.
 """
 
 import time
@@ -18,18 +19,27 @@ IMAGE = 1
 ACTIONS = {'command', 'link', 'rule'}
 
 
-def outcome(result, *, media=False):
-    """'sent', 'rejected' or 'unknown' for one reply result."""
+def unknown_code(code):
+    """Network failure or a server error: the platform may still have delivered it."""
+    return str(code) == '-1' or isinstance(code, int) and 500 <= code <= 599
+
+
+def outcome(result):
+    """'sent', 'rejected' or 'unknown' for one reply or push result."""
+    if isinstance(result, tuple) and result and isinstance(result[0], bool):
+        if result[0]:
+            return 'sent'
+        data = result[1] if len(result) > 1 else None
+        return 'unknown' if isinstance(data, dict) and unknown_code(data.get('code')) else 'rejected'
     if result is None:
-        # Media helpers return None when the upload failed before any send.
-        return 'rejected' if media else 'unknown'
+        # before_send interception or an ignored platform code: nothing is known.
+        return 'unknown'
     if not isinstance(result, dict):
         return 'unknown'
     code = result.get('code')
     if code in (None, 0):
         return 'sent'
-    # Network failure or a server error: the platform may still have delivered it.
-    return 'unknown' if str(code) == '-1' or isinstance(code, int) and 500 <= code <= 599 else 'rejected'
+    return 'unknown' if unknown_code(code) else 'rejected'
 
 
 def validate_rich(rule):
@@ -57,6 +67,43 @@ def validate_rich(rule):
             raise ValueError('规则按钮须填写规则 ID')
 
 
+class EventTarget:
+    """Reply into the chat of the triggering event."""
+
+    def __init__(self, entry, event, context):
+        self.entry, self.event, self.context = entry, event, context
+
+    async def text(self, content, **kwargs):
+        try:
+            result = await self.entry.reply(self.event, content, **kwargs)
+        except Exception:  # noqa: BLE001 - transport errors make the result unknown
+            return 'unknown', None
+        return outcome(result), result if isinstance(result, dict) else None
+
+    async def upload(self, url):
+        sender = self.entry.sender(self.event.appid)
+        return await upload_media_via_url(sender, self.event, url, IMAGE) if sender else None
+
+
+class UserTarget:
+    """Push to a verified private identity (``send_to_user``)."""
+
+    def __init__(self, sender, bot, private_id):
+        self.sender, self.private_id = sender, private_id
+        self.context = {'bot': bot, 'caller': private_id, 'scene': 'private', 'group': ''}
+
+    async def text(self, content, **kwargs):
+        try:
+            result = await self.sender.send_to_user(self.private_id, content, **kwargs)
+        except Exception:  # noqa: BLE001
+            return 'unknown', None
+        data = result[1] if isinstance(result, tuple) and len(result) > 1 else None
+        return outcome(result), data
+
+    async def upload(self, url):
+        return await upload_media_via_url(self.sender, None, url, IMAGE, target_user_id=self.private_id)
+
+
 class Delivery:
     def __init__(self, entry):
         self.entry = entry
@@ -71,17 +118,20 @@ class Delivery:
             'last_rejections': {kind: dict(info) for (b, kind), info in self.rejections.items() if b == bot},
         }
 
-    def _reject(self, bot, kind, result):
-        self.rejections[(bot, kind)] = {'code': str((result or {}).get('code', 'upload_failed'))[:64], 'at': time.time()}
+    def _reject(self, bot, kind, data):
+        code = str((data or {}).get('code', 'upload_failed') if isinstance(data, dict) else 'rejected')[:64]
+        self.rejections[(bot, kind)] = {'code': code, 'at': time.time()}
+        return code
 
-    async def send(self, event, rule, buttons_token, check):
-        """Send one rule's answer to this event's own chat.
+    async def send(self, target, rule, buttons_token, check):
+        """Send one rule's answer to ``target``; returns (state, platform error code or None).
 
-        Returns 'sent', 'degraded', 'failed' or 'unknown'; 'stale' when ``check()``
+        state is 'sent', 'degraded', 'failed' or 'unknown'; 'stale' when ``check()``
         failed before anything was delivered, 'partial' when it failed after a part.
         """
-        bot, entry = event.appid, self.entry
-        caller = event.raw_user_id or event.user_id
+        bot = target.context['bot']
+        caller = target.context['caller']
+        error = None
         rows, lines = [], []
         for index, button in enumerate(rule.get('buttons', [])):
             label, value = button['label'], button['value']
@@ -96,47 +146,39 @@ class Delivery:
                 lines.append(f'{label}：发送「问答选择 {index + 1}」')
         rich = bool(rows) or rule.get('format') == 'markdown'
         state = 'sent'
+        markdown = cfg.get_bot_setting(bot, 'message.use_markdown', True)
         if not check():
-            return 'stale'
-        if rich and cfg.get_bot_setting(bot, 'message.use_markdown', True):
-            result = await self._reply(event, rule['target'], buttons=rows or None, msg_type=MARKDOWN)
-            state = outcome(result)
+            return 'stale', None
+        if rich and markdown:
+            state, data = await target.text(rule['target'], buttons=rows or None, msg_type=MARKDOWN)
             if state == 'rejected':
-                self._reject(bot, 'buttons' if rows else 'markdown', result)
-        if not rich or state == 'rejected' or not cfg.get_bot_setting(bot, 'message.use_markdown', True):
+                error = self._reject(bot, 'buttons' if rows else 'markdown', data)
+        if not rich or state == 'rejected' or not markdown:
             if not check():
                 # A rejected first attempt delivered nothing.
-                return 'stale'
+                return 'stale', error
             text = '\n'.join([rule['target'], *lines]) if rich else rule['target']
-            result = await self._reply(event, text, msg_type=TEXT)
-            state = {'sent': 'degraded' if rich else 'sent', 'rejected': 'failed', 'unknown': 'unknown'}[outcome(result)]
+            result, data = await target.text(text, msg_type=TEXT)
+            state = {'sent': 'degraded' if rich else 'sent', 'rejected': 'failed', 'unknown': 'unknown'}[result]
             if state == 'failed':
-                self._reject(bot, 'text', result)
+                error = self._reject(bot, 'text', data)
         if state not in {'sent', 'degraded'} or not rule.get('image'):
             # Unknown or failed: never send the rest blindly.
-            return state
+            return state, error
         if not check():
-            return 'partial'
+            return 'partial', error
+        # Upload, check again, then post: the upload is a wait like any other.
         try:
-            # Upload, check again, then post: the upload is a wait like any other.
-            sender = entry.sender(bot)
-            file_info = await upload_media_via_url(sender, event, rule['image'], IMAGE) if sender else None
-            if file_info and not check():
-                return 'partial'
-            image = await sender.reply(event, media={'file_info': file_info}) if file_info else None
+            file_info = await target.upload(rule['image'])
         except Exception:  # noqa: BLE001 - an exception leaves the delivery unknown
-            return 'unknown'
-        image_state = outcome(image, media=True)
+            return 'unknown', error
+        if file_info and not check():
+            return 'partial', error
+        image_state = (await target.text(None, media={'file_info': file_info}))[0] if file_info else 'rejected'
         if image_state == 'rejected':
-            self._reject(bot, 'image', image if isinstance(image, dict) else None)
+            self._reject(bot, 'image', None)
             if not check():
-                return 'partial'
-            fallback = outcome(await self._reply(event, f'图片：{rule["image"]}', msg_type=TEXT))
-            return 'degraded' if fallback == 'sent' else 'unknown' if fallback == 'unknown' else 'failed'
-        return state if image_state == 'sent' else 'unknown'
-
-    async def _reply(self, event, content, **kwargs):
-        try:
-            return await self.entry.reply(event, content, **kwargs)
-        except Exception:  # noqa: BLE001 - transport errors make the result unknown
-            return {'code': -1}
+                return 'partial', error
+            fallback, _ = await target.text(f'图片：{rule["image"]}', msg_type=TEXT)
+            return ('degraded' if fallback == 'sent' else 'unknown' if fallback == 'unknown' else 'failed'), error
+        return (state if image_state == 'sent' else 'unknown'), error

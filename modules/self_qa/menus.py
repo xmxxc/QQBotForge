@@ -28,7 +28,8 @@ class Menus:
         self.menus = {}
         self.latest = {}
 
-    def issue(self, event, namespace, text, candidates):
+    def issue(self, context, namespace, text, candidates):
+        """``context`` is ``context_of(event)`` or the private target a reply is pushed to."""
         now = self.clock()
         for token in [t for t, m in self.menus.items() if m['expires_at'] <= now][:MAX_MENUS]:
             self.menus.pop(token)
@@ -36,7 +37,6 @@ class Menus:
             self.menus.pop(next(iter(self.menus)))
         self.latest = {key: token for key, token in self.latest.items() if token in self.menus}
         token = uuid4().hex
-        context = context_of(event)
         self.menus[token] = {
             **context,
             'token': token,
@@ -49,9 +49,9 @@ class Menus:
         self.latest[tuple(context.values())] = token
         return token
 
-    def issue_links(self, event, namespace, rule_ids):
+    def issue_links(self, context, namespace, rule_ids):
         """Session for rule buttons inside one answer: index → rule ID, nothing else."""
-        token = self.issue(event, namespace, '', [])
+        token = self.issue(context, namespace, '', [])
         self.menus[token].update(kind='links', links=list(rule_ids))
         return token
 

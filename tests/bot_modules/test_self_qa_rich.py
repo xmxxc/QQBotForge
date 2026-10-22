@@ -115,4 +115,5 @@ async def test_rule_buttons_cannot_bypass_restricted_rules(qa_access_host):  # n
     # Even with permission, a group without whole-group view gets status only.
     await host.qa({'operation': 'rule_policy', 'id': restricted['id'], 'policy': {'kind': 'role', 'groups': ['group-a'], 'roles': ['admin']}})
     await host.event('问答选择 1', user='member-a', group='group-a')
-    assert host.said() == ['「内部」仅限有权成员查看，不能在本群公开发送。']
+    (status,) = host.said()
+    assert status.startswith('该答案仅限有权成员查看') and 'SECRET' not in status

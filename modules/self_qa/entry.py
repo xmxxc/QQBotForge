@@ -16,18 +16,21 @@ from core.plugin._blacklist import get_blacklist_map
 from core.plugin._dispatch import _strip_leading_bot_name_at
 
 from .access import AccessBridge
-from .delivery import Delivery, outcome
-from .menus import PAGE, Menus
+from .delivery import TEXT, Delivery, EventTarget, UserTarget, outcome
+from .menus import PAGE, Menus, context_of
 
 PREFIX = '/api/ext/self-qa/'
 NAMESPACE = 'public'
 COMMAND = '问答管理 '
 MESSAGE_TYPES = {'GROUP_AT_MESSAGE_CREATE', 'GROUP_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE'}
 SELECT = '问答选择'
+CHOOSE_GROUP = '问答群'
+RESTRICTED_TITLE = '受限答案'
 CALLBACK = 'qa:'
 # Rules changed while an answer was prepared: re-resolve from current rules this often.
 ATTEMPTS = 3
 CHANGING = '答案正在更新，请稍后重新提问。'
+MANAGER_CHANGED = '管理资格已变化，请重新发送'
 STALE = object()
 
 
@@ -41,6 +44,8 @@ class PublicEntry:
         self.menus = Menus()
         self.access = AccessBridge(qa, NAMESPACE)
         self.delivery = Delivery(self)
+        # Private chat: the group context an asker chose among several valid ones (re-validated on every use).
+        self.private_groups = {}
 
     @staticmethod
     def sender(bot):
@@ -112,19 +117,49 @@ class PublicEntry:
         return list(chosen.values())
 
     async def matched(self, event, text):
-        """Best candidates this asker may see, with the rules and decisions behind them."""
+        """Best candidates this asker may see, the rules and decisions behind them, and group choices."""
         if not await self.enabled(event):
-            return [], {}
+            return [], {}, []
+        if event.is_group:
+            candidates, admitted, _ = await self.match_in(event, text, None, {})
+            return candidates, admitted, []
+        contexts, context = await self.private_scope(event)
+        candidates, admitted, choices = await self.match_in(event, text, context, contexts)
+        if candidates or context or len(contexts) < 2:
+            return candidates, admitted, choices
+        # Several valid groups, none chosen: offer only the groups where this asker has an answer.
+        for group, option in contexts.items():
+            if group not in choices and (await self.match_in(event, text, option, contexts))[0]:
+                choices.append(group)
+        return [], {}, choices
+
+    async def private_scope(self, event):
+        """Private chat: valid group contexts (Q&A enabled groups) and the one in use, if any."""
+        bot, member = event.appid, event.raw_user_id or event.user_id
+        settings = await self.qa.settings(bot, NAMESPACE)
+        contexts = await self.access.group_contexts(bot, member, settings['groups'])
+        chosen = self.private_groups.get((bot, member), '')
+        if chosen not in contexts:
+            # A stale choice is dropped; a single valid group needs no choice.
+            chosen = next(iter(contexts)) if len(contexts) == 1 else ''
+        return contexts, contexts.get(chosen)
+
+    async def match_in(self, event, text, context, contexts):
+        """Candidates in the event's group, or in private chat with ``context`` (or none)."""
         group, member = (event.group_id if event.is_group else ''), event.raw_user_id or event.user_id
-        admitted = {}
+        admitted, choices = {}, []
 
         async def admit(rule):
-            decision = await self.access.admit(event.appid, rule, group, member)
+            decision = await self.access.admit(event.appid, rule, group, member, context=context, groups=list(contexts))
+            if decision is not None and decision.get('choose'):
+                choices.extend(g for g in decision['choose'] if g not in choices)
+                return False
             if decision is not None:
                 admitted[rule['id']] = rule, decision
             return decision is not None
 
-        return self.candidates(await self.qa.match(event.appid, NAMESPACE, text, group=group, admit=admit)), admitted
+        rules_group = group or (context['group'] if context else '')
+        return self.candidates(await self.qa.match(event.appid, NAMESPACE, text, group=rules_group, admit=admit)), admitted, choices
 
     def fresh(self, bot, version):
         """Final non-awaiting check: no rule or enablement changed since ``version`` was read."""
@@ -140,7 +175,23 @@ class PublicEntry:
         return None
 
     async def current(self, event, menu):
-        return await self.matched(event, menu['text'])
+        candidates, admitted, _ = await self.matched(event, menu['text'])
+        return candidates, admitted
+
+    async def titles(self, event, candidates, admitted):
+        """Restricted titles stay hidden in a group whose members may not all view them.
+
+        Returns the titles and the (rule, report) pairs behind each shown restricted title.
+        """
+        names, shown = [], []
+        for candidate in candidates:
+            rule = admitted[candidate['rule_id']][0]
+            report = await self.access.group_view(event.appid, rule, event.group_id) if rule.get('access') == 'restricted' and event.is_group else None
+            if report is not None:
+                shown.append((rule, report))
+            hidden = rule.get('access') == 'restricted' and event.is_group and report is None
+            names.append(RESTRICTED_TITLE if hidden else candidate['name'])
+        return names, shown
 
     async def deliver(self, event, candidate, admitted, version):
         """Send one matched answer; STALE when its rules changed during the waits (nothing sent)."""
@@ -151,9 +202,7 @@ class PublicEntry:
         if rule.get('access') == 'restricted' and event.is_group and report is None:
             if not self.fresh(event.appid, version):
                 return STALE
-            # Only send restricted content to a group whose every member may view it.
-            await self.reply(event, f'「{rule["name"]}」仅限有权成员查看，不能在本群公开发送。')
-            return None
+            return await self.deliver_privately(event, rule, decision, version)
 
         def check():
             """Final non-awaiting gate before every part: rule version, asker, whole-group report."""
@@ -163,13 +212,7 @@ class PublicEntry:
                 and (report is None or self.access.report_current(event.appid, rule, event.group_id, report))
             )
 
-        buttons = rule.get('buttons', [])
-        token = (
-            self.menus.issue_links(event, NAMESPACE, [b['value'] if b['action'] == 'rule' else None for b in buttons])
-            if any(b['action'] == 'rule' for b in buttons)
-            else ''
-        )
-        state = await self.delivery.send(event, rule, token, check)
+        state, _ = await self.send(EventTarget(self, event, context_of(event)), rule, check)
         if state == 'stale':
             if not self.fresh(event.appid, version):
                 return STALE
@@ -179,16 +222,67 @@ class PublicEntry:
             await self.reply(event, '答案已变化，其余内容未发送，请重新提问。')
         return None
 
+    async def send(self, target, rule, check):
+        buttons = rule.get('buttons', [])
+        token = (
+            self.menus.issue_links(target.context, NAMESPACE, [b['value'] if b['action'] == 'rule' else None for b in buttons])
+            if any(b['action'] == 'rule' for b in buttons)
+            else ''
+        )
+        return await self.delivery.send(target, rule, token, check)
+
+    async def deliver_privately(self, event, rule, decision, version):
+        """Not every group member may view: status in the group, answer to the asker's verified private identity."""
+        bot, group, member = event.appid, event.group_id, event.raw_user_id or event.user_id
+        found = await self.access.member_context(bot, rule, group, member)
+        if not self.fresh(bot, version):
+            return STALE
+        context = found['context']
+        if context is None:
+            if found['reason'] == 'binding_missing':
+                await self.reply(event, f'该答案仅限有权成员查看，不能在本群发送。请先私聊 Bot 发送：身份绑定 申请 {group} {member}，主人核实后即可私聊接收。')
+            else:
+                await self.reply(event, '该答案仅限有权成员查看，暂不能私聊发送，请联系主人。')
+            return None
+
+        def check():
+            """Final non-awaiting gate before every private part: rule version, asker, recipient identity."""
+            return self.fresh(bot, version) and self.access.current(bot, decision) and self.access.context_current(bot, context)
+
+        sender = self.sender(bot)
+        if sender is None:
+            await self.reply(event, '资格已变化，请重新提问。')
+            return None
+        state, error = await self.send(UserTarget(sender, bot, context['private_id']), rule, check)
+        if state == 'stale' and not self.fresh(bot, version):
+            return STALE
+        status = {
+            'sent': '该答案仅限有权成员查看，已私聊发送给你。',
+            'degraded': '该答案仅限有权成员查看，已私聊发送给你（部分格式改为文字）。',
+            'failed': f'该答案仅限有权成员查看，私聊发送失败（平台代码 {error or "未知"}）。请先私聊 Bot 一次后重试，或联系主人。',
+            'unknown': '该答案仅限有权成员查看，私聊发送结果未知，请先查看私聊，勿重复索取。',
+            'stale': '资格已变化，请重新提问。',
+            'partial': '该答案仅限有权成员查看，已私聊发送部分内容；资格已变化，其余内容未发送。',
+        }[state]
+        # Never fall back to sending the restricted answer in the group.
+        await self.reply(event, status)
+        return None
+
     async def linked(self, event, rule_id):
         """A rule button: reload the rule now and check scope and the clicker's own eligibility."""
         group = event.group_id if event.is_group else ''
+        member = event.raw_user_id or event.user_id
 
         async def answer(version):
             rule = await self.qa.manage(event.appid, NAMESPACE, 'get', key=rule_id) if rule_id else None
             decision = None
-            if rule and rule['enabled'] and rule['kind'] == 'text' and (not rule.get('groups') or group in rule['groups']) and await self.enabled(event):
-                decision = await self.access.admit(event.appid, rule, group, event.raw_user_id or event.user_id)
-            if decision is None:
+            enabled = bool(rule) and await self.enabled(event)
+            # Same private group context as a typed question.
+            contexts, context = await self.private_scope(event) if enabled and not group else ({}, None)
+            in_scope = enabled and (not rule.get('groups') or group in rule['groups'] or context and context['group'] in rule['groups'])
+            if in_scope and rule['enabled'] and rule['kind'] == 'text':
+                decision = await self.access.admit(event.appid, rule, group, member, context=context, groups=list(contexts))
+            if decision is None or decision.get('choose'):
                 if not self.fresh(event.appid, version):
                     return STALE
                 await self.reply(event, '该答案已失效，请重新提问。')
@@ -196,6 +290,24 @@ class PublicEntry:
             return await self.deliver(event, {'rule_id': rule['id']}, {rule['id']: (rule, decision)}, version)
 
         await self.resolved(event, answer)
+
+    async def choose_group(self, event, argument):
+        """Private chat: pick, switch or clear the group context among the asker's valid ones."""
+        bot, member = event.appid, event.raw_user_id or event.user_id
+        if not await self.enabled(event):
+            return event
+        contexts, _ = await self.private_scope(event)
+        options = '可选：' + '、'.join(contexts) if contexts else '当前没有可用的群。'
+        if not argument:
+            self.private_groups.pop((bot, member), None)
+            await self.reply(event, '已清除群选择。' + options)
+        elif argument in contexts:
+            self.private_groups[bot, member] = argument
+            await self.reply(event, f'已选择群 {argument}，请重新提问。')
+        else:
+            # Says nothing about that group's rules; the asker's own valid groups only.
+            await self.reply(event, '无法选择该群：须为已启用问答、你已完成身份绑定且仍在群内的群。' + options)
+        return None
 
     async def on_event(self, event):
         text = (event.content or '').strip()
@@ -211,35 +323,53 @@ class PublicEntry:
         try:
             if text == SELECT or text.startswith(SELECT + ' '):
                 return await self.select_text(event, text[len(SELECT) :].strip())
+            if not event.is_group and (text == CHOOSE_GROUP or text.startswith(CHOOSE_GROUP + ' ')):
+                return await self.choose_group(event, text[len(CHOOSE_GROUP) :].strip())
 
             async def answer(version):
-                candidates, admitted = await self.matched(event, text)
+                candidates, admitted, choices = await self.matched(event, text)
                 if not candidates:
+                    if choices:
+                        await self.reply(event, f'该问题需要先选择群，请发送：{CHOOSE_GROUP} <群ID>。可选：' + '、'.join(choices))
+                        return None
                     return event
                 if not self.fresh(bot, version):
                     return STALE
                 if len(candidates) == 1:
                     return await self.deliver(event, candidates[0], admitted, version)
-                await self.offer(event, self.menus.issue(event, NAMESPACE, text, candidates), candidates, 0, version)
-                return None
+                return await self.offer(event, self.menus.issue(context_of(event), NAMESPACE, text, candidates), candidates, 0, admitted, version)
 
             return await self.resolved(event, answer)
         except (sqlite3.Error, OSError, RuntimeError):
             # Storage trouble never blocks plugin handlers.
             return event
 
-    async def offer(self, event, token, candidates, page, version):
+    async def offer(self, event, token, candidates, page, admitted, version):
         page, last, shown = self.menus.page(candidates, page)
         start = page * PAGE
-        lines = ['找到多个答案，请选择：'] + [f'{start + i + 1}. {c["name"]}' for i, c in enumerate(shown)]
+        names, reports = await self.titles(event, shown, admitted)
+
+        def current():
+            """Final non-awaiting gate before each menu send: every listed rule's decision and shown title's report."""
+            bot = event.appid
+            return all(self.access.current(bot, admitted[c['rule_id']][1]) for c in shown) and all(
+                self.access.report_current(bot, rule, event.group_id, report) for rule, report in reports
+            )
+
+        if not self.fresh(event.appid, version):
+            return STALE
+        if not current():
+            await self.reply(event, '资格已变化，请重新提问。')
+            return None
+        lines = ['找到多个答案，请选择：'] + [f'{start + i + 1}. {name}' for i, name in enumerate(names)]
         if last:
             lines.append(f'第 {page + 1}/{last + 1} 页，发送：{SELECT} 页 <页码>')
         lines.append(f'也可发送：{SELECT} <序号>')
         text = '\n'.join(lines)
         caller = event.raw_user_id or event.user_id
         rows = [
-            [{'text': c['name'][:20], 'type': 1, 'data': f'{CALLBACK}{token}:{start + i}', 'list': [caller], 'tips': f'请发送：{SELECT} {start + i + 1}'}]
-            for i, c in enumerate(shown)
+            [{'text': name[:20], 'type': 1, 'data': f'{CALLBACK}{token}:{start + i}', 'list': [caller], 'tips': f'请发送：{SELECT} {start + i + 1}'}]
+            for i, name in enumerate(names)
         ]
         navigation = [
             {'text': label, 'type': 1, 'data': f'{CALLBACK}{token}:p{target}', 'list': [caller], 'tips': f'请发送：{SELECT} 页 {target + 1}'}
@@ -255,11 +385,15 @@ class PublicEntry:
                 result = 'unknown'
             # Only a definite rejection falls back; an unknown result is not re-sent.
             if result != 'rejected':
-                return
+                return None
+        # The rejected menu delivered nothing: re-resolve or report, never offer stale titles.
         if not self.fresh(event.appid, version):
-            await self.reply(event, CHANGING)
-            return
+            return STALE
+        if not current():
+            await self.reply(event, '资格已变化，请重新提问。')
+            return None
         await self.reply(event, text + '\n按钮暂不可用，请使用以上文字选择。')
+        return None
 
     async def choose(self, event, menu, token, action):
         """Re-read current rules for this caller/context; stale choices answer nothing."""
@@ -277,8 +411,7 @@ class PublicEntry:
                 if not candidates:
                     await self.reply(event, '这些答案已变化，请重新提问。')
                     return None
-                await self.offer(event, token, candidates, int(action[1:]), version)
-                return None
+                return await self.offer(event, token, candidates, int(action[1:]), admitted, version)
             index = int(action)
             rule_id = menu['rules'][index] if 0 <= index < len(menu['rules']) else None
             chosen = next((c for c in candidates if c['rule_id'] == rule_id), None)
@@ -357,7 +490,7 @@ class PublicEntry:
                 return self.access.current(bot, decision)
 
             if operation == 'list':
-                result = await self.delegated_list(bot, own, guard)
+                result = await self.delegated_list(event, own, decision)
             elif operation == 'create':
                 if 'id' in values:
                     raise ValueError('新增不接受 id')
@@ -379,21 +512,64 @@ class PublicEntry:
         await self.reply(event, content)
         return None
 
-    async def delegated_list(self, bot, own, guard):
-        """This group's rules for the group, read again while rules change between the read and the reply."""
-        for _ in range(ATTEMPTS):
+    async def delegated_list(self, event, own, decision):
+        """This group's rules for the group, read and authorized again while they change before anything is sent.
+
+        Restricted details go to the delegate's verified private identity; the
+        group only learns their count and what happened to that push. Reads
+        have no store lock to guard them, so every reply re-checks after its waits.
+        """
+        bot, group, member = event.appid, event.group_id, event.raw_user_id or event.user_id
+        for attempt in range(ATTEMPTS):
+            if attempt:
+                # Rule changes also renew the authorization inventory: decide again before re-reading.
+                decision = await self.access.delegate(bot, group, member)
+            if not (self.qa.active and decision):
+                raise PermissionError(MANAGER_CHANGED)
             version = self.qa.version(bot, NAMESPACE)
             rules = [r for r in await self.qa.manage(bot, NAMESPACE, 'list') if own(r)]
-            if not (self.qa.active and guard()):
-                raise PermissionError('管理资格已变化，请重新发送')
-            # Final non-awaiting gate: never list a title or keyword the rules no longer have.
-            if self.fresh(bot, version):
-                # Managing is not disclosure: the group sees public rules and only a count of restricted ones.
-                return {
-                    'rules': [{k: r[k] for k in ('id', 'name', 'keywords', 'mode', 'enabled')} for r in rules if r.get('access') != 'restricted'],
-                    'restricted': sum(r.get('access') == 'restricted' for r in rules),
-                }
+            # Managing is not disclosure: the group sees public rules and only a count of restricted ones.
+            fields = ('id', 'name', 'keywords', 'mode', 'enabled')
+            public = [{k: r[k] for k in fields} for r in rules if r.get('access') != 'restricted']
+            hidden = [{k: r[k] for k in fields} for r in rules if r.get('access') == 'restricted']
+            result = {'rules': public, 'restricted': len(hidden)}
+            status = await self.manager_details(event, hidden, decision, version) if hidden else None
+            if status is STALE:
+                continue
+            # Final non-awaiting gate: the manager still qualifies and no listed title or keyword changed.
+            manager = self.qa.active and self.access.current(bot, decision)
+            if manager and self.fresh(bot, version):
+                return {**result, 'restricted_detail': status} if status else result
+            if status:
+                # The push cannot be undone; the group gets no list, only what happened to the push.
+                raise PermissionError(('规则已变化，请重新发送' if manager else MANAGER_CHANGED) + f'（受限详情：{status}）')
+        if not (self.qa.active and await self.access.delegate(bot, group, member)):
+            raise PermissionError(MANAGER_CHANGED)
         raise PermissionError('规则正在变化，请稍后重新发送')
+
+    async def manager_details(self, event, details, decision, version):
+        """Restricted rule details to the delegate's verified private identity.
+
+        Returns the status for the group, or STALE when the manager decision or
+        the rules changed before anything was pushed.
+        """
+        bot, group, member = event.appid, event.group_id, event.raw_user_id or event.user_id
+        found = await self.access.manager_context(bot, group, member)
+        context, sender = found['context'], self.sender(bot)
+        if not (self.qa.active and self.access.current(bot, decision) and self.fresh(bot, version)):
+            return STALE
+        if context is None or sender is None:
+            if found['reason'] == 'binding_missing':
+                return f'受限规则详情只私聊发送，请先私聊 Bot 发送：身份绑定 申请 {group} {member}'
+            return '受限规则详情只私聊发送，暂不能私聊发送'
+        if not self.access.context_current(bot, context):
+            raise PermissionError(MANAGER_CHANGED)
+        state, error = await UserTarget(sender, bot, context['private_id']).text(json.dumps(details, ensure_ascii=False), msg_type=TEXT)
+        return {
+            'sent': '已私聊发送',
+            'rejected': f'私聊发送失败（平台代码 {(error or {}).get("code", "未知")}）',
+            'unknown': '私聊发送结果未知，请先查看私聊',
+        }[state]
 
     async def command(self, event, text):
         sender = self.sender(event.appid)

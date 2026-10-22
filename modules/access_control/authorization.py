@@ -630,6 +630,17 @@ class Authorization(AccessControl):
     async def private_contexts(self, bot, consumer, function, private_id, *, group='', resource='', action='invoke'):
         return await self.bindings.contexts(bot, consumer, function, private_id, group=group, resource=resource, action=action)
 
+    async def member_context(self, bot, consumer, function, group, member, resource='', *, action='view'):
+        """Group member's current decision plus their owner-confirmed private identity.
+
+        For consumers that answer a group question privately. Check the returned
+        context with ``context_current`` right before the private send.
+        """
+        decision = await self.evaluate(bot, consumer, function, group, member, resource, action=action)
+        if not decision['allowed']:
+            return {'context': None, 'reason': decision['reason']}
+        return await self.bindings.member_context(bot, decision)
+
     def context_current(self, bot, context):
         return self.bindings.current(bot, context)
 
