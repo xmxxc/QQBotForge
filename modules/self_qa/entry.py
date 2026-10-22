@@ -24,6 +24,10 @@ COMMAND = '问答管理 '
 MESSAGE_TYPES = {'GROUP_AT_MESSAGE_CREATE', 'GROUP_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE'}
 SELECT = '问答选择'
 CALLBACK = 'qa:'
+# Rules changed while an answer was prepared: re-resolve from current rules this often.
+ATTEMPTS = 3
+CHANGING = '答案正在更新，请稍后重新提问。'
+STALE = object()
 
 
 def owner(event):
@@ -120,6 +124,19 @@ class PublicEntry:
 
         return self.candidates(await self.qa.match(event.appid, NAMESPACE, text, group=group, admit=admit)), admitted
 
+    def fresh(self, bot, version):
+        """Final non-awaiting check: no rule or enablement changed since ``version`` was read."""
+        return self.qa.active and self.qa.version(bot, NAMESPACE) == version
+
+    async def resolved(self, event, run):
+        """``run(version)`` returns STALE when rules changed before anything was sent; then run again on current rules."""
+        for _ in range(ATTEMPTS):
+            result = await run(self.qa.version(event.appid, NAMESPACE))
+            if result is not STALE:
+                return result
+        await self.reply(event, CHANGING)
+        return None
+
     async def current(self, event, menu):
         return await self.matched(event, menu['text'])
 
@@ -148,19 +165,25 @@ class PublicEntry:
         try:
             if text == SELECT or text.startswith(SELECT + ' '):
                 return await self.select_text(event, text[len(SELECT) :].strip())
-            candidates, admitted = await self.matched(event, text)
-            if not candidates:
-                return event
-            if len(candidates) == 1:
-                await self.deliver(event, candidates[0], admitted)
-            else:
-                await self.offer(event, self.menus.issue(event, NAMESPACE, text, candidates), candidates, 0)
+
+            async def answer(version):
+                candidates, admitted = await self.matched(event, text)
+                if not candidates:
+                    return event
+                if not self.fresh(bot, version):
+                    return STALE
+                if len(candidates) == 1:
+                    await self.deliver(event, candidates[0], admitted)
+                else:
+                    await self.offer(event, self.menus.issue(event, NAMESPACE, text, candidates), candidates, 0, version)
+                return None
+
+            return await self.resolved(event, answer)
         except (sqlite3.Error, OSError, RuntimeError):
             # Storage trouble never blocks plugin handlers.
             return event
-        return None
 
-    async def offer(self, event, token, candidates, page):
+    async def offer(self, event, token, candidates, page, version):
         page, last, shown = self.menus.page(candidates, page)
         start = page * PAGE
         lines = ['找到多个答案，请选择：'] + [f'{start + i + 1}. {c["name"]}' for i, c in enumerate(shown)]
@@ -187,25 +210,35 @@ class PublicEntry:
                     return
             except Exception:  # noqa: BLE001 - any platform rejection falls back to the equal text choice
                 pass
+        if not self.fresh(event.appid, version):
+            await self.reply(event, CHANGING)
+            return
         await self.reply(event, text + '\n按钮暂不可用，请使用以上文字选择。')
 
     async def choose(self, event, menu, token, action):
         """Re-read current rules for this caller/context; stale choices answer nothing."""
-        candidates, admitted = await self.current(event, menu)
-        if action.startswith('p'):
-            menu['rules'] = [c['rule_id'] for c in candidates]
-            if not candidates:
-                await self.reply(event, '这些答案已变化，请重新提问。')
-                return
-            await self.offer(event, token, candidates, int(action[1:]))
-            return
-        index = int(action)
-        rule_id = menu['rules'][index] if 0 <= index < len(menu['rules']) else None
-        chosen = next((c for c in candidates if c['rule_id'] == rule_id), None)
-        if chosen is None:
-            await self.reply(event, '该答案已失效，请重新提问。')
-            return
-        await self.deliver(event, chosen, admitted)
+
+        async def answer(version):
+            candidates, admitted = await self.current(event, menu)
+            if not self.fresh(event.appid, version):
+                return STALE
+            if action.startswith('p'):
+                menu['rules'] = [c['rule_id'] for c in candidates]
+                if not candidates:
+                    await self.reply(event, '这些答案已变化，请重新提问。')
+                    return None
+                await self.offer(event, token, candidates, int(action[1:]), version)
+                return None
+            index = int(action)
+            rule_id = menu['rules'][index] if 0 <= index < len(menu['rules']) else None
+            chosen = next((c for c in candidates if c['rule_id'] == rule_id), None)
+            if chosen is None:
+                await self.reply(event, '该答案已失效，请重新提问。')
+                return None
+            await self.deliver(event, chosen, admitted)
+            return None
+
+        await self.resolved(event, answer)
 
     async def select_text(self, event, argument):
         menu, reason = self.menus.resolve(event)
