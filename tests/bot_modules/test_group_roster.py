@@ -490,3 +490,23 @@ async def test_interrupted_roster_keeps_wellformed_rows_and_newer_single_verific
     assert report['reason'] == 'state_changed'
     record = (await host.state.snapshot('bot-a'))['groups'][0]['members']['member-a']
     assert record['reliable'] and record['source'] == 'platform_member' and record['reason'] == ''
+
+
+@pytest.mark.parametrize('pass_result', ['complete', 'conflict'])
+async def test_roster_pass_keeps_departed_member_history(group_host, pass_result):
+    from socket_platform import until
+
+    host = group_host
+    state = host.state
+    roster_platform(host)
+    await state.confirm_member('bot-a', 'group-a', 'member-a', evidence='verified')
+    host.lifecycle('GROUP_MEMBER_REMOVE', member='member-a')
+    await until(lambda: state.recovery.get_status('bot-a').ready and state.states['bot-a']['groups']['group-a']['members']['member-a']['status'] == 'left')
+    host.sender.json_results[('/v2/groups/group-a/members', '')] = page(member('member-b'), cursor='second')
+    if pass_result == 'conflict':
+        host.sender.json_results[('/v2/groups/group-a/members', 'second')] = page(member('member-b'))
+    report = await state.sync_roster('bot-a', 'group-a')
+    assert report['complete'] is (pass_result == 'complete')
+    departed = (await state.snapshot('bot-a'))['groups'][0]['members']['member-a']
+    assert departed['status'] == 'left' and not departed['reliable']
+    assert departed['reason'] != 'roster_refreshing'

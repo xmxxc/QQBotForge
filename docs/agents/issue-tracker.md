@@ -4,6 +4,23 @@ Issues and specs live in GitHub Issues for `xmxxc/QQBotForge`.
 Use the `gh` CLI from the repository root. Outside the clone,
 specify `--repo xmxxc/QQBotForge` where supported.
 
+## Branch workflow
+
+- `main` maintains the reusable framework, including system plugins and examples.
+- `personal` includes the framework plus self-use plugins, modules, business tests,
+  and business documentation.
+- Implement shared framework changes on `main` or a feature branch based on it;
+  framework PRs target `main`.
+- Implement self-use changes on `personal` or a feature branch based on it;
+  self-use feature PRs target `personal`.
+- Keep framework and self-use changes in separate commits. Integrate shared
+  framework updates by merging `main` into `personal`.
+- Use the same GitHub issue tracker for both branches. Record the implementation
+  branch in each issue; framework prerequisites are separate from business tickets.
+- Before opening a PR, verify the remote base/head branches and their diff.
+  Check existing PR metadata explicitly; creating a local branch leaves it unchanged.
+- Preserve pre-existing worktree changes and stage only task-owned files.
+
 ## Conventions
 
 - Create: `gh issue create --title "..." --body-file <file>`

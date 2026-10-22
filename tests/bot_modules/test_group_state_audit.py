@@ -102,17 +102,6 @@ async def test_cancelling_initial_queued_write_ends_current_operation(group_host
         second.cancel()
         with pytest.raises(asyncio.CancelledError):
             await second
-        group = next(g for g in (await host.state.snapshot('bot-a'))['groups'] if g['group'] == 'group-a')
-        assert not group['roster']['complete'] and group['version'] > earlier['version']
-        if operation == 'refresh':
-            assert group['status'] == 'historical' and group['reason'] == 'refresh_cancelled'
-        elif operation == 'roster':
-            assert group['roster']['reason'] == 'roster_cancelled'
-            assert group['members']['member-a']['reason'] == 'roster_cancelled'
-        else:
-            record = group['members']['member-a']
-            assert record['status'] == 'historical' and record['reason'] == 'verification_cancelled'
-        assert (await host.state.snapshot('bot-b'))['groups'] == []
     finally:
         blocker.commit()
         blocker.close()
@@ -120,6 +109,18 @@ async def test_cancelling_initial_queued_write_ends_current_operation(group_host
         if second is not None and not second.done():
             second.cancel()
             await asyncio.gather(second, return_exceptions=True)
+    group = next(g for g in (await host.state.snapshot('bot-a'))['groups'] if g['group'] == 'group-a')
+    assert not group['roster']['complete'] and group['version'] > earlier['version']
+    if operation == 'refresh':
+        assert group['status'] == 'historical' and group['reason'] == 'refresh_cancelled'
+    elif operation == 'roster':
+        assert group['roster']['reason'] == 'roster_cancelled'
+        assert group['members']['member-a']['reason'] == 'roster_cancelled'
+    else:
+        record = group['members']['member-a']
+        assert record['status'] == 'historical' and record['reason'] == 'verification_cancelled'
+    assert (await host.state.snapshot('bot-b'))['groups'] == []
+
 
 
 async def test_cancelled_confirmation_preserves_newer_same_group_observation(group_host):
@@ -131,7 +132,7 @@ async def test_cancelled_confirmation_preserves_newer_same_group_observation(gro
     observation = None
     try:
         await wait_until(lambda: host.state.pending_writes.get('bot-a'))
-        observation = asyncio.create_task(host.event('新的群消息', user='member-a', group='group-a'))
+        observation = asyncio.create_task(host.event('新的群消息', user='member-new', group='group-a'))
         await wait_until(lambda: host.state.pending_writes.get('bot-a', 0) >= 2)
         operation.cancel()
     finally:
@@ -143,4 +144,4 @@ async def test_cancelled_confirmation_preserves_newer_same_group_observation(gro
             await observation
     group = await assert_retired(host, earlier)
     assert group['source'] == 'native_event' and group['reason'] == 'observed_event_requires_refresh'
-    assert group['members']['member-a']['reason'] == 'requires_verification'
+    assert group['members']['member-new']['reason'] == 'requires_verification'

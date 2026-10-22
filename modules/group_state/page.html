@@ -2,7 +2,8 @@
 <h2>群状态 · 已知群</h2>
 <p>这里只展示当前 Bot 已观察或由主人刷新过的群，不代表平台全部群。历史资料、核验状态与错误分别显示；查询失败不表示退群。</p>
 <label>Bot <select id="gs-bot"></select></label>
-<button id="gs-load">查看已知群</button>
+<button id="gs-load">查看已知群</button> <button id="gs-rebuild">重建恢复基线</button>
+<p>首次启动、重载或连续性不明时，事实暂停使用。重建会核验已知群与仍在群的已知成员；许可不足会保留待核验状态。</p>
 <p><label>群原生标识 <input id="gs-group" maxlength="256"></label> <button id="gs-refresh">刷新 Bot 在群状态</button></p>
 <h3>成员与角色核验</h3>
 <p>名册按平台分页核验，包含本 Bot 及其他 Bot。缺页、冲突、缺少角色、许可不足或核验期间变化都不能证明完整。人工核验一个人不会证明全群完整。</p>
@@ -56,7 +57,7 @@
    output.textContent=JSON.stringify(data.data,null,2);status.textContent='已更新：'+summary(data.data);
   }catch(error){if(isCurrent()){status.textContent=error.message;output.textContent='';}}
  }
- document.getElementById('gs-load').onclick=()=>run();document.getElementById('gs-refresh').onclick=()=>run('refresh');
+ document.getElementById('gs-rebuild').onclick=()=>run('rebuild');document.getElementById('gs-load').onclick=()=>run();document.getElementById('gs-refresh').onclick=()=>run('refresh');
  document.getElementById('gs-roster').onclick=()=>run('roster');document.getElementById('gs-members').onclick=()=>run('members');
  next.onclick=()=>run('members',true);document.getElementById('gs-verify').onclick=()=>run('member');
  document.getElementById('gs-confirm').onclick=()=>run('confirm-member');

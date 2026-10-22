@@ -16,6 +16,7 @@ async def setup(ctx):
     on_event, handler, page_registered = candidate.on_event, candidate.http, False
     try:
         await candidate.initialize()
+        candidate.connect(ctx)
         ctx.register_hook('before_event', on_event, priority=0)
         register_route('*', PREFIX + '*', handler, auth=True)
         register_page('group-state', '群状态', source='module', source_name='group_state', html_file=str(Path(__file__).with_name('page.html')))

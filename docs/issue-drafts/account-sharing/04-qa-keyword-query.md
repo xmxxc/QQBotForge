@@ -1,3 +1,5 @@
+> 历史票稿：2026-10-20 已由[三模块实施清单](../../plans/bot-modules-tickets.md)中的新票替代。下文保留旧验收与实现背景，不作为当前执行清单。
+
 # 04：复用自助问答模块完成关键词账户查询
 
 GitHub 实施票：[#6](https://github.com/xmxxc/QQBotForge/issues/6)，父规格 [#2](https://github.com/xmxxc/QQBotForge/issues/2)。
