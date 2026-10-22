@@ -141,6 +141,8 @@ QQBotForge/
 
 请先阅读[插件开发文档](docs/plugin-development.md)，了解目录结构、元数据、配置、生命周期、事件、消息 API、群管理和面板扩展。
 
+[Markdown 图片素材 API](docs/plugin-development.md#511-markdown-图片素材) 支持上传本地文件或图片字节并返回 `qqbot-media://` 引用；达到 100 张额度时，会先删除最早上传的图片，再上传新图。
+
 创建 `plugins/hello/main.py`：
 
 ```python
