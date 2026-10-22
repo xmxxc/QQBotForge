@@ -30,6 +30,7 @@ CALLBACK = 'qa:'
 # Rules changed while an answer was prepared: re-resolve from current rules this often.
 ATTEMPTS = 3
 CHANGING = '答案正在更新，请稍后重新提问。'
+MANAGER_CHANGED = '管理资格已变化，请重新发送'
 STALE = object()
 
 
@@ -43,7 +44,7 @@ class PublicEntry:
         self.menus = Menus()
         self.access = AccessBridge(qa, NAMESPACE)
         self.delivery = Delivery(self)
-        # Private chat: the group context a member chose for group-limited rules.
+        # Private chat: the group context an asker chose among several valid ones (re-validated on every use).
         self.private_groups = {}
 
     @staticmethod
@@ -76,11 +77,6 @@ class PublicEntry:
             if set(values) != {'groups'}:
                 raise ValueError('委托须提供 groups 列表')
             return {'delegated_groups': await self.access.set_delegation(bot, values['groups'])}
-        if operation == 'private_groups':
-            # Owner only: groups whose rules verified members may use in private chat.
-            if set(values) != {'groups'}:
-                raise ValueError('私聊群上下文须提供 groups 列表')
-            return {'private_groups': await self.access.set_private_groups(bot, values['groups'])}
         if operation == 'rule_policy':
             if set(values) != {'id', 'policy'}:
                 raise ValueError('须提供规则 id 与 policy（null 为继承默认受限策略）')
@@ -102,7 +98,7 @@ class PublicEntry:
             if not isinstance(key, str) or not key:
                 raise ValueError('请提供规则 id')
             return await self.qa.manage(bot, NAMESPACE, operation, values if operation == 'update' else None, key)
-        raise ValueError('操作须为 list/settings/create/update/delete/test/delegate/private_groups/rule_policy')
+        raise ValueError('操作须为 list/settings/create/update/delete/test/delegate/rule_policy')
 
     async def reply(self, event, content, **kwargs):
         # before_event runs before dispatch assigns event._sender; use the Bot's sender.
@@ -124,22 +120,45 @@ class PublicEntry:
         """Best candidates this asker may see, the rules and decisions behind them, and group choices."""
         if not await self.enabled(event):
             return [], {}, []
+        if event.is_group:
+            candidates, admitted, _ = await self.match_in(event, text, None, {})
+            return candidates, admitted, []
+        contexts, context = await self.private_scope(event)
+        candidates, admitted, choices = await self.match_in(event, text, context, contexts)
+        if candidates or context or len(contexts) < 2:
+            return candidates, admitted, choices
+        # Several valid groups, none chosen: offer only the groups where this asker has an answer.
+        for group, option in contexts.items():
+            if group not in choices and (await self.match_in(event, text, option, contexts))[0]:
+                choices.append(group)
+        return [], {}, choices
+
+    async def private_scope(self, event):
+        """Private chat: valid group contexts (Q&A enabled groups) and the one in use, if any."""
+        bot, member = event.appid, event.raw_user_id or event.user_id
+        settings = await self.qa.settings(bot, NAMESPACE)
+        contexts = await self.access.group_contexts(bot, member, settings['groups'])
+        chosen = self.private_groups.get((bot, member), '')
+        if chosen not in contexts:
+            # A stale choice is dropped; a single valid group needs no choice.
+            chosen = next(iter(contexts)) if len(contexts) == 1 else ''
+        return contexts, contexts.get(chosen)
+
+    async def match_in(self, event, text, context, contexts):
+        """Candidates in the event's group, or in private chat with ``context`` (or none)."""
         group, member = (event.group_id if event.is_group else ''), event.raw_user_id or event.user_id
-        private_group = '' if group else self.private_groups.get((event.appid, member), '')
-        # Private chat: a chosen group's rules join the global ones only with a current verified context there.
-        scope = await self.access.chosen_group_context(event.appid, member, private_group) if private_group else None
         admitted, choices = {}, []
 
         async def admit(rule):
-            decision = await self.access.admit(event.appid, rule, group, member, private_group=private_group)
+            decision = await self.access.admit(event.appid, rule, group, member, context=context, groups=list(contexts))
             if decision is not None and decision.get('choose'):
                 choices.extend(g for g in decision['choose'] if g not in choices)
                 return False
             if decision is not None:
-                admitted[rule['id']] = rule, {**decision, 'scope': scope} if rule.get('groups') and not group else decision
+                admitted[rule['id']] = rule, decision
             return decision is not None
 
-        rules_group = group or (private_group if scope else '')
+        rules_group = group or (context['group'] if context else '')
         return self.candidates(await self.qa.match(event.appid, NAMESPACE, text, group=rules_group, admit=admit)), admitted, choices
 
     def fresh(self, bot, version):
@@ -254,19 +273,15 @@ class PublicEntry:
         group = event.group_id if event.is_group else ''
         member = event.raw_user_id or event.user_id
 
-        private_group = '' if group else self.private_groups.get((event.appid, member), '')
-
         async def answer(version):
             rule = await self.qa.manage(event.appid, NAMESPACE, 'get', key=rule_id) if rule_id else None
-            decision = scope = None
-            if rule and not group and private_group in rule.get('groups', []):
-                # Same private group context as a typed question.
-                scope = await self.access.chosen_group_context(event.appid, member, private_group)
-            in_scope = rule and (not rule.get('groups') or group in rule['groups'] or scope)
-            if in_scope and rule['enabled'] and rule['kind'] == 'text' and await self.enabled(event):
-                decision = await self.access.admit(event.appid, rule, group, member, private_group=private_group)
-            if decision is not None and scope:
-                decision = {**decision, 'scope': scope}
+            decision = None
+            enabled = bool(rule) and await self.enabled(event)
+            # Same private group context as a typed question.
+            contexts, context = await self.private_scope(event) if enabled and not group else ({}, None)
+            in_scope = enabled and (not rule.get('groups') or group in rule['groups'] or context and context['group'] in rule['groups'])
+            if in_scope and rule['enabled'] and rule['kind'] == 'text':
+                decision = await self.access.admit(event.appid, rule, group, member, context=context, groups=list(contexts))
             if decision is None or decision.get('choose'):
                 if not self.fresh(event.appid, version):
                     return STALE
@@ -277,14 +292,21 @@ class PublicEntry:
         await self.resolved(event, answer)
 
     async def choose_group(self, event, argument):
-        """Private chat: pick the group whose membership answers group-limited rules."""
-        key = event.appid, event.raw_user_id or event.user_id
-        if argument:
-            self.private_groups[key] = argument
+        """Private chat: pick, switch or clear the group context among the asker's valid ones."""
+        bot, member = event.appid, event.raw_user_id or event.user_id
+        if not await self.enabled(event):
+            return event
+        contexts, _ = await self.private_scope(event)
+        options = '可选：' + '、'.join(contexts) if contexts else '当前没有可用的群。'
+        if not argument:
+            self.private_groups.pop((bot, member), None)
+            await self.reply(event, '已清除群选择。' + options)
+        elif argument in contexts:
+            self.private_groups[bot, member] = argument
             await self.reply(event, f'已选择群 {argument}，请重新提问。')
         else:
-            self.private_groups.pop(key, None)
-            await self.reply(event, '已清除群选择。')
+            # Says nothing about that group's rules; the asker's own valid groups only.
+            await self.reply(event, '无法选择该群：须为已启用问答、你已完成身份绑定且仍在群内的群。' + options)
         return None
 
     async def on_event(self, event):
@@ -467,22 +489,8 @@ class PublicEntry:
             def guard():
                 return self.access.current(bot, decision)
 
-            def still_manager(note=''):
-                """Re-check before replying after a wait (reads have no store lock to guard them)."""
-                if not (self.qa.active and guard()):
-                    raise PermissionError('管理资格已变化，请重新发送' + note)
-
             if operation == 'list':
-                version = self.qa.version(bot, NAMESPACE)
-                rules = [r for r in await self.qa.manage(bot, NAMESPACE, 'list') if own(r)]
-                still_manager()
-                # Managing is not disclosure: the group sees public rules and only a count of restricted ones.
-                fields = ('id', 'name', 'keywords', 'mode', 'enabled')
-                public = [{k: r[k] for k in fields} for r in rules if r.get('access') != 'restricted']
-                hidden = [{k: r[k] for k in fields} for r in rules if r.get('access') == 'restricted']
-                result = {'rules': public, 'restricted': len(hidden)}
-                if hidden:
-                    result['restricted_detail'] = await self.manager_details(event, hidden, still_manager, version)
+                result = await self.delegated_list(event, own, decision)
             elif operation == 'create':
                 if 'id' in values:
                     raise ValueError('新增不接受 id')
@@ -504,29 +512,64 @@ class PublicEntry:
         await self.reply(event, content)
         return None
 
-    async def manager_details(self, event, details, still_manager, version):
-        """Restricted rule details to the delegate's verified private identity; returns the status for the group."""
+    async def delegated_list(self, event, own, decision):
+        """This group's rules for the group, read and authorized again while they change before anything is sent.
+
+        Restricted details go to the delegate's verified private identity; the
+        group only learns their count and what happened to that push. Reads
+        have no store lock to guard them, so every reply re-checks after its waits.
+        """
+        bot, group, member = event.appid, event.group_id, event.raw_user_id or event.user_id
+        for attempt in range(ATTEMPTS):
+            if attempt:
+                # Rule changes also renew the authorization inventory: decide again before re-reading.
+                decision = await self.access.delegate(bot, group, member)
+            if not (self.qa.active and decision):
+                raise PermissionError(MANAGER_CHANGED)
+            version = self.qa.version(bot, NAMESPACE)
+            rules = [r for r in await self.qa.manage(bot, NAMESPACE, 'list') if own(r)]
+            # Managing is not disclosure: the group sees public rules and only a count of restricted ones.
+            fields = ('id', 'name', 'keywords', 'mode', 'enabled')
+            public = [{k: r[k] for k in fields} for r in rules if r.get('access') != 'restricted']
+            hidden = [{k: r[k] for k in fields} for r in rules if r.get('access') == 'restricted']
+            result = {'rules': public, 'restricted': len(hidden)}
+            status = await self.manager_details(event, hidden, decision, version) if hidden else None
+            if status is STALE:
+                continue
+            # Final non-awaiting gate: the manager still qualifies and no listed title or keyword changed.
+            manager = self.qa.active and self.access.current(bot, decision)
+            if manager and self.fresh(bot, version):
+                return {**result, 'restricted_detail': status} if status else result
+            if status:
+                # The push cannot be undone; the group gets no list, only what happened to the push.
+                raise PermissionError(('规则已变化，请重新发送' if manager else MANAGER_CHANGED) + f'（受限详情：{status}）')
+        if not (self.qa.active and await self.access.delegate(bot, group, member)):
+            raise PermissionError(MANAGER_CHANGED)
+        raise PermissionError('规则正在变化，请稍后重新发送')
+
+    async def manager_details(self, event, details, decision, version):
+        """Restricted rule details to the delegate's verified private identity.
+
+        Returns the status for the group, or STALE when the manager decision or
+        the rules changed before anything was pushed.
+        """
         bot, group, member = event.appid, event.group_id, event.raw_user_id or event.user_id
         found = await self.access.manager_context(bot, group, member)
         context, sender = found['context'], self.sender(bot)
-        still_manager()
+        if not (self.qa.active and self.access.current(bot, decision) and self.fresh(bot, version)):
+            return STALE
         if context is None or sender is None:
             if found['reason'] == 'binding_missing':
                 return f'受限规则详情只私聊发送，请先私聊 Bot 发送：身份绑定 申请 {group} {member}'
             return '受限规则详情只私聊发送，暂不能私聊发送'
         if not self.access.context_current(bot, context):
-            raise PermissionError('管理资格已变化，请重新发送')
-        if not self.fresh(bot, version):
-            raise PermissionError('规则已变化，请重新发送')
+            raise PermissionError(MANAGER_CHANGED)
         state, error = await UserTarget(sender, bot, context['private_id']).text(json.dumps(details, ensure_ascii=False), msg_type=TEXT)
-        status = {
+        return {
             'sent': '已私聊发送',
             'rejected': f'私聊发送失败（平台代码 {(error or {}).get("code", "未知")}）',
             'unknown': '私聊发送结果未知，请先查看私聊',
         }[state]
-        # The push cannot be undone; the group still learns what happened to it.
-        still_manager(f'（受限详情：{status}）')
-        return status
 
     async def command(self, event, text):
         sender = self.sender(event.appid)
