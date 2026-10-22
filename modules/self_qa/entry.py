@@ -313,14 +313,7 @@ class PublicEntry:
                 return self.access.current(bot, decision)
 
             if operation == 'list':
-                rules = [r for r in await self.qa.manage(bot, NAMESPACE, 'list') if own(r)]
-                if not (self.qa.active and guard()):
-                    raise PermissionError('管理资格已变化，请重新发送')
-                # Managing is not disclosure: the group sees public rules and only a count of restricted ones.
-                result = {
-                    'rules': [{k: r[k] for k in ('id', 'name', 'keywords', 'mode', 'enabled')} for r in rules if r.get('access') != 'restricted'],
-                    'restricted': sum(r.get('access') == 'restricted' for r in rules),
-                }
+                result = await self.delegated_list(bot, own, guard)
             elif operation == 'create':
                 if 'id' in values:
                     raise ValueError('新增不接受 id')
@@ -341,6 +334,22 @@ class PublicEntry:
             content = '问答存储暂不可用'
         await self.reply(event, content)
         return None
+
+    async def delegated_list(self, bot, own, guard):
+        """This group's rules for the group, read again while rules change between the read and the reply."""
+        for _ in range(ATTEMPTS):
+            version = self.qa.version(bot, NAMESPACE)
+            rules = [r for r in await self.qa.manage(bot, NAMESPACE, 'list') if own(r)]
+            if not (self.qa.active and guard()):
+                raise PermissionError('管理资格已变化，请重新发送')
+            # Final non-awaiting gate: never list a title or keyword the rules no longer have.
+            if self.fresh(bot, version):
+                # Managing is not disclosure: the group sees public rules and only a count of restricted ones.
+                return {
+                    'rules': [{k: r[k] for k in ('id', 'name', 'keywords', 'mode', 'enabled')} for r in rules if r.get('access') != 'restricted'],
+                    'restricted': sum(r.get('access') == 'restricted' for r in rules),
+                }
+        raise PermissionError('规则正在变化，请稍后重新发送')
 
     async def command(self, event, text):
         sender = self.sender(event.appid)

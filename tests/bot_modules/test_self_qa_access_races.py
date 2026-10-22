@@ -163,3 +163,55 @@ async def test_delegated_list_rechecks_role_delegation_and_module_after_reading(
     reading(reload)
     await host.event('问答管理 ' + json.dumps({'operation': 'list'}), user='admin-a', group='group-a')
     assert host.said() == ['管理资格已变化，请重新发送']
+
+
+async def test_delegated_list_follows_rule_changes_made_after_reading(qa_host):
+    host = qa_host
+    qa = host.modules.get('self_qa')
+    original = qa.manage
+
+    def reading(body, *, times=1):
+        state = {'left': times}
+
+        async def manage(bot, namespace, operation, *args, **kwargs):
+            result = await original(bot, namespace, operation, *args, **kwargs)
+            if operation == 'list' and state['left']:
+                state['left'] -= 1
+                status, data = await host.qa(body(state['left']))
+                assert status == 200, data
+            return result
+
+        qa.manage = manage
+
+    changes = (
+        ({'access': 'restricted', 'name': '刚改为受限的标题'}, [], 2),
+        ({'enabled': False}, [{'name': '本群公开', 'enabled': False}], 1),
+        ({'groups': ['group-b']}, [], 1),
+        ({'name': '新标题', 'keywords': ['新问法']}, [{'name': '新标题', 'enabled': True}], 1),
+    )
+    for change, listed, restricted in changes:
+        _, public = await delegated(host)
+        reading(lambda _left, key=public['id'], change=change: {'operation': 'update', 'id': key, **change})
+        await host.event('问答管理 ' + json.dumps({'operation': 'list'}), user='admin-a', group='group-a')
+        qa.manage = original
+        (out,) = host.said()
+        result = json.loads(out)
+        mine = [r for r in result['rules'] if r['id'] == public['id']]
+        assert [{'name': r['name'], 'enabled': r['enabled']} for r in mine] == listed, (change, out)
+        assert '刚改为受限的标题' not in out and result['restricted'] == restricted, (change, out)
+        for row in (await host.qa())[1]['data']['rules']:
+            await host.qa({'operation': 'delete', 'id': row['id']})
+
+    # Deleted after reading: the old title is not listed.
+    _, public = await delegated(host)
+    reading(lambda _left: {'operation': 'delete', 'id': public['id']})
+    await host.event('问答管理 ' + json.dumps({'operation': 'list'}), user='admin-a', group='group-a')
+    qa.manage = original
+    (out,) = host.said()
+    assert json.loads(out) == {'rules': [], 'restricted': 1}
+
+    # Still changing after every bounded re-read: only a status, no titles.
+    reading(lambda left: {'operation': 'create', 'name': f'变化{left}', 'target': 'T', 'keywords': [f'问{left}'], 'groups': ['group-a']}, times=10)
+    await host.event('问答管理 ' + json.dumps({'operation': 'list'}), user='admin-a', group='group-a')
+    qa.manage = original
+    assert host.said() == ['规则正在变化，请稍后重新发送']
