@@ -142,11 +142,6 @@ async def test_delegated_restricted_details_go_to_verified_private_identity(qa_h
     assert host.said() == ['管理资格已变化，请重新发送'] and pushes(host) == []
 
 
-async def open_private_group(host, groups=('group-a',)):
-    status, data = await host.qa({'operation': 'private_groups', 'groups': list(groups)})
-    assert status == 200 and data['data']['private_groups'] == list(groups)
-
-
 async def test_private_chat_matches_rules_of_a_selected_verified_group(qa_host):
     host = qa_host
     await rule(host, name='全局', target='GLOBAL', keywords=['全局'])
@@ -155,28 +150,25 @@ async def test_private_chat_matches_rules_of_a_selected_verified_group(qa_host):
     # Public global answers need no binding or choice.
     await host.event('全局', user='stranger')
     assert host.said('stranger') == ['GLOBAL']
-    # Nothing selected: group rules are not matched or listed.
+    # No valid group context: group rules are not matched or listed.
     await host.event('群规', user='private-a')
     assert host.said('private-a') == []
-    # Any typed group ID needs a current verified context in a group the owner opened.
+    # A typed group ID needs a current verified context in a Q&A enabled group.
     await host.event('问答群 group-a', user='private-a')
-    host.sender.messages.clear()
+    assert host.said('private-a')[0].startswith('无法选择该群')
     await host.event('群规', user='private-a')
     assert host.said('private-a') == []
     await bind(host, 'group-a', 'member-a')
-    await host.event('群规', user='private-a')
-    assert host.said('private-a') == []
-    await open_private_group(host)
     await host.event('群规', user='private-a')
     assert host.said('private-a') == ['GROUP-A']
     # Global rules still take part, ranked as before.
     await host.event('全局', user='private-a')
     assert host.said('private-a') == ['GLOBAL']
-    # Another group's rules: not bound there, not opened, nothing.
+    # Another group's rules: not bound there, nothing.
     await host.event('问答群 group-b', user='private-a')
-    host.sender.messages.clear()
+    assert host.said('private-a')[0].startswith('无法选择该群')
     await host.event('群规', user='private-a')
-    assert host.said('private-a') == []
+    assert host.said('private-a') == ['GROUP-A']
     # Group chat scope is unchanged.
     await host.event('群规', user='member-z', group='group-b')
     assert host.said('group-b') == ['GROUP-B']
@@ -186,9 +178,6 @@ async def test_private_group_context_lost_during_wait_is_not_answered(qa_host):
     host = qa_host
     await rule(host, name='甲群', target='GROUP-A', keywords=['群规'], groups=['group-a'])
     await bind(host, 'group-a', 'member-a')
-    await open_private_group(host)
-    await host.event('问答群 group-a', user='private-a')
-    host.sender.messages.clear()
     await host.event('群规', user='private-a')
     assert host.said('private-a') == ['GROUP-A']
 
@@ -196,9 +185,19 @@ async def test_private_group_context_lost_during_wait_is_not_answered(qa_host):
         host.lifecycle('GROUP_MEMBER_REMOVE', member='member-a')
         await until(lambda: host.state.states['bot-a']['groups']['group-a']['members']['member-a'].get('status') == 'left')
 
-    restore = after(host, 'private_contexts', leave)
+    # Left after the context was resolved, while the rules were matched.
+    qa = host.modules.get('self_qa')
+    original = qa.match
+
+    async def match(*args, **kwargs):
+        qa.match = original
+        result = await original(*args, **kwargs)
+        await leave()
+        return result
+
+    qa.match = match
     await host.event('群规', user='private-a')
-    restore()
+    qa.match = original
     assert host.said('private-a') == ['资格已变化，请重新提问。']
     await until(lambda: host.state.recovery.get_status('bot-a').ready)
     await host.event('群规', user='private-a')
@@ -209,9 +208,6 @@ async def test_private_group_rules_keep_restricted_policy(qa_host):
     host = qa_host
     await restricted(host, policy=ADMINS, target='GROUP-SECRET', keywords=['群密'], groups=['group-a'])
     await bind(host, 'group-a', 'member-a')
-    await open_private_group(host)
-    await host.event('问答群 group-a', user='private-a')
-    host.sender.messages.clear()
     await host.event('群密', user='private-a')
     assert host.said('private-a') == ['GROUP-SECRET']
     await host.state.confirm_member('bot-a', 'group-a', 'member-a', evidence='demoted', member_role='member')
@@ -251,15 +247,12 @@ async def test_private_rule_button_reaches_group_rule_only_with_verified_context
     host = qa_host
     target = await rule(host, name='甲群详情', target='GROUP-DETAIL', keywords=['甲详情'], groups=['group-a'])
     await rule(host, name='入口', target='ENTRY', keywords=['入口'], buttons=[{'label': '详情', 'action': 'rule', 'value': target['id']}])
-    await bind(host, 'group-a', 'member-a')
     await host.event('入口', user='private-a')
     assert host.said('private-a')[0].startswith('ENTRY')
-    # No chosen group context: the group rule behind the button is not reachable.
+    # No group context: the group rule behind the button is not reachable.
     await host.event('问答选择 1', user='private-a')
     assert host.said('private-a') == ['该答案已失效，请重新提问。']
-    await open_private_group(host)
-    await host.event('问答群 group-a', user='private-a')
-    host.sender.messages.clear()
+    await bind(host, 'group-a', 'member-a')
     await host.event('问答选择 1', user='private-a')
     assert host.said('private-a') == ['GROUP-DETAIL']
 
