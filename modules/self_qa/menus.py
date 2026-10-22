@@ -40,12 +40,19 @@ class Menus:
         self.menus[token] = {
             **context,
             'token': token,
+            'kind': 'choices',
             'namespace': namespace,
             'text': text,
             'rules': [c['rule_id'] for c in candidates],
             'expires_at': now + TTL,
         }
         self.latest[tuple(context.values())] = token
+        return token
+
+    def issue_links(self, event, namespace, rule_ids):
+        """Session for rule buttons inside one answer: index → rule ID, nothing else."""
+        token = self.issue(event, namespace, '', [])
+        self.menus[token].update(kind='links', links=list(rule_ids))
         return token
 
     def resolve(self, event, token=None):

@@ -101,9 +101,18 @@ class AccessBridge:
             return bool(acl and acl.decision_current(bot, {**decision['evaluated'], 'allowed': True}))
         return bool(acl and acl.decision_current(bot, decision))
 
+    @staticmethod
+    def view_context(rule, group):
+        return dict(consumer=CONSUMER, function=rule_function(rule), group=group, resource=resource(rule), actions=['view'])
+
+    def report_current(self, bot, rule, group, report):
+        """Non-awaiting re-check of a ``group_view`` report for this rule and group."""
+        acl = self.module()
+        return bool(acl and acl.report_current(bot, report, **self.view_context(rule, group)))
+
     async def group_view(self, bot, rule, group):
         """Whole-group view eligibility for a restricted answer (A04 report)."""
-        context = dict(consumer=CONSUMER, function=rule_function(rule), group=group, resource=resource(rule), actions=['view'])
+        context = self.view_context(rule, group)
         try:
             acl = await self.ensure(bot)
             report = await acl.audience_report(bot, context['consumer'], context['function'], group, context['resource'], actions=context['actions'])

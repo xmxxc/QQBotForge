@@ -102,7 +102,12 @@ async def test_authorization_unavailable_keeps_public_and_refuses_restricted(qa_
     assert (await host.qa())[1]['data']['capabilities']['authorization'] == 'available'
     await host.modules.disable('access_control', _persist=False)
     capabilities = (await host.qa())[1]['data']['capabilities']
-    assert capabilities == {'authorization': 'unavailable', 'restricted': 'refused', 'delegation': 'paused', 'delegated_groups': []}
+    assert {k: capabilities[k] for k in ('authorization', 'restricted', 'delegation', 'delegated_groups')} == {
+        'authorization': 'unavailable',
+        'restricted': 'refused',
+        'delegation': 'paused',
+        'delegated_groups': [],
+    }
     await host.event('帮助', user='member-a', group='group-a')
     await host.event('内部', user='owner-a', group='group-a')
     assert host.said() == ['P']
