@@ -58,16 +58,17 @@ async def group_host(tmp_path, monkeypatch):
         async def send_to_user(self, user_id, content=None, **kwargs):
             ok, data = self.push_result
             if ok:
-                self.messages.append(('push', user_id, content))
+                media = kwargs.get('media')
+                self.messages.append(('push-image', user_id, media['file_info'][5:]) if media else ('push', user_id, content))
             return ok, data, {}
 
         async def send_to_group(self, group_id, content=None, **kwargs):
             self.messages.append(('group-push', group_id, content))
             return True, {'id': 'fake-group-push'}, {}
 
-        async def send_image(self, target_type, target_id, image, content='', **kwargs):
-            self.messages.append(('push-image', target_id, image))
-            return True, {'id': 'fake-image'}
+        async def post_json(self, endpoint, data):
+            # Media URL upload (POST .../files, srv_send_msg false): file_info names the URL.
+            return True, {'file_info': 'file:' + data['url']}
 
         async def reply(self, event, content=None, **kwargs):
             self.messages.append((event.appid, event.group_id if event.is_group else event.raw_user_id, content))
