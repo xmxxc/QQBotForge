@@ -1,3 +1,5 @@
+> 本文保留旧版账户共享的管理入口和操作说明，供迁移与排查使用。当前规划已采用群状态、授权、自助问答三个模块；模块职责、框架能力及实际接入状态以[总体规格](specs/bot-modules.md)和[当前进度](plans/account-sharing-progress.md)为准。新功能尚待实施，下文不作为新架构已完成的证据。
+
 # 账户共享
 
 交付目录为 `modules/access_control/`、`modules/self_qa/` 和 `plugins/account_sharing/`，框架源码保持原样。存储随授权模块提供，使用现有上下文数据路径，三个扩展共同复用。

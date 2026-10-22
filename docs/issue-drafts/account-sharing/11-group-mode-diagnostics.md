@@ -1,3 +1,5 @@
+> 历史票稿：2026-10-20 已由[三模块实施清单](../../plans/bot-modules-tickets.md)中的新票替代。下文保留旧验收与实现背景，不作为当前执行清单。
+
 # 11：群发失败显示逐人原因并可选自动恢复
 
 GitHub 实施票：[#13](https://github.com/xmxxc/QQBotForge/issues/13)，父规格 [#2](https://github.com/xmxxc/QQBotForge/issues/2)。

@@ -158,7 +158,13 @@ async def test_pending_commit_does_not_publish_or_overwrite_new_observations(gro
         assert not result['reliable'] and result['reason'] == 'state_changed'
         assert final['groups'][0]['source'] == 'native_event' and not final['groups'][0]['reliable']
     else:
-        assert result['reliable'] and final['version'] > during['version']
+        assert final['version'] > during['version']
+        if observed_group:
+            # G03 also gates public results while another group in this Bot is persisting.
+            assert not result['reliable'] and result['reason'] == 'persistence_pending'
+        else:
+            assert result['reliable']
+        assert final['groups'][0]['reliable']
         assert final['groups'][0]['version'] > during['groups'][0]['version']
     if observed_group == 'group-b':
         assert [group['group'] for group in final['groups']] == ['group-a', 'group-b']
@@ -255,6 +261,7 @@ async def test_late_observation_save_failure_preserves_newer_same_group_facts(gr
 
     monkeypatch.setattr(sqlite3, 'connect', test_connection)
     assert await host.modules.reload('group_state')
+    assert await host.state.rebuild('bot-a')
     database = host.modules.get_context('group_state').get_data_path('group-state.db')
     with sqlite3.connect(database) as connection:
         connection.execute("""CREATE TRIGGER fail_first_observation BEFORE INSERT ON extension_records
@@ -265,7 +272,7 @@ async def test_late_observation_save_failure_preserves_newer_same_group_facts(gr
         assert await asyncio.to_thread(entered.wait, 2)
         before = await host.state.snapshot('bot-a')
         newer = asyncio.create_task(
-            host.state.refresh('bot-a', 'group-a') if newer_action == 'refresh' else host.event('new observation', group='group-a', user='member-a')
+            host.state.refresh('bot-a', 'group-a') if newer_action == 'refresh' else host.event('new observation', group='group-a', user='member-b')
         )
         await asyncio.sleep(0)
         assert (await host.state.snapshot('bot-a'))['version'] > before['version']
@@ -445,6 +452,9 @@ async def test_cold_and_queued_reads_are_rejected_across_unload(group_host, monk
     assert current['generation'] != old.generation
     assert current['groups'][0]['group'] == 'group-a'
     assert not current['groups'][0]['reliable'] and current['groups'][0]['reason'] == 'process_restart'
+    pending = await host.state.refresh('bot-a', 'group-a')
+    assert not pending['reliable'] and pending['continuity_reason'] == 'recovery_pending'
+    assert await host.state.rebuild('bot-a')
     assert (await host.state.refresh('bot-a', 'group-a'))['reliable']
 
 
@@ -607,3 +617,47 @@ async def test_setup_failure_after_registration_releases_only_its_own_resources(
     assert await host.modules.enable('group_state', _skip_deps=True, _persist=False)
     await host.event('ordinary', group='group-a', user='member-a')
     assert (await host.state.snapshot('bot-a'))['groups'][0]['group'] == 'group-a'
+
+
+@pytest.mark.parametrize('step', ['recovery', 'connection', 'cancelled'])
+async def test_partial_connect_failure_keeps_original_error_and_releases_resources(group_host, monkeypatch, step):
+    from core.application import get_app
+    from core.module.manager import ModuleContext
+    from core.plugin import web_pages
+
+    host = group_host
+    await host.modules.disable('group_state', _persist=False)
+    acquired = {}
+    subscribe_recovery = ModuleContext.subscribe_recovery_events
+
+    def recovery(self, callback, **kwargs):
+        acquired['state'] = callback.__self__
+        if step == 'recovery':
+            raise RuntimeError('fake recovery subscribe failure')
+        acquired['recovery'] = subscribe_recovery(self, callback, **kwargs)
+        return acquired['recovery']
+
+    def connection(self, callback, **kwargs):
+        if step == 'cancelled':
+            raise asyncio.CancelledError
+        raise RuntimeError('fake connection subscribe failure')
+
+    monkeypatch.setattr(ModuleContext, 'subscribe_recovery_events', recovery)
+    monkeypatch.setattr(ModuleContext, 'subscribe_connection_status', connection)
+    if step == 'cancelled':
+        with pytest.raises(asyncio.CancelledError):
+            await host.modules.enable('group_state', _skip_deps=True, _persist=False)
+    else:
+        assert not await host.modules.enable('group_state', _skip_deps=True, _persist=False)
+        assert f'fake {step} subscribe failure' in host.modules._modules['group_state'].error
+    candidate = acquired['state']
+    assert not candidate.active and candidate.store._closed and candidate.store._connection is None
+    assert 'recovery' not in acquired or not acquired['recovery'].active
+    candidate.close()
+    await candidate.aclose()
+    hooks = get_app().hook_manager.list_hooks().get('before_event', [])
+    assert [entry for entry in hooks if entry['owner'] == '群状态'] == []
+    assert web_pages.match_route('GET', '/api/ext/group-state/') is None
+    monkeypatch.undo()
+    assert await host.modules.enable('group_state', _skip_deps=True, _persist=False)
+    assert host.state.active and host.state is not candidate

@@ -1,26 +1,45 @@
-# 账户共享实施进度
+# 三模块与账户共享实施进度
 
-- 工作树：`/opt/qqbot/QQBotForge-account-sharing`；分支：`feat/account-sharing`。
-- 起点：`3951d873d734eaed12ae150abbf3d20f80d1f999`；PR：[draft #15](https://github.com/xmxxc/QQBotForge/pull/15)。
-- 原工作区用户修改和运行实例保持原样；测试仅使用临时配置/数据库与假身份，不连接真实 QQ。
-- 补充约束：仅安装授权、自助问答两个模块和账户共享插件，框架源码不变。存储随授权模块提供，复用现有上下文路径接口。
-- 当前检查：[扩展接入检查](account-sharing-extension-boundary.md)。缺少可靠原生事件前置观察与连接连续性通知；用户已选择保留完整保证，前置优化由 [Issue #16](https://github.com/xmxxc/QQBotForge/issues/16) 跟踪，等待下一轮评审/排期，成员敏感查询暂停。
+更新：2026-10-20。当前父规格 [#18](https://github.com/xmxxc/QQBotForge/issues/18)，完整[实施清单](bot-modules-tickets.md)。实施已启动；原始工作树未提交规划与框架改动保持原样，业务及框架使用独立工作树。
 
-| Issue | 当前状态 | 证据及剩余工作 |
+## 当前基线
+
+- 扩展工作树 `/opt/qqbot/QQBotForge-account-sharing`，分支 `personal`，审计 HEAD 为 `3509cd9`。原有未提交框架、探针、项目配置和指引保留。
+- 账户业务自 `61dfff0` 后未变更，包含主人管理、授权／匹配算法、绑定、按钮、群发策略及待办；当前生产成员查询仍默认拒绝。
+- 2026-10-20 审计重跑账户业务测试：86 passed，主要使用显式模拟观察源；它不能证明新独立问答、群状态或真实接线已完成。
+- 隔离验证：只有问答目录时因导入授权存储而失败；仅补存储文件、不启用授权后可回复静态文字。B01 负责解除安装耦合。
+- 群生命周期和连接事实接口已进入本地 main，personal 另含本地恢复机制及后续修复；F01 负责核对精确版本和实际契约，G03 再接入。授权当前 setup 尚未订阅这些接口。
+
+## 交付状态
+
+| 阶段 | 新票 | 当前状态 |
 | --- | --- | --- |
-| #3 | 已完成，保留关闭 | 主人 CRUD/预览在起点框架＋三扩展独立安装测试通过；原提交 `23f8f01` |
-| #4—#10 | 重新打开，待接入验收 | 授权/绑定/匹配/按钮/范围/期限/周期算法有模拟测试；原提交 `b9391f0`、`db0685e`、`04c5585`、`a423239`、`0d62a58`、`1474ab2`、`54920dd`。不能用模拟事件证明当前框架可靠接线 |
-| #11 | 独立部分已实现，整票未完成 | 重启待核验、主人单人/批量核验、平台单人核验、完整分页名册、暂停与 Bot 移出/重入状态机及管理入口；真实连接连续性和事件接入依赖 #16 |
-| #12 | 策略与模拟验证已实现，整票未完成 | 包含本 Bot 的全员调用/查看检查、发送前复查、群发/私发路由、关键词/按钮共用；生产事件屏障依赖 #16 |
-| #13 | 管理与模拟验证已实现，整票未完成 | 逐人报告、目标/实际模式、手动/自动恢复选择、恢复通知；事件触发失效及后台检查依赖 #16 |
-| #14 | 独立管理部分已实现，整票未完成 | 按 Bot/群/成员/账户筛选待办、核验/绑定/群发处理、主人通知重试及使用说明；跨真实事件的整体流程依赖 #16 |
+| 基础兼容与框架契约 | [#19](https://github.com/xmxxc/QQBotForge/issues/19)、[#20](https://github.com/xmxxc/QQBotForge/issues/20) | 已实现与验证，票据关闭；draft PR #37、#38、#39 保持待审核 |
+| 完整群状态 | [#21](https://github.com/xmxxc/QQBotForge/issues/21)—[#23](https://github.com/xmxxc/QQBotForge/issues/23) | G01、G02 已实现／验证，票据关闭；draft PR #40、#41 保持待审核，G03 接续 |
+| 通用授权 | [#24](https://github.com/xmxxc/QQBotForge/issues/24)—[#27](https://github.com/xmxxc/QQBotForge/issues/27) | 已有算法；待群状态接入、独立管理、绑定迁移与隔离 |
+| 独立问答 | [#28](https://github.com/xmxxc/QQBotForge/issues/28)—[#32](https://github.com/xmxxc/QQBotForge/issues/32) | 已有匹配核心；待独立入口、正则、权限、委托和丰富回复 |
+| 账户组合 | [#33](https://github.com/xmxxc/QQBotForge/issues/33)—[#36](https://github.com/xmxxc/QQBotForge/issues/36) | 已有业务基础；待接口迁移和完整验收 |
 
-本轮起点：`eb54a45`，启动时工作树干净。用户于 2026-10-18 确认继续独立部分，依赖接口的票据保持未完成。本轮没有恢复旧的持续目标，也没有实施 #16。
+已有实现与新票完成是不同状态。框架提供接口、消费者接入、自动测试和真实平台许可分别报告。当前发布动作及原票关闭读回结果记录在实施清单与 GitHub 时间线。
 
-当前验证：`.venv/bin/pytest -q` 86 passed（当前仓库全部测试，含新增 29 项）；Ruff、core/web/main mypy 及 8 个扩展文件类型检查通过。安装边界测试使用起点框架和三个扩展的真实管理器；事件行为仍使用显式模拟观察源。页面脚本语法、文档链接及固定快照规范/规格审查通过。
+## 旧票与历史
 
-审查修复：框架限制变化使旧全员判断失效；默认手动恢复保留实际失效状态；功能授权组修改在 Bot 全局失效；批量核验单独记录核验结果；持续授权按当前资源目录展开待办。新增 Bot 冻结/重入、暂停及已知新成员缺失的名册保护模拟验证。框架及运行实例保持原样。
+原 #2、#4—#14、#16、#17 由新父规格及子票承接，按“规划替代”关闭；原 #3 的完成状态保留。新票不继承旧票的完成标记。[对应关系](bot-modules-tickets.md#原票承接)和[旧进度档案](../archive/account-sharing-v1/account-sharing-progress.md)可追溯。历史 PR #15 已关闭，未合并。
 
-发布记录以 PR 和 Issue 实际状态为准。#11—#14 的独立部分随本分支交付，整票继续打开；后续受支持接口可用后再完成生产接入验收。PR 保持 draft，不合并、不部署。[新增管理说明](../account-sharing-management.md)列出入口、限制和人工核查方法。
+## 后续执行
 
-真实平台、真实 Bot 部署及浏览器核查均未执行。HTTPS 推送沿用命令级 gh 凭据助手，未改全局 Git 配置。
+先推进 B01 与 F01，再按群状态、授权、问答、账户顺序交付；可用技术依赖见新清单。每票需具备可演示入口和验收证据才关闭。业务 PR 目标 personal，框架 PR 目标 main。已确认规划保存在本实施分支，GitHub 父规格完整收录目标行为和账户规则；原始工作树仍保留未提交副本。
+
+本轮未执行真实 QQ、浏览器核查、部署或生产数据迁移；现有配置、凭据、数据库、日志及运行实例保持原样。
+
+
+## 本轮实施记录
+
+- B01 #19：`0585773`，`feat/bot-modules-b01`，draft [PR #37](https://github.com/xmxxc/QQBotForge/pull/37) 目标 personal。业务 93 passed；单目录加载、静态公开回复、旧数据管理／拒绝／重启及写入失败重试通过，Ruff／存储 mypy 通过。[安装与兼容](../bot-modules-installation.md)、[上游固定提交](../research/bot-modules-reuse.md)。
+- F01 #20：框架 `460c841`，draft [PR #38](https://github.com/xmxxc/QQBotForge/pull/38) 目标 main。personal 同步 `b23572b`，draft [PR #39](https://github.com/xmxxc/QQBotForge/pull/39)；core/web 与框架提交完全一致。测试资产 `9790d7d` 从 ci-assets 独立提交，发布到 `test/module-contract-f01`。完整框架 712 passed／5 skipped，专项 271 passed／5 skipped，Python 3.13 eager 4 passed。两条生产分支均未合并。规划中的 `docs/module-recovery.md` 等框架文档随同步 PR #39 进入 personal；当前业务分支可先查阅 [F01 固定版本](https://github.com/xmxxc/QQBotForge/blob/460c841/docs/module-recovery.md)。
+- G01 #21：`75c76e8`，`feat/group-state-g01`，draft [PR #40](https://github.com/xmxxc/QQBotForge/pull/40)；临时组合框架 `b23572b` 与业务目录，通过独立 ModuleManager、实际 Application 消息入口、鉴权 HTTP 和主人命令验证。G01 业务组合 99 passed；事实历史／刷新错误、Bot 隔离、重载及在途失效均覆盖。双轴审查通过，票据已关闭。
+- G02 #22：`4498f0d`，`feat/group-state-g02`，draft [PR #41](https://github.com/xmxxc/QQBotForge/pull/41)；原始分页、角色与本 Bot 身份核验、单人事实和版本分页已完成。组合业务 118 passed，Ruff／四文件 mypy 通过；双轴复核与持久化失败／延迟、并发旧响应的先失败后通过回归均已完成。票据关闭。
+- 浏览器尝试：CUA 返回无可用浏览器（apps=[]、browsers=[]），G01 未完成浏览器核查。真实 QQ 平台许可、生产数据迁移及部署均未执行。
+- 原始工作树 `/opt/qqbot/QQBotForge-account-sharing` 的已跟踪改动已与起点二进制 diff 备份核对一致；实施文件位于 `/opt/qqbot/QQBotForge-bot-modules`。框架与同步分别位于 `QQBotForge-framework-f01`、`QQBotForge-bot-modules-framework-sync`，测试资产位于 `QQBotForge-f01-test-assets`。
+
+下一张依赖票为 G03 #23；#20、#22 原生阻塞已关闭。当前业务分支 `feat/group-state-g03` 基于 `4498f0d`，尚未开始修改 G03 代码。优先按群状态 → 授权 → 独立问答 → 账户共享推进；未完成票不继承旧验收状态。所有 PR 保持 draft，合并与部署由主人决定。

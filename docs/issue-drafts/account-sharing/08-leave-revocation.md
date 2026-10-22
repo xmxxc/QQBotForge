@@ -1,3 +1,5 @@
+> 历史票稿：2026-10-20 已由[三模块实施清单](../../plans/bot-modules-tickets.md)中的新票替代。下文保留旧验收与实现背景，不作为当前执行清单。
+
 # 08：退群撤销全部授权来源且重入不恢复
 
 GitHub 实施票：[#10](https://github.com/xmxxc/QQBotForge/issues/10)，父规格 [#2](https://github.com/xmxxc/QQBotForge/issues/2)。

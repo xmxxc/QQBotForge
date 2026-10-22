@@ -1,3 +1,5 @@
+> 历史票稿：2026-10-20 已由[三模块实施清单](../../plans/bot-modules-tickets.md)中的新票替代。下文保留旧验收与实现背景，不作为当前执行清单。
+
 # 10：全员含 Bot 合格才群发，否则提示后私发
 
 GitHub 实施票：[#12](https://github.com/xmxxc/QQBotForge/issues/12)，父规格 [#2](https://github.com/xmxxc/QQBotForge/issues/2)。
