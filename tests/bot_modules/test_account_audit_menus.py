@@ -154,3 +154,43 @@ async def test_old_page_keeps_group_binding_during_dispatch(account_host, monkey
     texts = h.texts('private-a')
     assert all('group-b-private-title' not in t for t in texts)
     assert any('已失效' in t for t in texts)
+
+
+async def test_keyword_page_single_candidate_keeps_original_group(account_host, monkeypatch):
+    h = account_host
+    rules, accounts = [], []
+    for i in range(7):
+        a = await h.create(name=f'choice-{i}')
+        accounts.append(a)
+        await grant(h, a)
+        rules.append(
+            (await h.account_api('POST', 'rules', {'name': f'choice-{i}', 'target': a['id'], 'keywords': ['choices'], 'groups': ['group-a']}))[1]['data']
+        )
+    await grant(h, accounts[0], 'member-b', 'group-b')
+    await bind(h, 'group-a', 'member-a')
+    await bind(h, 'group-b', 'member-b')
+    await h.event('账户群 group-a', user='private-a')
+    await h.event('choices', user='private-a')
+    page = button(h, '下一页')
+    for rule in rules[1:]:
+        await h.account_api('DELETE', 'rules/' + rule['id'])
+    qa = h.modules.get('self_qa')
+    service = h.plugins._plugins['account_sharing'].module._instance
+    match = qa.match
+
+    async def switching(*args, **kwargs):
+        results = await match(*args, **kwargs)
+        if getattr(kwargs.get('admit'), '__name__', '') == 'admit':
+            # After the old group was checked but before the single result dispatch.
+            from core.message.event import Event
+
+            event = Event.from_websocket('bot-a', {'t': 'C2C_MESSAGE_CREATE', 'd': {'id': 'switch', 'content': '', 'author': {'id': 'private-a'}}})
+            await service.resolve_context(event, select='group-b')
+        return results
+
+    monkeypatch.setattr(qa, 'match', switching)
+    h.sender.messages.clear()
+    await h.click(page, user='private-a')
+    texts = h.texts('private-a')
+    assert all('fake-secret' not in t for t in texts)
+    assert any('已失效' in t for t in texts)
