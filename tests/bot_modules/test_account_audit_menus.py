@@ -128,3 +128,29 @@ async def test_directory_unknown_push_reports_unknown_without_retry(account_host
     texts = h.texts('group-a')
     assert any('结果未知' in t and '身份绑定' in t for t in texts)
     assert all(a['name'] not in t and a['id'] not in t for t in texts)
+
+
+async def test_old_page_keeps_group_binding_during_dispatch(account_host, monkeypatch):
+    h = account_host
+    for i in range(7):
+        a = await h.create(name=f'group-a-title-{i}')
+        await grant(h, a)
+    b = await h.create(name='group-b-private-title')
+    await grant(h, b, 'member-b', 'group-b')
+    await bind(h, 'group-a', 'member-a')
+    await bind(h, 'group-b', 'member-b')
+    await h.event('账户群 group-a', user='private-a')
+    old_page = button(h, '下一页')
+    h.sender.messages.clear()
+    service = h.plugins._plugins['account_sharing'].module._instance
+    original = service.directory
+
+    async def directory(event, **kwargs):
+        await service.resolve_context(event, select='group-b')
+        return await original(event, **kwargs)
+
+    monkeypatch.setattr(service, 'directory', directory)
+    await h.click(old_page, user='private-a')
+    texts = h.texts('private-a')
+    assert all('group-b-private-title' not in t for t in texts)
+    assert any('已失效' in t for t in texts)

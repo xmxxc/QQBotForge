@@ -588,7 +588,8 @@ class AccountSharing:
             return
         await self.present_menu(event, {'menu': 'groups', 'candidates': [c['group'] for c in candidates]}, items, page=page, title='请选择授权群')
 
-    async def keyword_query(self, event, *, text=None, page=0):
+    async def keyword_query(self, event, *, text=None, page=0, expected_context=None):
+        selection_version = self.context_versions.get((event.appid, event.raw_user_id), 0)
         module = self.qa_provider()
         if module is None or not module.active:
             return
@@ -603,6 +604,9 @@ class AccountSharing:
         if not await module.match(event.appid, FUNCTION, match_text, group=event.group_id if event.is_group else None, admit=live_rule):
             return
         context = await self.resolve_context(event)
+        if expected_context and context and any(context.get(k) != expected_context.get(k) for k in ('group', 'member')):
+            await self.safe_reply(event, '菜单已失效，请重新发送：账户列表')
+            return
         if not context:
             await self.deny(event)
             return
@@ -646,16 +650,27 @@ class AccountSharing:
             ]
             await self.present_menu(
                 event,
-                {**context, 'menu': 'candidates', 'keyword': match_text, 'inventory': inventory, 'rules_version': rules_version},
+                {
+                    **context,
+                    'menu': 'candidates',
+                    'keyword': match_text,
+                    'selection_version': selection_version,
+                    'inventory': inventory,
+                    'rules_version': rules_version,
+                },
                 items,
                 page=page,
                 title='请选择有权候选',
             )
 
-    async def directory(self, event, *, page=0):
+    async def directory(self, event, *, page=0, expected_context=None):
+        selection_version = self.context_versions.get((event.appid, event.raw_user_id), 0)
         inventory = self.inventory_version.get(event.appid, 0)
         rules_version = self.qa().version(event.appid, FUNCTION)
         context = await self.resolve_context(event)
+        if expected_context and context and any(context.get(k) != expected_context.get(k) for k in ('group', 'member')):
+            await self.safe_reply(event, '菜单已失效，请重新发送：账户列表')
+            return
         if not context:
             await self.deny(event)
             return
@@ -668,10 +683,16 @@ class AccountSharing:
         if not visible:
             await self.deny(event)
             return
-        await self.present_menu(event, {**context, 'menu': 'accounts', 'inventory': inventory, 'rules_version': rules_version}, visible, page=page)
+        await self.present_menu(
+            event,
+            {**context, 'menu': 'accounts', 'selection_version': selection_version, 'inventory': inventory, 'rules_version': rules_version},
+            visible,
+            page=page,
+        )
 
     async def present_menu(self, event, context, items, *, page=0, title='账户列表'):
         bot = event.appid
+        selection_version = context.get('selection_version', self.context_versions.get((bot, event.raw_user_id), 0))
         acl = await self.ensure(bot)
         inventory = context.get('inventory', self.inventory_version.get(bot, 0))
         qa = self.qa()
@@ -739,6 +760,7 @@ class AccountSharing:
                 and self.access_provider() is acl
                 and qa.active
                 and self.qa_provider() is qa
+                and selection_version == self.context_versions.get((bot, event.raw_user_id), 0)
                 and inventory == self.inventory_version.get(bot, 0)
                 and rules_version == qa.version(bot, FUNCTION)
                 and bool(contexts)
@@ -898,11 +920,11 @@ class AccountSharing:
                     await self.deny(event)
             elif action['kind'] == 'page':
                 if context['menu'] == 'candidates':
-                    await self.keyword_query(event, text=context['keyword'], page=action['page'])
+                    await self.keyword_query(event, text=context['keyword'], page=action['page'], expected_context=context)
                 elif context['menu'] == 'groups':
                     await self.resolve_context(event, page=action['page'])
                 else:
-                    await self.directory(event, page=action['page'])
+                    await self.directory(event, page=action['page'], expected_context=context)
         except PermissionError:
             await self.deny(event)
         except (BusinessError, RuntimeError, sqlite3.Error, OSError):
