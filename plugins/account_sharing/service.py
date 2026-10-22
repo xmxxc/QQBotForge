@@ -498,6 +498,7 @@ class AccountSharing:
             return result
 
     async def tasks(self, bot, filters=None):
+        """Owner to-dos across modules; each names the page or command that resolves it."""
         filters = filters or {}
         if (
             not isinstance(filters, dict)
@@ -509,23 +510,36 @@ class AccountSharing:
         snapshot = await acl.access_snapshot(bot, CONSUMER)
         identities = await acl.binding_snapshot(bot)
         bound = {(b['group'], b['member']) for b in identities['bindings']}
+        facts = acl.group_state()
         tasks = []
         for grant in snapshot['grants']:
             base = {'group': grant['group'], 'member': grant['member'], 'resources': grant['resources'], 'source': grant['id']}
             if grant['cycle'].startswith('legacy:'):
-                tasks.append({**base, 'type': 'legacy_adoption', 'action': '在群状态核验成员后“恢复来源”'})
+                tasks.append(
+                    {
+                        **base,
+                        'type': 'legacy_adoption',
+                        'entry': 'group-state → account-sharing',
+                        'action': f'群状态核验成员后：账户管理 恢复来源 {{"group":"{grant["group"]}","member":"{grant["member"]}"}}',
+                    }
+                )
                 continue
+            fact = await facts.fact(bot, grant['group'], grant['member']) if facts else None
+            if not fact or not fact['usable'] or (fact['member'] or {}).get('status') != 'present':
+                tasks.append(
+                    {**base, 'type': 'verification', 'entry': 'group-state', 'action': f'群状态 核验 {grant["group"]} {grant["member"]}（或后台“群状态”）'}
+                )
             if (grant['group'], grant['member']) not in bound:
-                tasks.append({**base, 'type': 'binding', 'action': '成员申请身份绑定后由主人在授权管理确认'})
+                tasks.append({**base, 'type': 'binding', 'entry': 'access-control', 'action': '成员私聊“身份绑定 申请”后在“授权管理”确认'})
         for request in identities['requests']:
             if request['status'] == 'pending':
-                tasks.append({**request, 'type': 'binding_request', 'action': '在授权管理确认或拒绝身份绑定'})
+                tasks.append({**request, 'type': 'binding_request', 'entry': 'access-control', 'action': '在“授权管理”确认或拒绝身份绑定'})
         for mode in await self.group_delivery.list(bot):
             if mode['desired'] == 'group' and mode['actual'] != 'group':
-                tasks.append({**mode, 'type': 'group_delivery', 'action': '查看逐人原因并重新检查'})
+                tasks.append({**mode, 'type': 'group_delivery', 'entry': 'account-sharing', 'action': '查看逐人原因后重新开启群发'})
         for result in await self.store.all(bot, 'operations'):
             if result.get('notification') in {'failed', 'unavailable', 'pending'}:
-                tasks.append({**result, 'type': 'notification', 'operation_id': result['id'], 'action': '重试主人通知'})
+                tasks.append({**result, 'type': 'notification', 'operation_id': result['id'], 'entry': 'account-sharing', 'action': '重试主人通知'})
         return [
             t
             for t in tasks
