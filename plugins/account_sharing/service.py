@@ -575,32 +575,57 @@ class AccountSharing:
             return False
         return bool(rule and rule['enabled'] and rule.get('revision', 0) == revision)
 
-    async def resolve_context(self, event, *, select='', page=0):
+    async def account_contexts(self, bot, private_id, *, resource=''):
+        """One current resource-view context per group that can actually query an account."""
+        acl = await self.ensure(bot)
+        inventory = self.inventory_version.get(bot, 0)
+        candidates = []
+        for account in await self.accounts(bot):
+            if not account['enabled'] or resource and account['id'] != resource:
+                continue
+            found = await acl.private_contexts(bot, CONSUMER, FUNCTION, private_id, resource=account['id'], action='view')
+            for context in found['candidates']:
+                # A view decision includes the required invocation grant as well.
+                if context['decision']['reason'] == 'explicit':
+                    candidates.append(context)
+        if not self.active or self.access_provider() is not acl or inventory != self.inventory_version.get(bot, 0):
+            return []
+        current = {}
+        for context in candidates:
+            if acl.context_current(bot, context):
+                current.setdefault(context['group'], context)
+        return list(current.values())
+
+    async def resolve_context(self, event, *, select='', page=0, resource=''):
         """Group: the asker's native member identity. Private: an authorization-verified group context."""
         if event.is_channel or not (event.is_group or event.is_direct):
             return None
         if event.is_group:
             return {'group': event.group_id, 'member': event.raw_user_id}
-        acl = await self.ensure(event.appid)
         chosen = select or ((await self.store.get(event.appid, 'contexts', event.raw_user_id)) or {}).get('group', '')
-        found = await acl.private_contexts(event.appid, CONSUMER, FUNCTION, event.raw_user_id, group=chosen, action='invoke')
-        if found['selected']:
+        candidates = await self.account_contexts(event.appid, event.raw_user_id, resource=resource)
+        selected = next((c for c in candidates if c['group'] == chosen), None)
+        if not selected and not select and len(candidates) == 1:
+            selected = candidates[0]
+        if selected:
             if select:
                 key = (event.appid, event.raw_user_id)
                 self.context_versions[key] = self.context_versions.get(key, 0) + 1
                 await self.store.put(event.appid, 'contexts', event.raw_user_id, {'group': select})
-            return {'group': found['selected']['group'], 'member': found['selected']['member'], 'private': True}
-        if found['reason'] == 'choose_group' and not select:
-            await self.show_groups(event, found['candidates'], page=page)
+            return {'group': selected['group'], 'member': selected['member'], 'private': True}
+        if candidates and not select:
+            await self.show_groups(event, candidates, page=page, resource=resource)
             return {'selection_required': True}
         return None
 
-    async def show_groups(self, event, candidates, page=0):
+    async def show_groups(self, event, candidates, page=0, *, resource=''):
         items = [(c['group'], {'kind': 'group', 'group': c['group']}) for c in candidates]
         if not items:
             await self.deny(event)
             return
-        await self.present_menu(event, {'menu': 'groups', 'candidates': [c['group'] for c in candidates]}, items, page=page, title='请选择授权群')
+        await self.present_menu(
+            event, {'menu': 'groups', 'candidates': [c['group'] for c in candidates], 'resource': resource}, items, page=page, title='请选择授权群'
+        )
 
     async def keyword_query(self, event, *, text=None, page=0, expected_context=None):
         selection_version = self.context_versions.get((event.appid, event.raw_user_id), 0)
@@ -750,8 +775,7 @@ class AccountSharing:
         # Refresh after menu persistence and all identity lookups. The synchronous
         # gate below checks every decision after the last preparatory await.
         if context['menu'] == 'groups':
-            found = await acl.private_contexts(bot, CONSUMER, FUNCTION, event.raw_user_id, action='invoke')
-            contexts = found['candidates']
+            contexts = await self.account_contexts(bot, event.raw_user_id, resource=context.get('resource', ''))
             if [c['group'] for c in contexts] != context['candidates']:
                 await self.safe_reply(event, '菜单已失效，请重新发送：账户列表')
                 return
@@ -810,7 +834,7 @@ class AccountSharing:
 
     async def query(self, event, resource, *, rule_id=None, expected_context=None, via_rule=None):
         context_version = self.context_versions.get((event.appid, event.raw_user_id), 0)
-        context = await self.resolve_context(event)
+        context = await self.resolve_context(event, resource=resource)
         if expected_context and context and any(context.get(k) != expected_context.get(k) for k in ('group', 'member')):
             await self.safe_reply(event, '菜单已失效，请重新发送：账户列表')
             return
@@ -929,7 +953,7 @@ class AccountSharing:
             elif action['kind'] == 'reply':
                 await self.query(event, '', rule_id=action['rule'], expected_context=context, via_rule=via)
             elif action['kind'] == 'group':
-                if await self.resolve_context(event, select=action['group']):
+                if await self.resolve_context(event, select=action['group'], resource=context.get('resource', '')):
                     await self.directory(event)
                 else:
                     await self.deny(event)
@@ -937,7 +961,7 @@ class AccountSharing:
                 if context['menu'] == 'candidates':
                     await self.keyword_query(event, text=context['keyword'], page=action['page'], expected_context=context)
                 elif context['menu'] == 'groups':
-                    await self.resolve_context(event, page=action['page'])
+                    await self.resolve_context(event, page=action['page'], resource=context.get('resource', ''))
                 else:
                     await self.directory(event, page=action['page'], expected_context=context)
         except PermissionError:
