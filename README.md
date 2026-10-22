@@ -141,6 +141,8 @@ QQBotForge/
 
 Start with the [plugin development guide](docs/plugin-development.md) (currently in Chinese). It covers layout, metadata, configuration, lifecycle hooks, events, message APIs, group management and panel extensions.
 
+The [Markdown image material API](docs/plugin-development.md#511-markdown-图片素材) uploads local files or image bytes and returns a `qqbot-media://` reference. At the 100-image limit it deletes the oldest uploaded image before uploading a new one.
+
 Create `plugins/hello/main.py`:
 
 ```python
