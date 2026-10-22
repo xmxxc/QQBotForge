@@ -140,16 +140,23 @@ class PublicEntry:
     async def current(self, event, menu):
         return await self.matched(event, menu['text'])
 
-    async def deliver(self, event, candidate, admitted):
+    async def deliver(self, event, candidate, admitted, version):
+        """Send one matched answer; STALE when its rules changed during the waits (nothing sent)."""
         rule, decision = admitted[candidate['rule_id']]
         if rule.get('access') == 'restricted' and event.is_group and await self.access.group_view(event.appid, rule, event.group_id) is None:
+            if not self.fresh(event.appid, version):
+                return STALE
             # Only send restricted content to a group whose every member may view it.
             await self.reply(event, f'「{candidate["name"]}」仅限有权成员查看，不能在本群公开发送。')
-            return
+            return None
+        # Final gate after every wait: rule version, then the asker's decision.
+        if not self.fresh(event.appid, version):
+            return STALE
         if not self.access.current(event.appid, decision):
             await self.reply(event, '资格已变化，请重新提问。')
-            return
+            return None
         await self.reply(event, candidate['target'])
+        return None
 
     async def on_event(self, event):
         text = (event.content or '').strip()
@@ -173,9 +180,8 @@ class PublicEntry:
                 if not self.fresh(bot, version):
                     return STALE
                 if len(candidates) == 1:
-                    await self.deliver(event, candidates[0], admitted)
-                else:
-                    await self.offer(event, self.menus.issue(event, NAMESPACE, text, candidates), candidates, 0, version)
+                    return await self.deliver(event, candidates[0], admitted, version)
+                await self.offer(event, self.menus.issue(event, NAMESPACE, text, candidates), candidates, 0, version)
                 return None
 
             return await self.resolved(event, answer)
@@ -235,8 +241,7 @@ class PublicEntry:
             if chosen is None:
                 await self.reply(event, '该答案已失效，请重新提问。')
                 return None
-            await self.deliver(event, chosen, admitted)
-            return None
+            return await self.deliver(event, chosen, admitted, version)
 
         await self.resolved(event, answer)
 
@@ -308,7 +313,14 @@ class PublicEntry:
                 return self.access.current(bot, decision)
 
             if operation == 'list':
-                result = [{k: r[k] for k in ('id', 'name', 'keywords', 'mode', 'enabled')} for r in await self.qa.manage(bot, NAMESPACE, 'list') if own(r)]
+                rules = [r for r in await self.qa.manage(bot, NAMESPACE, 'list') if own(r)]
+                if not (self.qa.active and guard()):
+                    raise PermissionError('管理资格已变化，请重新发送')
+                # Managing is not disclosure: the group sees public rules and only a count of restricted ones.
+                result = {
+                    'rules': [{k: r[k] for k in ('id', 'name', 'keywords', 'mode', 'enabled')} for r in rules if r.get('access') != 'restricted'],
+                    'restricted': sum(r.get('access') == 'restricted' for r in rules),
+                }
             elif operation == 'create':
                 if 'id' in values:
                     raise ValueError('新增不接受 id')
