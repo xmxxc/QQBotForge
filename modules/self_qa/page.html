@@ -2,6 +2,7 @@
 <h2>自助问答</h2>
 <p>公开问答只在下方启用的群或私聊中回复，无需个人授权；框架黑名单、维护模式和非 @ 群消息设置照常生效。默认不启用任何群和私聊。未命中的消息不回应。</p>
 <p><label>Bot <select id="qa-bot"></select></label> <button id="qa-load">查看范围与规则</button></p>
+<p id="qa-capabilities" role="status">受限规则与委托状态：点击“查看范围与规则”后显示。</p>
 <h3>启用范围</h3>
 <p><label>启用的群原生ID（每行一个）<textarea id="qa-groups" rows="3" style="width:100%"></textarea></label></p>
 <p><label><input type="checkbox" id="qa-private">启用私聊</label> <button id="qa-settings">保存启用范围</button></p>
@@ -9,16 +10,20 @@
 <p><label>规则ID（修改／删除时填写） <input id="qa-id" maxlength="64"></label> <label>名称 <input id="qa-name" maxlength="200"></label></p>
 <p><label>关键词（每行一个；行首加 # 表示停用该关键词）<textarea id="qa-keywords" rows="3" style="width:100%"></textarea></label></p>
 <p><label>回复文字 <textarea id="qa-target" rows="3" style="width:100%" maxlength="4000"></textarea></label></p>
-<p><label>匹配 <select id="qa-mode"><option value="exact">精确</option><option value="contains">包含</option><option value="regex">正则</option></select></label> <label>优先级（空为默认） <input id="qa-priority" type="number" min="-100000" max="100000" style="width:7rem"></label> <label>适用群（逗号分隔，空为全局） <input id="qa-rule-groups" maxlength="4000"></label> <label><input type="checkbox" id="qa-enabled" checked>启用规则</label></p>
+<p><label>匹配 <select id="qa-mode"><option value="exact">精确</option><option value="contains">包含</option><option value="regex">正则</option></select></label> <label>优先级（空为默认） <input id="qa-priority" type="number" min="-100000" max="100000" style="width:7rem"></label> <label>适用群（逗号分隔，空为全局） <input id="qa-rule-groups" maxlength="4000"></label> <label><input type="checkbox" id="qa-enabled" checked>启用规则</label> <label>访问 <select id="qa-access"><option value="public">公开</option><option value="restricted">受限（授权模块决定）</option></select></label></p>
 <p><button id="qa-create">新增规则</button> <button id="qa-update">修改规则</button> <button id="qa-delete">删除规则</button></p>
 <p>排序：精确优先于包含，包含优先于正则；同类按优先级，包含未设优先级时较长关键词优先。正则保存时校验，无效时保留原规则；每条消息的正则匹配有时间上限，超时视为未命中，不影响其他 Bot。并列最佳答案会给提问者按钮和“问答选择 序号”文字选择。</p>
+<h3>受限规则与群委托（需要授权模块）</h3>
+<p>受限规则在“授权管理”中以消费方 <code>self_qa</code>、资源 <code>rule-规则ID</code> 管理名单、角色与授权；默认功能 <code>answer</code> 为明确授权且未启用任何群。受限答案只在全群都可查看时于群内发送，否则仅提示。公开规则只受明确拒绝影响。授权模块不可用时受限规则拒绝、公开规则照常。</p>
+<p><label>单独策略 JSON（null 为继承 answer） <input id="qa-rule-policy" maxlength="4000" placeholder='{"kind":"role","groups":["群ID"],"roles":["admin"]}'></label> <button id="qa-rule-policy-save">设置所填规则ID的单独策略</button></p>
+<p><label>开放委托的群原生ID（每行一个；当前群主／管理员可在本群用“问答管理”命令管理本群规则）<textarea id="qa-delegate" rows="2" style="width:100%"></textarea></label> <button id="qa-delegate-save">保存委托范围</button></p>
 <h3>测试</h3>
 <p><label>测试消息 <input id="qa-test-text" maxlength="2000"></label> <label>群原生ID（空为私聊） <input id="qa-test-group" maxlength="256"></label> <button id="qa-test">测试匹配</button></p>
 <p id="qa-status" role="status"></p><pre id="qa-output" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
 <script>
 (()=>{
  const el=id=>document.getElementById('qa-'+id), value=id=>el(id).value.trim(), lines=id=>el(id).value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
- function rule(){return {priority:value('priority')===''?null:Number(value('priority')),name:value('name'),target:value('target'),mode:value('mode'),enabled:el('enabled').checked,groups:value('rule-groups').split(',').map(s=>s.trim()).filter(Boolean),keywords:lines('keywords').map(k=>k.startsWith('#')?{text:k.slice(1).trim(),enabled:false}:k)};}
+ function rule(){return {access:value('access'),priority:value('priority')===''?null:Number(value('priority')),name:value('name'),target:value('target'),mode:value('mode'),enabled:el('enabled').checked,groups:value('rule-groups').split(',').map(s=>s.trim()).filter(Boolean),keywords:lines('keywords').map(k=>k.startsWith('#')?{text:k.slice(1).trim(),enabled:false}:k)};}
  async function run(operation){
   el('status').textContent='处理中…';
   try{
@@ -28,13 +33,15 @@
    if(operation==='update')body={operation,id:value('id'),...rule()};
    if(operation==='delete')body={operation,id:value('id')};
    if(operation==='test')body={operation,text:el('test-text').value,group:value('test-group')};
+   if(operation==='rule_policy')body={operation,id:value('id'),policy:JSON.parse(value('rule-policy')||'null')};
+   if(operation==='delegate')body={operation,groups:lines('delegate')};
    const response=await fetch('/api/ext/self-qa/?'+new URLSearchParams({bot:value('bot')}),{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
    const data=await response.json();if(!response.ok||!data.success)throw Error(data.error||'处理失败');
-   if(operation==='list'){el('groups').value=data.data.settings.groups.join('\n');el('private').checked=data.data.settings.private;}
+   if(operation==='list'){el('groups').value=data.data.settings.groups.join('\n');el('private').checked=data.data.settings.private;const c=data.data.capabilities;el('delegate').value=c.delegated_groups.join('\n');el('capabilities').textContent=c.authorization==='available'?'授权模块可用：受限规则由授权决定；委托给当前群主／管理员':'授权模块不可用：受限规则拒绝回答、委托暂停；公开问答照常';}
    el('output').textContent=JSON.stringify(data.data,null,2);el('status').textContent='已处理';
   }catch(error){el('status').textContent=error.message;el('output').textContent='';}
  }
- for(const [button,operation] of Object.entries({load:'list',settings:'settings',create:'create',update:'update',delete:'delete',test:'test'}))el(button).onclick=()=>run(operation);
+ for(const [button,operation] of Object.entries({load:'list',settings:'settings',create:'create',update:'update',delete:'delete',test:'test','rule-policy-save':'rule_policy','delegate-save':'delegate'}))el(button).onclick=()=>run(operation);
  fetch('/api/bots',{credentials:'same-origin'}).then(r=>r.json()).then(data=>{for(const row of data.data?.bots||data.bots||[]){const option=document.createElement('option');option.value=row.appid;option.textContent=(row.name||row.appid)+' ('+row.appid+')';el('bot').append(option);}}).catch(()=>{el('status').textContent='无法读取Bot，请检查登录状态';});
 })();
 </script></section>
