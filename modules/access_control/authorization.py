@@ -736,6 +736,10 @@ class Authorization(AccessControl):
         """Final non-awaiting gate; pass the context of the send actually being made."""
         return self.audience.current(bot, report, consumer=consumer, function=function, group=group, resource=resource, actions=actions)
 
+    def report_facts_current(self, bot, report, *, consumer, function, group, resource, actions):
+        """Only the group-fact part of a report (roster, members, roles, recovery) is unchanged."""
+        return self.audience.facts_current(bot, report, consumer=consumer, function=function, group=group, resource=resource, actions=actions)
+
     def member_current(self, bot, report, member, *, consumer, function, group, resource, actions):
         return self.audience.member_current(bot, report, member, consumer=consumer, function=function, group=group, resource=resource, actions=actions)
 
