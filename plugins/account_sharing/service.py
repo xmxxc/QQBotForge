@@ -654,6 +654,7 @@ class AccountSharing:
                 match['target'] if match['kind'] == 'resource' else '',
                 rule_id=match['rule_id'] if match['kind'] == 'text' else None,
                 via_rule=(match['rule_id'], match['revision']),
+                expected_context=context,
             )
         else:
             items = [
