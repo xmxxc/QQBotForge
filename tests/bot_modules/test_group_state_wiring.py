@@ -331,18 +331,18 @@ def owners(host, bot):
     return host.registry.get(bot).bot_generation, host.status(bot, 'webhook').context.bot_generation, host.status(bot).context.bot_generation
 
 
-async def overlapping_credential_sync(host, bot, secret):
+async def overlapping_credential_sync(host, bot, secret, *, last='first'):
     """One bot.yaml change seen by two BotRegistry._sync runs (e.g. the file watcher and a web toggle) while the
-    first new BotInstance starts slowly: the instance that finishes start() last owns the registry slot and the WS
-    source, the one constructed last owns the HTTP callback source."""
-    platform, hold, calls = host.platforms[bot], asyncio.Event(), []
+    new BotInstances start slowly. The instance that finishes start() last owns the registry slot and the WS
+    source, the one constructed last owns the HTTP callback source. last='first': the first-constructed instance
+    finishes last (split); last='second': the second one does (one owner, the other is orphaned)."""
+    platform, gates, calls = host.platforms[bot], [asyncio.Event(), asyncio.Event()], []
     real_get = platform.get
 
     async def get(url, **kwargs):
         if url.endswith('/users/@me'):
             calls.append(url)
-            if len(calls) == 1:
-                await hold.wait()
+            await gates[len(calls) - 1].wait()
         return await real_get(url, **kwargs)
 
     platform.get = get
@@ -350,10 +350,12 @@ async def overlapping_credential_sync(host, bot, secret):
     extra = host.gateways[bot].add()  # the second new WSClient also connects
     first = asyncio.create_task(host.registry._sync())
     await until(lambda: len(calls) == 1)  # the first new instance is constructed and held inside start()
-    await host.registry._sync()  # the second instance starts unheld and takes the registry slot first
-    assert len(calls) == 2 and not first.done()
-    hold.set()
-    await first
+    second = asyncio.create_task(host.registry._sync())
+    await until(lambda: len(calls) == 2)
+    steps = [(gates[0], first), (gates[1], second)]
+    for gate, task in reversed(steps) if last == 'first' else steps:
+        gate.set()
+        await task
     platform.get = real_get
     return extra
 
@@ -437,6 +439,23 @@ def test_unknown_source_identities_never_match():
     assert not GroupState._same_instance(status('webhook', 'runtime', ''), status('websocket', 'runtime', ''))
     assert not GroupState._same_instance(webhook, replace(websocket, context=replace(websocket.context, runtime_id='other-runtime')))
     assert not GroupState._same_instance(webhook, replace(websocket, context=replace(websocket.context, bot_generation='other')))
+
+
+async def test_overlapping_sync_with_one_owner_stays_usable(wired):
+    await wired.load_module()
+    await wired.start_bots()
+    proof_a, proof_b = await trusted(wired, *BOTS)
+    # The later-constructed instance also finishes last: it owns the registry slot and both sources; the
+    # earlier one is orphaned with superseded sources and is never served callbacks.
+    extra = await overlapping_credential_sync(wired, 'bot-a', 'fake-secret-bot-a-2', last='second')
+    serving, webhook_owner, ws_owner = owners(wired, 'bot-a')
+    assert serving == webhook_owner == ws_owner
+    assert not wired.state.fact_current(proof_a)
+    await wired.ready_ws('bot-a', extra, session='session-a-2')
+    (proof_a,) = await trusted(wired, 'bot-a')
+    await wired.post_webhook('bot-a', 9, lifecycle=False)  # counted by the serving instance: fails closed
+    assert not wired.state.fact_current(proof_a)
+    assert wired.state.fact_current(proof_b)
 
 
 async def test_non_overlapping_hot_updates_stay_usable(wired):
