@@ -7,6 +7,8 @@ module is enabled, Q&A registers as consumer ``self_qa``:
 - ``answer``: default policy of restricted rules (explicit, no groups enabled).
 - ``rule-<id>-policy``: optional per-rule policy chosen by the owner.
 - ``manage``: delegation; role owner/admin in the groups the owner opened.
+- ``private-group``: group members whose rules a verified private identity may
+  use in private chat, in the groups the owner opened (none by default).
 
 Restricted rules are resources ``rule-<id>``. Without authorization, public
 rules keep answering and restricted rules and delegation are refused.
@@ -20,6 +22,7 @@ BASE = {
     'public': {'kind': 'public', 'groups': [], 'private': False},
     'answer': {'kind': 'explicit', 'groups': [], 'private': False},
     'manage': {'kind': 'role', 'groups': [], 'roles': ['owner', 'admin'], 'private': False},
+    'private-group': {'kind': 'group', 'groups': [], 'private': True},
 }
 FAILURES = (RuntimeError, ValueError, KeyError, sqlite3.Error, OSError)
 
@@ -64,12 +67,13 @@ class AccessBridge:
             acl = await self.ensure(bot)
             snapshot = await acl.access_snapshot(bot, CONSUMER)
         except FAILURES:
-            return {'authorization': 'unavailable', 'restricted': 'refused', 'delegation': 'paused', 'delegated_groups': []}
+            return {'authorization': 'unavailable', 'restricted': 'refused', 'delegation': 'paused', 'delegated_groups': [], 'private_groups': []}
         return {
             'authorization': 'available',
             'restricted': 'authorization',
             'delegation': 'role_owner_admin',
             'delegated_groups': snapshot['functions']['manage']['groups'],
+            'private_groups': snapshot['functions']['private-group']['groups'],
         }
 
     async def admit(self, bot, rule, group, member, *, private_group=''):
@@ -88,7 +92,9 @@ class AccessBridge:
                 decision = await acl.evaluate(bot, CONSUMER, 'public', group, member)
             except FAILURES:
                 return {'allowed': True, 'reason': 'public'}
-            return None if decision['reason'] in {'denied', 'framework_denied'} else {'allowed': True, 'reason': 'public'}
+            if decision['reason'] in {'denied', 'framework_denied'}:
+                return None
+            return {'allowed': True, 'reason': 'public', 'evaluated': decision}
         try:
             acl = await self.ensure(bot)
             if not group:
@@ -104,9 +110,15 @@ class AccessBridge:
         return decision if decision['allowed'] else None
 
     def current(self, bot, decision):
-        if decision.get('reason') == 'public' and 'consumer' not in decision:
-            return True
         acl = self.module()
+        if 'scope' in decision and not (acl and acl.context_current(bot, decision['scope'])):
+            # A group rule answered in private chat also needs its group context to stay current.
+            return False
+        if decision.get('reason') == 'public' and 'consumer' not in decision:
+            if 'evaluated' not in decision:
+                return True
+            # Not a grant: only that the public evaluation (denies, policy, generation) is still current.
+            return bool(acl and acl.decision_current(bot, {**decision['evaluated'], 'allowed': True}))
         if acl is None:
             return False
         return bool(acl.context_current(bot, decision['context']) if 'context' in decision else acl.decision_current(bot, decision))
@@ -119,13 +131,40 @@ class AccessBridge:
         except FAILURES:
             return {'context': None, 'reason': 'authorization_unavailable'}
 
+    async def chosen_group_context(self, bot, private_id, group):
+        """The asker's current verified context in ``group`` for private chat, or None."""
+        try:
+            acl = await self.ensure(bot)
+            found = await acl.private_contexts(bot, CONSUMER, 'private-group', private_id, group=group)
+        except FAILURES:
+            return None
+        selected = found['selected']
+        return selected if selected and selected['group'] == group else None
+
+    async def manager_context(self, bot, group, member):
+        """A delegated manager's verified private identity, for details not shown to the group."""
+        try:
+            acl = await self.ensure(bot)
+            return await acl.member_context(bot, CONSUMER, 'manage', group, member, action='invoke')
+        except FAILURES:
+            return {'context': None, 'reason': 'authorization_unavailable'}
+
     def context_current(self, bot, context):
         acl = self.module()
         return bool(acl and acl.context_current(bot, context))
 
+    @staticmethod
+    def view_context(rule, group):
+        return dict(consumer=CONSUMER, function=rule_function(rule), group=group, resource=resource(rule), actions=['view'])
+
+    def report_current(self, bot, rule, group, report):
+        """Non-awaiting re-check of a ``group_view`` report for this rule and group."""
+        acl = self.module()
+        return bool(acl and acl.report_current(bot, report, **self.view_context(rule, group)))
+
     async def group_view(self, bot, rule, group):
         """Whole-group view eligibility for a restricted answer (A04 report)."""
-        context = dict(consumer=CONSUMER, function=rule_function(rule), group=group, resource=resource(rule), actions=['view'])
+        context = self.view_context(rule, group)
         try:
             acl = await self.ensure(bot)
             report = await acl.audience_report(bot, context['consumer'], context['function'], group, context['resource'], actions=context['actions'])
@@ -146,6 +185,11 @@ class AccessBridge:
         acl = await self.ensure(bot)
         await acl.manage_access(bot, CONSUMER, 'policy', function='manage', policy={**BASE['manage'], 'groups': groups})
         return (await self.status(bot))['delegated_groups']
+
+    async def set_private_groups(self, bot, groups):
+        acl = await self.ensure(bot)
+        await acl.manage_access(bot, CONSUMER, 'policy', function='private-group', policy={**BASE['private-group'], 'groups': groups})
+        return (await self.status(bot))['private_groups']
 
     async def set_rule_policy(self, bot, rule, policy):
         """Give one restricted rule its own authorization policy (or None to inherit ``answer``)."""
