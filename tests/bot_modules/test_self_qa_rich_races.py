@@ -36,6 +36,15 @@ async def test_rule_changed_after_the_text_part_stops_the_image(qa_host):
         await host.api({'operation': 'update', 'id': created['id'], 'enabled': True, 'image': 'https://example.com/guide.png', 'groups': []})
 
 
+async def test_rule_changed_during_the_image_upload_is_not_posted(qa_host):
+    host = qa_host
+    created, _ = await guide(host)
+    once_after(host, 'upload', {'operation': 'update', 'id': created['id'], 'enabled': False})
+    await host.event('指南', group='group-a')
+    # The upload is a wait like any other: checked again before the image is posted.
+    assert [m[2] for m in host.replies()] == ['**欢迎**', '答案已变化，其余内容未发送，请重新提问。']
+
+
 async def test_rule_changed_while_the_rich_part_was_rejected_resends_current_text(qa_host):
     host = qa_host
     created, _ = await guide(host)
@@ -129,24 +138,30 @@ async def test_recipient_denied_between_parts_stops_restricted_image(qa_access_h
     )
     assert (await host.state.sync_roster('bot-a', 'group-a'))['complete']
     images = []
+    original = host.sender.reply
 
-    async def reply_image(event, image, content='', **kwargs):
-        images.append(image)
-        return {'id': 'fake-image'}
+    async def post_json(endpoint, data):
+        return True, {'file_info': 'file:' + data['url']}
 
-    host.sender.reply_image = reply_image
+    async def reply(event, content=None, **kwargs):
+        if kwargs.get('media'):
+            images.append(kwargs['media']['file_info'][5:])
+            return {'id': 'fake-image'}
+        return await original(event, content, **kwargs)
+
+    host.sender.post_json, host.sender.reply = post_json, reply
     await host.event('机密', user='member-a', group='group-a')
     assert host.said() == ['SECRET-TEXT'] and images == ['https://example.com/secret.png']
     images.clear()
-    original = host.sender.reply
+    media_reply = host.sender.reply
 
     async def reply(event, content=None, **kwargs):
-        result = await original(event, content, **kwargs)
+        result = await media_reply(event, content, **kwargs)
         if content == 'SECRET-TEXT':
             await host.access.manage_access('bot-a', 'self_qa', 'deny', function=function, group='group-a', member='member-b')
         return result
 
     host.sender.reply = reply
     await host.event('机密', user='member-a', group='group-a')
-    host.sender.reply = original
+    host.sender.reply = media_reply
     assert host.said() == ['SECRET-TEXT', '答案已变化，其余内容未发送，请重新提问。'] and images == []
