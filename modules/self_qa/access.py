@@ -131,7 +131,7 @@ class AccessBridge:
         except FAILURES:
             return {'context': None, 'reason': 'authorization_unavailable'}
 
-    async def private_group(self, bot, private_id, group):
+    async def chosen_group_context(self, bot, private_id, group):
         """The asker's current verified context in ``group`` for private chat, or None."""
         try:
             acl = await self.ensure(bot)

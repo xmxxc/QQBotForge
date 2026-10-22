@@ -230,3 +230,60 @@ async def test_menu_titles_follow_rule_changes_during_title_checks(qa_host):
     restore()
     (menu,) = host.said()
     assert '公开新名' in menu and '公开旧名' not in menu and '内部' not in menu and '受限答案' in menu
+
+
+async def test_menu_not_sent_when_asker_loses_eligibility_during_title_checks(qa_host):
+    host = qa_host
+    await restricted(host, name='内部', target='SECRET', keywords=['问'], mode='contains', priority=1)
+    await rule(host, name='公开', target='PUBLIC', keywords=['问'], mode='contains', priority=1)
+    await host.state.confirm_member('bot-a', 'group-a', 'member-a', evidence='checked', member_role='admin')
+
+    async def deny():
+        await host.access.manage_access('bot-a', 'self_qa', 'deny', function='public', group='group-a', member='member-a')
+
+    restore = after(host, 'audience_report', deny)
+    await host.event('问', user='member-a', group='group-a')
+    restore()
+    assert host.said() == ['资格已变化，请重新提问。']
+
+
+async def test_private_rule_button_reaches_group_rule_only_with_verified_context(qa_host):
+    host = qa_host
+    target = await rule(host, name='甲群详情', target='GROUP-DETAIL', keywords=['甲详情'], groups=['group-a'])
+    await rule(host, name='入口', target='ENTRY', keywords=['入口'], buttons=[{'label': '详情', 'action': 'rule', 'value': target['id']}])
+    await bind(host, 'group-a', 'member-a')
+    await host.event('入口', user='private-a')
+    assert host.said('private-a')[0].startswith('ENTRY')
+    # No chosen group context: the group rule behind the button is not reachable.
+    await host.event('问答选择 1', user='private-a')
+    assert host.said('private-a') == ['该答案已失效，请重新提问。']
+    await open_private_group(host)
+    await host.event('问答群 group-a', user='private-a')
+    host.sender.messages.clear()
+    await host.event('问答选择 1', user='private-a')
+    assert host.said('private-a') == ['GROUP-DETAIL']
+
+
+async def test_delegated_details_follow_rule_changes_and_report_late_revocation(qa_host):
+    host = qa_host
+    await delegated(host)
+    await bind(host, 'group-a', 'admin-a', 'private-admin')
+    secret = next(r for r in (await host.qa())[1]['data']['rules'] if r['access'] == 'restricted')
+    # A restricted rule renamed while the identity was looked up: no stale details pushed.
+    restore = after(host, 'member_context', owner(host, {'operation': 'update', 'id': secret['id'], 'name': '改名'}))
+    await host.event('问答管理 ' + json.dumps({'operation': 'list'}), user='admin-a', group='group-a')
+    restore()
+    assert pushes(host) == [] and host.said() == ['规则已变化，请重新发送']
+    # Revoked right after the push: the group hears that, and that the push went out.
+    original = host.sender.send_to_user
+
+    async def send_to_user(user_id, content=None, **kwargs):
+        result = await original(user_id, content, **kwargs)
+        await host.qa({'operation': 'delegate', 'groups': []})
+        return result
+
+    host.sender.send_to_user = send_to_user
+    await host.event('问答管理 ' + json.dumps({'operation': 'list'}), user='admin-a', group='group-a')
+    host.sender.send_to_user = original
+    assert [m[1] for m in pushes(host)] == ['private-admin']
+    assert host.said() == ['管理资格已变化，请重新发送（受限详情：已私聊发送）']
