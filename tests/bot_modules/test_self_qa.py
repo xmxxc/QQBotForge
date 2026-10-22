@@ -56,8 +56,14 @@ async def qa_host(tmp_path, monkeypatch):
 
         def __init__(self):
             self.messages = []
+            self.buttons = []
+            self.reject_buttons = False
 
         async def reply(self, event, content=None, **kwargs):
+            if kwargs.get('buttons') is not None:
+                if self.reject_buttons:
+                    return False, {'code': 'fake-button-rejected'}
+                self.buttons.append(kwargs['buttons'])
             # Framework template replies (default/blacklist/maintenance) are recorded by name.
             content = content if content is not None else 'template:' + str(kwargs.get('template_name'))
             self.messages.append((event.appid, event.group_id if event.is_group else event.raw_user_id, content))
@@ -125,6 +131,29 @@ async def qa_host(tmp_path, monkeypatch):
             for _ in range(5):  # let spawned framework replies run
                 await asyncio.sleep(0)
             return event
+
+        async def click(self, data, *, bot='bot-a', user='member-a', group=''):
+            event = Event.from_websocket(
+                bot,
+                {
+                    't': 'INTERACTION_CREATE',
+                    'd': {
+                        'id': 'fake-interaction',
+                        'type': 11,
+                        'application_id': bot,
+                        'chat_type': 1 if group else 2,
+                        'scene': 'group' if group else 'c2c',
+                        'group_openid': group,
+                        'group_member_openid': user if group else '',
+                        'user_openid': '' if group else user,
+                        'data': {'type': 11, 'resolved': {'button_data': data}},
+                    },
+                },
+            )
+            event.start_ack_countdown()
+            app._prepare_event(event)
+            await app._on_event(event)
+            return await event.wait_ack_code()
 
         def replies(self, *, templates=False):
             result = [m for m in self.sender.messages if templates or not m[2].startswith('template:')]
