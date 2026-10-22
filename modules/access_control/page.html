@@ -13,6 +13,10 @@
 <p><label>到期 Unix 秒（空为长期） <input id="ac-expiry" type="number" min="0"></label> <button id="ac-grant">授权调用及查看</button> <button id="ac-expiry-save">修改来源期限</button> <button id="ac-revoke">撤销该成员功能授权</button> <button id="ac-deny">明确拒绝</button> <button id="ac-allow">移除该项拒绝</button> <button id="ac-explain">解释资格</button></p>
 <p><label>批量成员原生ID（每行一个，部分失败只重试失败行）<textarea id="ac-bulk-members" rows="3" style="width:100%"></textarea></label> <button id="ac-bulk-grant">批量授权</button> <button id="ac-bulk-revoke">批量撤销</button> <button id="ac-bulk-expiry">批量期限</button></p>
 <p>保存清单会以填写内容替换该消费方资源清单；移除资源会从快照来源中去掉该项；持续来源继续按明确选择的范围重算。群／成员留空的明确拒绝适用于该功能的全部对应范围。所有操作仅主人后台可用。</p>
+<h3>通用身份绑定（仅主人确认）</h3>
+<p>成员先私聊发送“身份绑定 申请 群原生ID 成员原生ID”。申请编号和相同字符串都不是关联证据；绑定不授予功能资格，也不会主动联系新成员。</p>
+<p><button id="ac-binding-list">查看待审与已绑定</button> <label>申请ID <input id="ac-binding-request" maxlength="256"></label></p>
+<p><label>核对两侧身份的依据 <input id="ac-binding-evidence" maxlength="1000"></label> <label><input type="checkbox" id="ac-binding-checked">主人已核对为同一人</label> <button id="ac-binding-confirm">确认关联</button> <button id="ac-binding-reject">拒绝申请</button> <button id="ac-binding-revoke">撤销填写群／成员的关联</button></p>
 <p id="ac-status" role="status"></p><pre id="ac-output" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
 <script>
 (()=>{
@@ -25,6 +29,7 @@
   el('status').textContent='处理中…';
   try {
   const bot=value('bot'), consumer=value('consumer'), body={operation,consumer,function:value('function'),group:value('group'),member:value('member')};
+  if(operation.startsWith('binding_')){delete body.consumer;delete body.function;delete body.group;delete body.member;if(operation==='binding_confirm'){body.request=value('binding-request');body.evidence=value('binding-evidence');body.confirmed=el('binding-checked').checked;}if(operation==='binding_reject')body.request=value('binding-request');if(operation==='binding_revoke'){body.group=value('group');body.member=value('member');}}
   if(operation==='register'){delete body.function;delete body.group;delete body.member;body.owner=value('owner');body.functions={[value('function')]:policy()};}
   if(operation==='resources'){delete body.function;delete body.group;delete body.member;body.resources=value('inventory-json')?JSON.parse(value('inventory-json')):resources().map(id=>({id}));}
   if(operation==='policy')body.policy=policy();
@@ -37,7 +42,7 @@
   if(operation==='explain')body.resource=resources()[0]||'';
   const response=await fetch('/api/ext/access-control/?'+new URLSearchParams({bot,...(operation==='snapshot'?{consumer}:{})}),{method:operation==='snapshot'?'GET':'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},...(operation==='snapshot'?{}:{body:JSON.stringify(body)})});const data=await response.json();if(!response.ok||!data.success)throw Error(data.error||'处理失败');el('output').textContent=JSON.stringify(data.data,null,2);el('status').textContent='已处理，请核对资格原因和来源';}catch(error){el('status').textContent=error.message;el('output').textContent='';}
  }
- for(const [button,operation] of Object.entries({'load':'snapshot','register':'register','inventory':'resources','policy-save':'policy','grant':'grant','revoke':'revoke','deny':'deny','allow':'allow','explain':'explain','expiry-save':'expiry','function-group-save':'function_group','bulk-grant':'bulk_grant','bulk-revoke':'bulk_revoke','bulk-expiry':'bulk_expiry'}))el(button).onclick=()=>run(operation);
+ for(const [button,operation] of Object.entries({'load':'snapshot','register':'register','inventory':'resources','policy-save':'policy','grant':'grant','revoke':'revoke','deny':'deny','allow':'allow','explain':'explain','expiry-save':'expiry','function-group-save':'function_group','bulk-grant':'bulk_grant','bulk-revoke':'bulk_revoke','bulk-expiry':'bulk_expiry','binding-list':'binding_list','binding-confirm':'binding_confirm','binding-reject':'binding_reject','binding-revoke':'binding_revoke'}))el(button).onclick=()=>run(operation);
  fetch('/api/bots',{credentials:'same-origin'}).then(r=>r.json()).then(data=>{for(const row of data.data?.bots||data.bots||[]){const option=document.createElement('option');option.value=row.appid;option.textContent=(row.name||row.appid)+' ('+row.appid+')';el('bot').append(option);}}).catch(()=>{el('status').textContent='无法读取Bot，请检查登录状态';});
 })();
 </script></section>

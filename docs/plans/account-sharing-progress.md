@@ -16,7 +16,7 @@
 | --- | --- | --- |
 | 基础兼容与框架契约 | [#19](https://github.com/xmxxc/QQBotForge/issues/19)、[#20](https://github.com/xmxxc/QQBotForge/issues/20) | 已实现与验证，票据关闭；draft PR #37、#38、#39 保持待审核 |
 | 完整群状态 | [#21](https://github.com/xmxxc/QQBotForge/issues/21)—[#23](https://github.com/xmxxc/QQBotForge/issues/23) | G01—G03 已实现／验证，票据关闭；draft PR #40、#41、#42 保持待审核 |
-| 通用授权 | [#24](https://github.com/xmxxc/QQBotForge/issues/24)—[#27](https://github.com/xmxxc/QQBotForge/issues/27) | A01 #24 已实现／验证，draft PR #43；A02 #25 实施范围、批量和解释，其余待验收 |
+| 通用授权 | [#24](https://github.com/xmxxc/QQBotForge/issues/24)—[#27](https://github.com/xmxxc/QQBotForge/issues/27) | A01 #24 已实现／验证，draft PR #43；A02 #25 已实现／验证，draft PR #44；A03 #26 已实现／验证，draft PR #45；A04 #27 尚未开始，按主人要求暂停 |
 | 独立问答 | [#28](https://github.com/xmxxc/QQBotForge/issues/28)—[#32](https://github.com/xmxxc/QQBotForge/issues/32) | 已有匹配核心；待独立入口、正则、权限、委托和丰富回复 |
 | 账户组合 | [#33](https://github.com/xmxxc/QQBotForge/issues/33)—[#36](https://github.com/xmxxc/QQBotForge/issues/36) | 已有业务基础；待接口迁移和完整验收 |
 
@@ -42,4 +42,13 @@
 - 浏览器尝试：CUA 返回无可用浏览器（apps=[]、browsers=[]），G01 未完成浏览器核查。真实 QQ 平台许可、生产数据迁移及部署均未执行。
 - 原始工作树 `/opt/qqbot/QQBotForge-account-sharing` 的已跟踪改动已与起点二进制 diff 备份核对一致；实施文件位于 `/opt/qqbot/QQBotForge-bot-modules`。框架与同步分别位于 `QQBotForge-framework-f01`、`QQBotForge-bot-modules-framework-sync`，测试资产位于 `QQBotForge-f01-test-assets`。
 
-G03 #23：`fe873ac` 及成员周期锚点修正 `0a83634`，draft [PR #42](https://github.com/xmxxc/QQBotForge/pull/42) 目标 personal。实际 WS 接线及消费屏障、异常、重载、SQLite 延迟和原生事件冲突验证通过，组合业务 140 passed；双轴最终无剩余发现。A01 #24：`bfab97f`，draft [PR #43](https://github.com/xmxxc/QQBotForge/pull/43)，目标 personal；完整业务160 passed，授权20项，双轴最终0剩余发现，票据关闭。后续 A02 #25 已认领，当前工作树 `/opt/qqbot/QQBotForge-access-control-a01`，分支 `feat/access-control-a02` 基于 `bfab97f`，正在实施，尚未关闭。优先按群状态 → 授权 → 独立问答 → 账户共享推进；未完成票不继承旧验收状态。所有 PR 保持 draft，合并与部署由主人决定。
+G03 #23：`fe873ac` 及成员周期锚点修正 `0a83634`，draft [PR #42](https://github.com/xmxxc/QQBotForge/pull/42) 目标 personal。实际 WS 接线及消费屏障、异常、重载、SQLite 延迟和原生事件冲突验证通过，组合业务 140 passed；双轴最终无剩余发现。A01 #24：`bfab97f`，draft [PR #43](https://github.com/xmxxc/QQBotForge/pull/43)，目标 personal；完整业务160 passed，授权20项，双轴最终0剩余发现，票据关闭。A02 #25：`57debf6`，draft [PR #44](https://github.com/xmxxc/QQBotForge/pull/44)，目标 personal；完整业务172 passed，范围专项12项，双轴最终0剩余发现，票据关闭。A03 #26：代码 `b8d3297`，draft [PR #45](https://github.com/xmxxc/QQBotForge/pull/45)，目标 personal；完整业务184 passed，绑定专项12项，Ruff／三文件mypy／脚本语法通过，双轴最终0剩余发现，票据关闭。工作树 `/opt/qqbot/QQBotForge-access-control-a01`，分支 `feat/access-control-a03`。优先按群状态 → 授权 → 独立问答 → 账户共享推进；未完成票不继承旧验收状态。所有 PR 保持 draft，合并与部署由主人决定。
+
+
+## 当前暂停位置
+
+主人最新指令：“干完这个票据就先停一下”。当前票为 A03 #26，已完成代码、回归、审查、提交推送、draft PR 和票据验收记录，按要求停在这里；未认领或开始 A04 #27。新规划18票中 #19—#26 共8票完成，#27—#36 共10票仍待实施，不因旧票关闭或本轮暂停视为完成。
+
+最后可复现验证组合：框架同步 `b23572b` + 业务 `b8d3297`，`/tmp/qqbotforge-a01-runner` 指向相应 core/web 和业务 modules/plugins/tests；测试命令 `/opt/qqbot/QQBotForge-account-sharing/.venv/bin/python -m pytest -q`，184 passed。新绑定流程使用实际 Application/ModuleManager/WSClient 和鉴权HTTP、主人命令；旧账户测试中的模拟观察源仅算旧算法证据。浏览器和真实QQ／平台许可未验收；未迁移生产数据、合并或部署，全部 PR 保持 draft。
+
+暂停后若主人要求继续，从原生依赖已解除的 #27 开始核对当前正文／评论／阻塞关系，再按授权 → 独立问答 → 账户共享推进。不要改动原始工作树或把规划替代关闭当作新验收。

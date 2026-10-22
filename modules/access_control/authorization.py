@@ -9,6 +9,7 @@ from uuid import uuid4
 from core.base.config import cfg
 from core.plugin._blacklist import get_blacklist_map
 
+from .bindings import Bindings
 from .policy import AccessControl, expiry, identifier
 
 COLLECTION = 'access_consumers'
@@ -62,6 +63,7 @@ class Authorization(AccessControl):
         self.shared_failure = False
         self.fact_subscription = None
         self.fact_source = None
+        self.bindings = Bindings(self)
 
     @staticmethod
     def group_state():
@@ -606,7 +608,18 @@ class Authorization(AccessControl):
             result.update(allowed=False, reason='state_changed')
         return result
 
+    async def binding_snapshot(self, bot):
+        return await self.bindings.manage(bot, 'binding_list', {}, 'internal_owner')
+
+    async def private_contexts(self, bot, consumer, function, private_id, *, group='', resource='', action='invoke'):
+        return await self.bindings.contexts(bot, consumer, function, private_id, group=group, resource=resource, action=action)
+
+    def context_current(self, bot, context):
+        return self.bindings.current(bot, context)
+
     def decision_current(self, bot, decision):
+        if not isinstance(decision, dict) or not decision.get('allowed'):
+            return False
         if 'consumer' not in decision:
             return super().decision_current(bot, decision)
         key = bot, decision['consumer']
