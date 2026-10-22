@@ -42,6 +42,8 @@ class ExtensionStore:
                 self._connection = self._open()
             with self._connection:
                 cursor = self._connection.execute(sql, params)
+                if read == 'keys':
+                    return [row[0] for row in cursor.fetchall()]
                 return [json.loads(row[0]) for row in cursor.fetchall()] if read else None
 
     async def _execute(self, sql, params, read=False):
@@ -53,9 +55,12 @@ class ExtensionStore:
     async def all(self, bot, collection):
         return await self._execute('SELECT payload FROM extension_records WHERE bot=? AND collection=? ORDER BY rowid', (bot, collection), True)
 
-    async def get(self, bot, collection, key):
+    async def keys(self, bot, collection):
+        return await self._execute('SELECT id FROM extension_records WHERE bot=? AND collection=? ORDER BY rowid', (bot, collection), 'keys')
+
+    async def get(self, bot, collection, key, *, missing=None):
         rows = await self._execute('SELECT payload FROM extension_records WHERE bot=? AND collection=? AND id=?', (bot, collection, key), True)
-        return rows[0] if rows else None
+        return rows[0] if rows else missing
 
     async def put(self, bot, collection, key, record):
         await self._execute(

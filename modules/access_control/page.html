@@ -1,0 +1,29 @@
+<section style="padding:1.5rem;max-width:70rem;margin:auto;font:16px system-ui;color:var(--text-primary,inherit)">
+<h2>授权管理</h2><p>按 Bot 和消费方管理功能资格。角色策略不授予账户管理权。依赖群资格时，请先在“群状态”核验成员并完成恢复；公开策略仍受启用范围和拒绝约束。</p>
+<p><label>Bot <select id="ac-bot"></select></label> <label>消费方 <input id="ac-consumer" maxlength="256"></label> <button id="ac-load">查看策略与来源</button></p>
+<p><label>功能 <input id="ac-function" maxlength="256"></label> <label>群原生ID <input id="ac-group" maxlength="256"></label> <label>成员原生ID <input id="ac-member" maxlength="256"></label></p>
+<p><label>策略 <select id="ac-policy"><option value="explicit">明确授权</option><option value="public">公开</option><option value="group">当前群成员</option><option value="members">指定成员</option><option value="role">群角色</option><option value="owner">Bot 主人</option></select></label> <label>允许私聊 <input type="checkbox" id="ac-private"></label> <label>角色 <select id="ac-role"><option value="member">普通成员</option><option value="admin">管理员</option><option value="owner">群主</option></select></label> <button id="ac-policy-save">保存功能策略</button></p>
+<p><label>注册归属 <input id="ac-owner" maxlength="256" placeholder="明确的插件或模块归属"></label> <button id="ac-register">注册消费方／功能</button></p>
+<p><label>资源ID（逗号分隔） <input id="ac-resources" maxlength="4000"></label> <button id="ac-inventory">保存资源清单</button></p>
+<p><label>到期 Unix 秒（空为长期） <input id="ac-expiry" type="number" min="0"></label> <button id="ac-grant">授权调用及查看</button> <button id="ac-revoke">撤销该成员功能授权</button> <button id="ac-deny">明确拒绝</button> <button id="ac-allow">移除该项拒绝</button> <button id="ac-explain">解释资格</button></p>
+<p>保存清单会以填写内容替换该消费方资源清单；删除资源会撤销涉及它的来源。群／成员留空的明确拒绝适用于该功能的全部对应范围。所有操作仅主人后台可用。</p>
+<p id="ac-status" role="status"></p><pre id="ac-output" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
+<script>
+(()=>{
+ const el=id=>document.getElementById('ac-'+id), value=id=>el(id).value.trim();
+ const resources=()=>value('resources').split(',').map(s=>s.trim()).filter(Boolean);
+ function policy(){const kind=value('policy'), p={kind,groups:value('group')?[value('group')]:[],private:el('private').checked};if(kind==='role')p.roles=[value('role')];if(kind==='members')p.members=value('member')?[value('member')]:[];return p;}
+ async function run(operation){
+  el('status').textContent='处理中…';
+  const bot=value('bot'), consumer=value('consumer'), body={operation,consumer,function:value('function'),group:value('group'),member:value('member')};
+  if(operation==='register'){delete body.function;delete body.group;delete body.member;body.owner=value('owner');body.functions={[value('function')]:policy()};}
+  if(operation==='resources'){delete body.function;delete body.group;delete body.member;body.resources=resources().map(id=>({id}));}
+  if(operation==='policy')body.policy=policy();
+  if(operation==='grant'){body.resources=resources();body.expires_at=value('expiry')?Number(value('expiry')):null;}
+  if(operation==='explain')body.resource=resources()[0]||'';
+  try{const response=await fetch('/api/ext/access-control/?'+new URLSearchParams({bot,...(operation==='snapshot'?{consumer}:{})}),{method:operation==='snapshot'?'GET':'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},...(operation==='snapshot'?{}:{body:JSON.stringify(body)})});const data=await response.json();if(!response.ok||!data.success)throw Error(data.error||'处理失败');el('output').textContent=JSON.stringify(data.data,null,2);el('status').textContent='已处理，请核对资格原因和来源';}catch(error){el('status').textContent=error.message;el('output').textContent='';}
+ }
+ for(const [button,operation] of Object.entries({'load':'snapshot','register':'register','inventory':'resources','policy-save':'policy','grant':'grant','revoke':'revoke','deny':'deny','allow':'allow','explain':'explain'}))el(button).onclick=()=>run(operation);
+ fetch('/api/bots',{credentials:'same-origin'}).then(r=>r.json()).then(data=>{for(const row of data.data?.bots||data.bots||[]){const option=document.createElement('option');option.value=row.appid;option.textContent=(row.name||row.appid)+' ('+row.appid+')';el('bot').append(option);}}).catch(()=>{el('status').textContent='无法读取Bot，请检查登录状态';});
+})();
+</script></section>

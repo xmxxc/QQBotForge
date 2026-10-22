@@ -100,7 +100,9 @@ class GroupState:
                     group.setdefault('roster', {'complete': False, 'reason': 'not_verified'})
                     group['roster'].update(complete=False, reason='process_restart')
                     for member in group['members'].values():
-                        member.update(reliable=False, status='left' if member.get('status') == 'left' else 'historical', reason='process_restart')
+                        member.update(
+                            reliable=False, cycle_uncertain=True, status='left' if member.get('status') == 'left' else 'historical', reason='process_restart'
+                        )
                 state['version'] += 1
                 self.durable[bot] = {}
                 self.states[bot] = state
@@ -445,11 +447,11 @@ class GroupState:
                 record.update(status='historical', reason=reason)
             raise
 
-    async def _commit_member(self, bot, state, native_group, member, fact, *, previous=None, manual=False):
+    async def _commit_member(self, bot, state, native_group, member, fact, *, previous=None, manual=False, continuity_unknown=False):
         published: dict = {}
 
         def apply(candidate, updated):
-            self._merge_member(updated, {'member': member, **fact}, manual=manual, previous=previous)
+            self._merge_member(updated, {'member': member, **fact}, manual=manual, previous=previous, continuity_unknown=continuity_unknown)
             self._invalidate(candidate, updated, 'individual_verification')
             published.update(updated['members'][member], group=native_group, version=updated['version'], generation=self.generation)
 
@@ -492,9 +494,13 @@ class GroupState:
             'evidence': evidence,
             'state': 'present',
             'confirmation_generation': self.generation,
+            'confirmation_revision': self.recovery.get_status(bot).revision,
         }
         try:
-            return await self._commit_member(bot, state, native_group, member, fact, previous=previous, manual=True)
+            return await self._commit_member(
+                bot, state, native_group, member, fact, previous=previous, manual=True,
+                continuity_unknown=self.recovery.get_status(bot).phase in {'needs_baseline', 'unsupported', 'closed'},
+            )
         except BaseException as error:
             if reason := self._abandon(state, group, version, error, 'confirmation'):
                 record.update(status='historical', reason=reason)
@@ -773,29 +779,36 @@ class GroupState:
         for member in group['members'].values():
             member.update(reliable=False, reason=reason)
 
-    def _merge_member(self, group, data, *, manual=False, previous=None):
+    def _merge_member(self, group, data, *, manual=False, previous=None, continuity_unknown=False):
         previous = previous if previous is not None else group['members'].get(data['member'], {})
         cycle = previous.get('cycle') or uuid4().hex
         joined = data.get('joined_at')
         anchor = previous.get('cycle_anchor') or previous.get('checked_at')
-        changed = previous.get('status') == 'left' or (
-            joined is not None
-            and (
-                previous.get('joined_at') is not None
-                and joined != previous['joined_at']
-                or previous.get('joined_at') is None
-                and anchor is not None
-                and joined > anchor
+        changed = (
+            previous.get('status') == 'left'
+            or manual
+            and (previous.get('cycle_uncertain') or continuity_unknown)
+            or (
+                joined is not None
+                and (
+                    previous.get('joined_at') is not None
+                    and joined != previous['joined_at']
+                    or previous.get('joined_at') is None
+                    and anchor is not None
+                    and joined > anchor
+                )
             )
         )
         stale = not manual and previous.get('left_at') and (joined is None or joined <= previous['left_at'])
-        already_joined = previous.get('last_transition', {}).get('type') == 'GROUP_MEMBER_ADD' and previous.get('status') == 'pending'
+        already_joined = not manual and previous.get('last_transition', {}).get('type') == 'GROUP_MEMBER_ADD' and previous.get('status') == 'pending'
         if changed and not stale and not already_joined:
             cycle = uuid4().hex
         result = {**copy.deepcopy(previous), **data, 'cycle': cycle}
         result['cycle_anchor'] = self.clock() if anchor is None or cycle != previous.get('cycle') else anchor
         if stale:
             result.update(reliable=False, status='left' if previous.get('status') == 'left' else 'pending', state='unknown', reason='stale_membership')
+        if result.get('reliable'):
+            result['cycle_uncertain'] = False
         group['members'][data['member']] = result
         return result
 
@@ -803,6 +816,7 @@ class GroupState:
         async with self.rebuild_locks.setdefault(bot, asyncio.Lock()):
             if not self.active or self.notifications.busy(bot):
                 return False
+            previous_revision = self.recovery.get_status(bot).revision
             self.recovery.invalidate(bot, reason='rebuilding')
             checkpoint = self.recovery.get_status(bot)
             unsettled = [
@@ -818,7 +832,10 @@ class GroupState:
                 good = good and state['groups'][native_group]['reliable']
                 for member, record in tuple(state['groups'][native_group]['members'].items()):
                     current_manual = (
-                        record.get('source') == 'owner_confirmed' and record.get('confirmation_generation') == self.generation and record.get('reliable')
+                        record.get('source') == 'owner_confirmed'
+                        and record.get('confirmation_generation') == self.generation
+                        and record.get('confirmation_revision') == previous_revision
+                        and record.get('reliable')
                     )
                     if record.get('status') != 'left' and not current_manual:
                         await self.verify_member(bot, native_group, member)
