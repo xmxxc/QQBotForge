@@ -25,6 +25,10 @@ COMMAND = '问答管理 '
 MESSAGE_TYPES = {'GROUP_AT_MESSAGE_CREATE', 'GROUP_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE'}
 SELECT = '问答选择'
 CALLBACK = 'qa:'
+# Rules changed while an answer was prepared: re-resolve from current rules this often.
+ATTEMPTS = 3
+CHANGING = '答案正在更新，请稍后重新提问。'
+STALE = object()
 
 
 def owner(event):
@@ -122,18 +126,37 @@ class PublicEntry:
 
         return self.candidates(await self.qa.match(event.appid, NAMESPACE, text, group=group, admit=admit)), admitted
 
+    def fresh(self, bot, version):
+        """Final non-awaiting check: no rule or enablement changed since ``version`` was read."""
+        return self.qa.active and self.qa.version(bot, NAMESPACE) == version
+
+    async def resolved(self, event, run):
+        """``run(version)`` returns STALE when rules changed before anything was sent; then run again on current rules."""
+        for _ in range(ATTEMPTS):
+            result = await run(self.qa.version(event.appid, NAMESPACE))
+            if result is not STALE:
+                return result
+        await self.reply(event, CHANGING)
+        return None
+
     async def current(self, event, menu):
         return await self.matched(event, menu['text'])
 
-    async def deliver(self, event, candidate, admitted):
+    async def deliver(self, event, candidate, admitted, version):
+        """Send one matched answer; STALE when its rules changed during the waits (nothing sent)."""
         rule, decision = admitted[candidate['rule_id']]
         if rule.get('access') == 'restricted' and event.is_group and await self.access.group_view(event.appid, rule, event.group_id) is None:
+            if not self.fresh(event.appid, version):
+                return STALE
             # Only send restricted content to a group whose every member may view it.
             await self.reply(event, f'「{rule["name"]}」仅限有权成员查看，不能在本群公开发送。')
-            return
+            return None
+        # Final gate after every wait: rule version, then the asker's decision.
+        if not self.fresh(event.appid, version):
+            return STALE
         if not self.access.current(event.appid, decision):
             await self.reply(event, '资格已变化，请重新提问。')
-            return
+            return None
         buttons = rule.get('buttons', [])
         token = (
             self.menus.issue_links(event, NAMESPACE, [b['value'] if b['action'] == 'rule' else None for b in buttons])
@@ -141,18 +164,25 @@ class PublicEntry:
             else ''
         )
         await self.delivery.send(event, rule, token)
+        return None
 
     async def linked(self, event, rule_id):
         """A rule button: reload the rule now and check scope and the clicker's own eligibility."""
         group = event.group_id if event.is_group else ''
-        rule = await self.qa.manage(event.appid, NAMESPACE, 'get', key=rule_id) if rule_id else None
-        decision = None
-        if rule and rule['enabled'] and rule['kind'] == 'text' and (not rule.get('groups') or group in rule['groups']) and await self.enabled(event):
-            decision = await self.access.admit(event.appid, rule, group, event.raw_user_id or event.user_id)
-        if decision is None:
-            await self.reply(event, '该答案已失效，请重新提问。')
-            return
-        await self.deliver(event, {'rule_id': rule['id']}, {rule['id']: (rule, decision)})
+
+        async def answer(version):
+            rule = await self.qa.manage(event.appid, NAMESPACE, 'get', key=rule_id) if rule_id else None
+            decision = None
+            if rule and rule['enabled'] and rule['kind'] == 'text' and (not rule.get('groups') or group in rule['groups']) and await self.enabled(event):
+                decision = await self.access.admit(event.appid, rule, group, event.raw_user_id or event.user_id)
+            if decision is None:
+                if not self.fresh(event.appid, version):
+                    return STALE
+                await self.reply(event, '该答案已失效，请重新提问。')
+                return None
+            return await self.deliver(event, {'rule_id': rule['id']}, {rule['id']: (rule, decision)}, version)
+
+        await self.resolved(event, answer)
 
     async def on_event(self, event):
         text = (event.content or '').strip()
@@ -168,19 +198,24 @@ class PublicEntry:
         try:
             if text == SELECT or text.startswith(SELECT + ' '):
                 return await self.select_text(event, text[len(SELECT) :].strip())
-            candidates, admitted = await self.matched(event, text)
-            if not candidates:
-                return event
-            if len(candidates) == 1:
-                await self.deliver(event, candidates[0], admitted)
-            else:
-                await self.offer(event, self.menus.issue(event, NAMESPACE, text, candidates), candidates, 0)
+
+            async def answer(version):
+                candidates, admitted = await self.matched(event, text)
+                if not candidates:
+                    return event
+                if not self.fresh(bot, version):
+                    return STALE
+                if len(candidates) == 1:
+                    return await self.deliver(event, candidates[0], admitted, version)
+                await self.offer(event, self.menus.issue(event, NAMESPACE, text, candidates), candidates, 0, version)
+                return None
+
+            return await self.resolved(event, answer)
         except (sqlite3.Error, OSError, RuntimeError):
             # Storage trouble never blocks plugin handlers.
             return event
-        return None
 
-    async def offer(self, event, token, candidates, page):
+    async def offer(self, event, token, candidates, page, version):
         page, last, shown = self.menus.page(candidates, page)
         start = page * PAGE
         lines = ['找到多个答案，请选择：'] + [f'{start + i + 1}. {c["name"]}' for i, c in enumerate(shown)]
@@ -207,6 +242,9 @@ class PublicEntry:
                     return
             except Exception:  # noqa: BLE001 - the menu holds only permitted titles, safe to offer again as text
                 pass
+        if not self.fresh(event.appid, version):
+            await self.reply(event, CHANGING)
+            return
         await self.reply(event, text + '\n按钮暂不可用，请使用以上文字选择。')
 
     async def choose(self, event, menu, token, action):
@@ -215,21 +253,27 @@ class PublicEntry:
             index = int(action[1:]) if action[:1] == 'r' and action[1:].isdecimal() else -1
             await self.linked(event, menu['links'][index] if 0 <= index < len(menu['links']) else None)
             return
-        candidates, admitted = await self.current(event, menu)
-        if action.startswith('p'):
-            menu['rules'] = [c['rule_id'] for c in candidates]
-            if not candidates:
-                await self.reply(event, '这些答案已变化，请重新提问。')
-                return
-            await self.offer(event, token, candidates, int(action[1:]))
-            return
-        index = int(action)
-        rule_id = menu['rules'][index] if 0 <= index < len(menu['rules']) else None
-        chosen = next((c for c in candidates if c['rule_id'] == rule_id), None)
-        if chosen is None:
-            await self.reply(event, '该答案已失效，请重新提问。')
-            return
-        await self.deliver(event, chosen, admitted)
+
+        async def answer(version):
+            candidates, admitted = await self.current(event, menu)
+            if not self.fresh(event.appid, version):
+                return STALE
+            if action.startswith('p'):
+                menu['rules'] = [c['rule_id'] for c in candidates]
+                if not candidates:
+                    await self.reply(event, '这些答案已变化，请重新提问。')
+                    return None
+                await self.offer(event, token, candidates, int(action[1:]), version)
+                return None
+            index = int(action)
+            rule_id = menu['rules'][index] if 0 <= index < len(menu['rules']) else None
+            chosen = next((c for c in candidates if c['rule_id'] == rule_id), None)
+            if chosen is None:
+                await self.reply(event, '该答案已失效，请重新提问。')
+                return None
+            return await self.deliver(event, chosen, admitted, version)
+
+        await self.resolved(event, answer)
 
     async def select_text(self, event, argument):
         menu, reason = self.menus.resolve(event)
@@ -299,7 +343,14 @@ class PublicEntry:
                 return self.access.current(bot, decision)
 
             if operation == 'list':
-                result = [{k: r[k] for k in ('id', 'name', 'keywords', 'mode', 'enabled')} for r in await self.qa.manage(bot, NAMESPACE, 'list') if own(r)]
+                rules = [r for r in await self.qa.manage(bot, NAMESPACE, 'list') if own(r)]
+                if not (self.qa.active and guard()):
+                    raise PermissionError('管理资格已变化，请重新发送')
+                # Managing is not disclosure: the group sees public rules and only a count of restricted ones.
+                result = {
+                    'rules': [{k: r[k] for k in ('id', 'name', 'keywords', 'mode', 'enabled')} for r in rules if r.get('access') != 'restricted'],
+                    'restricted': sum(r.get('access') == 'restricted' for r in rules),
+                }
             elif operation == 'create':
                 if 'id' in values:
                     raise ValueError('新增不接受 id')
