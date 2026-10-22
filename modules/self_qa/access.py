@@ -82,7 +82,9 @@ class AccessBridge:
                 decision = await acl.evaluate(bot, CONSUMER, 'public', group, member)
             except FAILURES:
                 return {'allowed': True, 'reason': 'public'}
-            return None if decision['reason'] in {'denied', 'framework_denied'} else {'allowed': True, 'reason': 'public'}
+            if decision['reason'] in {'denied', 'framework_denied'}:
+                return None
+            return {'allowed': True, 'reason': 'public', 'evaluated': decision}
         try:
             acl = await self.ensure(bot)
             decision = await acl.evaluate(bot, CONSUMER, rule_function(rule), group, member, resource(rule), action='view')
@@ -91,9 +93,12 @@ class AccessBridge:
         return decision if decision['allowed'] else None
 
     def current(self, bot, decision):
-        if decision.get('reason') == 'public' and 'consumer' not in decision:
-            return True
         acl = self.module()
+        if decision.get('reason') == 'public' and 'consumer' not in decision:
+            if 'evaluated' not in decision:
+                return True
+            # Not a grant: only that the public evaluation (denies, policy, generation) is still current.
+            return bool(acl and acl.decision_current(bot, {**decision['evaluated'], 'allowed': True}))
         return bool(acl and acl.decision_current(bot, decision))
 
     async def group_view(self, bot, rule, group):
