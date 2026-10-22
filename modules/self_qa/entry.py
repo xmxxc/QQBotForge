@@ -145,25 +145,38 @@ class PublicEntry:
     async def deliver(self, event, candidate, admitted, version):
         """Send one matched answer; STALE when its rules changed during the waits (nothing sent)."""
         rule, decision = admitted[candidate['rule_id']]
-        if rule.get('access') == 'restricted' and event.is_group and await self.access.group_view(event.appid, rule, event.group_id) is None:
+        report = None
+        if rule.get('access') == 'restricted' and event.is_group:
+            report = await self.access.group_view(event.appid, rule, event.group_id)
+        if rule.get('access') == 'restricted' and event.is_group and report is None:
             if not self.fresh(event.appid, version):
                 return STALE
             # Only send restricted content to a group whose every member may view it.
             await self.reply(event, f'「{rule["name"]}」仅限有权成员查看，不能在本群公开发送。')
             return None
-        # Final gate after every wait: rule version, then the asker's decision.
-        if not self.fresh(event.appid, version):
-            return STALE
-        if not self.access.current(event.appid, decision):
-            await self.reply(event, '资格已变化，请重新提问。')
-            return None
+
+        def check():
+            """Final non-awaiting gate before every part: rule version, asker, whole-group report."""
+            return (
+                self.fresh(event.appid, version)
+                and self.access.current(event.appid, decision)
+                and (report is None or self.access.report_current(event.appid, rule, event.group_id, report))
+            )
+
         buttons = rule.get('buttons', [])
         token = (
             self.menus.issue_links(event, NAMESPACE, [b['value'] if b['action'] == 'rule' else None for b in buttons])
             if any(b['action'] == 'rule' for b in buttons)
             else ''
         )
-        await self.delivery.send(event, rule, token)
+        state = await self.delivery.send(event, rule, token, check)
+        if state == 'stale':
+            if not self.fresh(event.appid, version):
+                return STALE
+            await self.reply(event, '资格已变化，请重新提问。')
+        elif state == 'partial':
+            # Parts already sent stay sent; the rest is withheld.
+            await self.reply(event, '答案已变化，其余内容未发送，请重新提问。')
         return None
 
     async def linked(self, event, rule_id):
@@ -237,11 +250,12 @@ class PublicEntry:
             rows.append(navigation)
         if cfg.get_bot_setting(event.appid, 'message.use_markdown', True):
             try:
-                # Only a definite rejection falls back; an unknown result is not re-sent.
-                if outcome(await self.reply(event, text, buttons=rows)) != 'rejected':
-                    return
-            except Exception:  # noqa: BLE001 - the menu holds only permitted titles, safe to offer again as text
-                pass
+                result = outcome(await self.reply(event, text, buttons=rows))
+            except Exception:  # noqa: BLE001 - a transport error leaves the menu's delivery unknown
+                result = 'unknown'
+            # Only a definite rejection falls back; an unknown result is not re-sent.
+            if result != 'rejected':
+                return
         if not self.fresh(event.appid, version):
             await self.reply(event, CHANGING)
             return
