@@ -592,10 +592,22 @@ class GroupState:
         # carry no event and settle like any connection status. receive_index counts callbacks
         # this Bot instance actually read (updated without a new revision). HTTP has no
         # continuity proof, so once it delivered anything this Bot instance stays untrusted.
-        # True also when delivery cannot be ruled out (see _same_instance). No HTTP source means no BotInstance was ever created for this Bot, so the framework
-        # route has nothing to deliver to.
+        # Source agreement alone is insufficient: both may belong to an orphan while a
+        # WS-disabled instance serves HTTP. Resolve the same registry used by WebhookHandler.
+        from core.application import get_app
+
+        app = get_app()
+        serving = app.get_bot(bot) if app else None
         status = self.webhook_status(bot)
-        return status is not None and (status.context.receive_index > 0 or not self._same_instance(status, self.websocket_status(bot)))
+        if status is None:
+            # Standalone WS adapters have no HTTP receiver/source. A real HTTP-capable
+            # instance without its source is unknown, never evidence of zero receipts.
+            return callable(getattr(serving, 'observe_webhook', None))
+        if status.context.receive_index > 0 or not self._same_instance(status, self.websocket_status(bot)):
+            return True
+        generation = getattr(serving, 'bot_generation', None)
+        runtime = getattr(getattr(serving, 'connection_status', None), 'runtime_id', None)
+        return not (generation and runtime and (runtime, generation) == (status.context.runtime_id, status.context.bot_generation))
 
     @staticmethod
     def _same_instance(webhook, websocket):
@@ -608,7 +620,7 @@ class GroupState:
         if websocket is None:
             return False
         http, ws = webhook.context, websocket.context
-        return bool(http.bot_generation) and (http.runtime_id, http.bot_generation) == (ws.runtime_id, ws.bot_generation)
+        return bool(http.runtime_id and http.bot_generation) and (http.runtime_id, http.bot_generation) == (ws.runtime_id, ws.bot_generation)
 
     def _pause_reason(self, bot):
         """Why this Bot's facts are paused: '' when ready; 'recovery_processing' while a
