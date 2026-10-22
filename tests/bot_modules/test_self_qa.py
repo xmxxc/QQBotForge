@@ -69,6 +69,12 @@ async def qa_host(tmp_path, monkeypatch):
             self.sent = []
 
         async def reply(self, event, content=None, **kwargs):
+            if kwargs.get('media'):
+                # An uploaded image posted as a media reply.
+                self.messages.append((event.appid, event.group_id if event.is_group else event.raw_user_id, 'image:' + kwargs['media']['file_info'][5:]))
+                if self.after_send:
+                    await self.after_send('image')
+                return {'id': 'fake-image'}
             kind = 'buttons' if kwargs.get('buttons') else 'markdown' if kwargs.get('msg_type') == 2 else 'template' if content is None else 'text'
             if kind == 'buttons' and self.reject_buttons or kind in self.reject:
                 return {'code': 'fake-' + kind + '-rejected', 'message': 'rejected'}
@@ -89,13 +95,13 @@ async def qa_host(tmp_path, monkeypatch):
             # Same shape as Sender.reply: the platform response dict.
             return {'id': 'fake-reply'}
 
-        async def reply_image(self, event, image, content='', **kwargs):
+        async def post_json(self, endpoint, data):
+            # Media URL upload (POST .../files, srv_send_msg false): file_info names the URL.
             if 'image' in self.reject:
-                return None
-            self.messages.append((event.appid, event.group_id if event.is_group else event.raw_user_id, 'image:' + image))
+                return False, {'code': 'fake-upload-rejected', 'message': 'rejected'}
             if self.after_send:
-                await self.after_send('image')
-            return {'id': 'fake-image'}
+                await self.after_send('upload')
+            return True, {'file_info': 'file:' + data['url']}
 
     platform = Platform()
     for bot in ('bot-a', 'bot-b'):

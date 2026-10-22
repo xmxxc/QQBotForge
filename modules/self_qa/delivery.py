@@ -11,8 +11,10 @@ Buttons carry session references, never answer content.
 import time
 
 from core.base.config import cfg
+from core.message.media import upload_media_via_url
 
 TEXT, MARKDOWN = 0, 2
+IMAGE = 1
 ACTIONS = {'command', 'link', 'rule'}
 
 
@@ -116,8 +118,12 @@ class Delivery:
         if not check():
             return 'partial'
         try:
+            # Upload, check again, then post: the upload is a wait like any other.
             sender = entry.sender(bot)
-            image = await sender.reply_image(event, rule['image']) if sender else None
+            file_info = await upload_media_via_url(sender, event, rule['image'], IMAGE) if sender else None
+            if file_info and not check():
+                return 'partial'
+            image = await sender.reply(event, media={'file_info': file_info}) if file_info else None
         except Exception:  # noqa: BLE001 - an exception leaves the delivery unknown
             return 'unknown'
         image_state = outcome(image, media=True)
