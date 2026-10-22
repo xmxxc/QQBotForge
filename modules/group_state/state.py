@@ -555,6 +555,7 @@ class GroupState:
         # One entry per Bot/transport, so it does not grow with reconnects.
         self.current_connection_statuses = lambda: ctx.connection_statuses
         self.webhook_status = lambda bot: ctx.get_connection_status(bot, transport='webhook')
+        self.websocket_status = lambda bot: ctx.get_connection_status(bot, transport='websocket')
         self.connection_baseline = {(status.appid, status.transport): status.revision for status in ctx.connection_statuses}
         self.connection_settled = dict(self.connection_baseline)
         # Highest status our callback started for, whatever its outcome.
@@ -591,8 +592,23 @@ class GroupState:
         # carry no event and settle like any connection status. receive_index counts callbacks
         # this Bot instance actually read (updated without a new revision). HTTP has no
         # continuity proof, so once it delivered anything this Bot instance stays untrusted.
+        # True also when delivery cannot be ruled out (see _same_instance). No HTTP source means no BotInstance was ever created for this Bot, so the framework
+        # route has nothing to deliver to.
         status = self.webhook_status(bot)
-        return status is not None and status.context.receive_index > 0
+        return status is not None and (status.context.receive_index > 0 or not self._same_instance(status, self.websocket_status(bot)))
+
+    @staticmethod
+    def _same_instance(webhook, websocket):
+        # A BotInstance registers its HTTP source at construction and its WS source when its
+        # WSClient is created (start or hot update), both with its bot_generation; the registry
+        # serves callbacks with the instance whose start() finished last. Sources owned by
+        # different instances (one superseded the other's, e.g. overlapping config syncs) mean
+        # the serving instance may count callbacks into a source that no longer publishes, so
+        # receive_index cannot show they did not happen. Missing identities never match.
+        if websocket is None:
+            return False
+        http, ws = webhook.context, websocket.context
+        return bool(http.bot_generation) and (http.runtime_id, http.bot_generation) == (ws.runtime_id, ws.bot_generation)
 
     def _pause_reason(self, bot):
         """Why this Bot's facts are paused: '' when ready; 'recovery_processing' while a
