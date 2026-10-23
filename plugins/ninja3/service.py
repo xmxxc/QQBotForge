@@ -139,37 +139,56 @@ class Ninja3:
         # The declaration interface never overwrites an existing owner policy.
         await acl.declare(bot, CONSUMER, owner=OWNER, functions={FUNCTION: DEFAULT_POLICY})
 
-    async def sync(self, bot, *, group=None):
-        """Owner configuration writes only; member queries never write authorization.
+    async def sync(self, bot, change, apply):
+        """Run one owner-configuration sync and record it; member queries never write authorization.
 
-        Declares the consumer if missing and the account inventory (IDs only: the
-        resource category field is not a QQ group list). Saving or deleting a group
-        adds or removes that one group in the policy scope, keeping the policy kind,
-        private switch, other groups, sources, denials and other consumers.
+        ``apply(acl)`` changes only what this save needs. It reads the authorization
+        snapshot as its last await before its single write, so an owner edit made in
+        the authorization page in between is never reverted (no await separates them).
         """
         acl = self.access_provider()
-        result = {'id': uuid4().hex, 'kind': 'acl_sync', 'created_at': self.clock(), 'group': group or ''}
+        result = {'id': uuid4().hex, 'kind': 'acl_sync', 'created_at': self.clock(), **change}
         if acl is None or not acl.active:
-            result.update(status='unavailable')
+            result['status'] = 'unavailable'
         else:
             try:
                 await self.declare(acl, bot)
-                accounts = await self.store.all(bot, 'accounts')
-                await acl.declare_resources(bot, CONSUMER, [{'id': a['id'], 'enabled': a['enabled']} for a in accounts])
-                result['status'] = 'saved'
-                if group is not None:
-                    record = await self.store.get(bot, 'groups', group)
-                    configured = (await acl.access_snapshot(bot, CONSUMER))['functions'][FUNCTION]
-                    wanted = bool(record and record['enabled'])
-                    groups = [g for g in configured['groups'] if g != group] + ([group] if wanted else [])
-                    result.update(policy_before=configured['groups'], policy_after=groups)
-                    if groups != configured['groups']:
-                        await acl.manage_access(bot, CONSUMER, 'policy', function=FUNCTION, policy={**configured, 'groups': groups})
+                result.update(await apply(acl), status='saved')
             except (RuntimeError, ValueError, sqlite3.Error, OSError) as error:
                 result.update(status='failed', error=type(error).__name__)
         await self.store.put(bot, 'operations', result['id'], result)
-        log.info(f'[{bot}] 授权同步 group={result["group"]} status={result["status"]}')
+        log.info(f'[{bot}] 授权同步 {change} status={result["status"]}')
         return result
+
+    async def sync_account(self, bot, key):
+        """Only this account's resource entry (ID and enablement, no category groups); others keep their authorization state."""
+
+        async def apply(acl):
+            account = await self.store.get(bot, 'accounts', key)
+            resources = (await acl.access_snapshot(bot, CONSUMER))['resources']
+            before = resources.get(key)
+            inventory = {**resources, key: {'id': key, 'groups': [], 'enabled': account['enabled']}} if account else dict(resources)
+            if not account:
+                inventory.pop(key, None)
+            after = inventory.get(key)
+            if before != after:
+                await acl.declare_resources(bot, CONSUMER, list(inventory.values()))
+            return {'resource_before': before and before['enabled'], 'resource_after': after and after['enabled']}
+
+        return await self.sync(bot, {'account': key}, apply)
+
+    async def sync_group(self, bot, group):
+        """Only this group in the policy scope; kind, private switch, other groups, sources and denials are kept."""
+
+        async def apply(acl):
+            record = await self.store.get(bot, 'groups', group)
+            configured = (await acl.access_snapshot(bot, CONSUMER))['functions'][FUNCTION]
+            groups = [g for g in configured['groups'] if g != group] + ([group] if record and record['enabled'] else [])
+            if groups != configured['groups']:
+                await acl.manage_access(bot, CONSUMER, 'policy', function=FUNCTION, policy={**configured, 'groups': groups})
+            return {'policy_before': configured['groups'], 'policy_after': groups}
+
+        return await self.sync(bot, {'group': group}, apply)
 
     # ---------- owner management (HTTP) ----------
 
@@ -218,7 +237,7 @@ class Ninja3:
                 with self.writing(bot):
                     await self.store.delete(bot, 'accounts', key)
                 log.info(f'[{bot}] 删除账号 {key}')
-                return {'id': key, 'acl_sync': await self.sync(bot)}
+                return {'id': key, 'acl_sync': await self.sync_account(bot, key)}
             if operation not in {'create', 'update'}:
                 raise BusinessError('未知账号操作')
             data = await self.validate_account(bot, dict(data) if isinstance(data, dict) else data, key, create=operation == 'create')
@@ -228,7 +247,7 @@ class Ninja3:
             with self.writing(bot):
                 await self.store.put(bot, 'accounts', account['id'], account)
             log.info(f'[{bot}] 保存账号 {account["id"]} 启用={account["enabled"]} 开放群={len(account["open_groups"])}')
-            return {**self.public(account), 'acl_sync': await self.sync(bot)}
+            return {**self.public(account), 'acl_sync': await self.sync_account(bot, account['id'])}
 
     async def manage_group(self, bot, operation, data=None, key=''):
         if not self.active:
@@ -247,7 +266,7 @@ class Ninja3:
                             await self.store.put(bot, 'accounts', account['id'], account)
                     await self.store.delete(bot, 'groups', key)
                 log.info(f'[{bot}] 删除群 {key}')
-                return {'group': key, 'acl_sync': await self.sync(bot, group=key)}
+                return {'group': key, 'acl_sync': await self.sync_group(bot, key)}
             if operation != 'save' or not isinstance(data, dict) or set(data) - GROUP_FIELDS:
                 raise BusinessError('群字段无效')
             group = native(data.get('group'), '群')
@@ -260,7 +279,7 @@ class Ninja3:
             with self.writing(bot):
                 await self.store.put(bot, 'groups', group, record)
             log.info(f'[{bot}] 保存群 {group} 开放={record["enabled"]}')
-            return {**record, 'acl_sync': await self.sync(bot, group=group)}
+            return {**record, 'acl_sync': await self.sync_group(bot, group)}
 
     # ---------- replies ----------
 
@@ -323,7 +342,8 @@ class Ninja3:
         member = targets.pop()
         try:
             acl = self.access()
-            await self.declare(acl, bot)  # the owner's grant; never touches the policy scope
+            # The owner's grant; declaration never touches an existing policy scope.
+            await self.declare(acl, bot)
             facts = acl.group_state()
             if facts is None:
                 await self.reply(event, '授权待处理：群状态模块未启用')
@@ -386,7 +406,8 @@ class Ninja3:
             return
         revision = self.revision(bot)
         try:
-            acl = self.access()  # read-only path: no declaration or policy write
+            # Read-only path: no declaration or policy write.
+            acl = self.access()
             opened = await self.store.get(bot, 'groups', group)
             if not opened or not opened['enabled']:
                 await self.reply(event, '本群未开放账号查询')
@@ -434,6 +455,9 @@ class Ninja3:
         log.info(f'[{bot}] 查询拒绝 group={group} member={member} reason={reason}')
         # Explicit owner restrictions are not notified: denial, framework blacklist, and
         # a group the owner keeps out of the authorization scope (closed there).
+        if decision.get('retryable'):
+            await self.reply(event, '暂时无法确认查询资格，请稍后重试')
+            return
         if reason in {'denied', 'framework_denied'}:
             await self.reply(event, '你暂无查询权限')
             return
@@ -447,7 +471,9 @@ class Ninja3:
         # Claim a notice only when this attempt actually reached the owner.
         sent = record['count'] == 1 and record['notification'] == 'sent'
         told = '已通知主人' if sent else '已记录给主人'
-        await self.reply(event, f'暂时无法确认查询资格，请稍后重试；{told}' if decision.get('retryable') else f'你暂无查询权限，{told}')
+        # Unreliable group facts (recovery required, module off) are for the owner to judge.
+        unsure = reason in {'group_facts_recovery_required', 'group_facts_unavailable'}
+        await self.reply(event, f'暂时无法确认查询资格，{told}' if unsure else f'你暂无查询权限，{told}')
 
     # ---------- owner notices ----------
 
