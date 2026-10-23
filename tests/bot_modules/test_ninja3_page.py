@@ -213,13 +213,15 @@ async def test_group_auto_grant_switch_in_a_real_browser(ninja):
             await page.click('#groups tr:has-text("group-a") button:text-is("开放")')
             await page.wait_for_function("() => document.getElementById('groups').textContent.includes('开放，入群自动授权关闭')")
             assert await rules() == ['group-a']
-            assert '入群自动授权 false → true' in await page.text_content('#operations')
+            # The sync log renders after the table within the same refresh.
+            await page.wait_for_function("() => document.getElementById('operations').textContent.includes('入群自动授权 false → true')")
             # Turning only the switch off removes the rule and leaves the group open.
             await page.click('#groups tr:has-text("group-a") button:text-is("关闭自动授权")')
             await page.wait_for_function("() => document.getElementById('groups').textContent.includes('开放关闭开启自动授权')")
             assert await rules() == [] and (await stored())['group-a']['enabled'] is True
-            assert '入群自动授权 true → false' in await page.text_content('#operations')
-            assert await page.text_content('#acl-status') == '一致'
+            # The sync log renders after the table within the same refresh.
+            await page.wait_for_function("() => document.getElementById('operations').textContent.includes('入群自动授权 true → false')")
+            await page.wait_for_function("() => document.getElementById('acl-status').textContent === '一致'")
             await browser.close()
     finally:
         await server.close()

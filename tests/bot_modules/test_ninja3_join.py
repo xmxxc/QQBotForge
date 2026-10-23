@@ -163,6 +163,11 @@ async def test_trusted_join_grants_this_cycle_leave_revokes_and_rejoin_is_a_new_
     assert await host.say('账号 账号B', user='MEMBERJ') == ['名称：账号B\n账号：fake-login\n密码：fake-b']
     decision = await host.access.evaluate('bot-a', 'ninja3', 'query', 'group-a', 'MEMBERJ', action='invoke')
     assert decision['allowed'] and decision['fact_kind'] == 'native_join' and host.access.decision_current('bot-a', decision)
+    # Another member leaving changes only group facts (no authorization write): in-flight decisions are stale.
+    await settle(host, frames.feed('GROUP_MEMBER_REMOVE', 'MEMBERX'))
+    assert not host.access.decision_current('bot-a', decision)
+    decision = await host.access.evaluate('bot-a', 'ninja3', 'query', 'group-a', 'MEMBERJ', action='invoke')
+    assert decision['allowed'] and host.access.decision_current('bot-a', decision)
     # Leaving is immediate for in-flight decisions, then the source is retired.
     left = frames.feed('GROUP_MEMBER_REMOVE', 'MEMBERJ')
     await until(lambda: not host.access.decision_current('bot-a', decision))
@@ -366,6 +371,9 @@ async def test_owner_changes_before_the_join_decision_leave_no_source(ninja, mon
             await auto(host, enabled=False)
         elif change == 'close_group':
             await auto(host, open_group=False)
+            # The owner's switch stays on in the plugin, but a closed group syncs no rule.
+            assert (await host.ninja_api('GET', 'groups'))[1]['data'][0]['auto_grant'] is True
+            assert (await host.access.access_snapshot('bot-a', 'ninja3'))['join_rules'] == []
         elif change == 'deny':
             await host.access.manage_access('bot-a', 'ninja3', 'deny', function='query', group='group-a', member='MEMBERJ')
         else:
