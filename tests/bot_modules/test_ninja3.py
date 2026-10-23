@@ -82,7 +82,8 @@ async def test_backend_crud_defaults_closed_and_isolated_per_bot(ninja):
     host = ninja
     assert (await host.ninja_api(authenticated=False))[0] == 401
     status, group = await host.ninja_api('POST', 'groups', {'group': 'group-a'})
-    assert status == 200 and group['data'] == {'group': 'group-a', 'name': '', 'enabled': False}
+    assert status == 200 and {k: group['data'][k] for k in ('group', 'name', 'enabled')} == {'group': 'group-a', 'name': '', 'enabled': False}
+    assert group['data']['acl_sync']['status'] == 'saved' and group['data']['acl_sync']['policy_after'] == []
     status, account = await host.ninja_api('POST', 'accounts', {'name': '账号A', 'login': 'fake-login', 'password': SECRET})
     assert status == 201 and account['data']['enabled'] is False and account['data']['open_groups'] == []
     assert SECRET not in str(account) and SECRET not in str(await host.ninja_api())
@@ -94,8 +95,18 @@ async def test_backend_crud_defaults_closed_and_isolated_per_bot(ninja):
     # Resource category groups stay empty; QQ group openness lives in the policy scope only.
     assert snapshot['resources'][account['data']['id']] == {'id': account['data']['id'], 'groups': [], 'enabled': False}
     assert snapshot['functions']['query'] == {'kind': 'explicit', 'groups': [], 'private': False}
-    await host.ninja_api('POST', 'groups', {'group': 'group-a', 'enabled': True})
+    status, opened = await host.ninja_api('POST', 'groups', {'group': 'group-a', 'enabled': True})
+    assert opened['data']['acl_sync'] | {'id': '', 'created_at': 0} == {
+        'id': '',
+        'created_at': 0,
+        'kind': 'acl_sync',
+        'group': 'group-a',
+        'status': 'saved',
+        'policy_before': [],
+        'policy_after': ['group-a'],
+    }
     assert (await host.access.access_snapshot('bot-a', 'ninja3'))['functions']['query']['groups'] == ['group-a']
+    assert [o['group'] for o in (await host.ninja_api('GET', 'operations'))[1]['data'] if o['group']] == ['group-a', 'group-a']
 
 
 async def test_owner_mention_grant_covers_future_accounts_and_member_queries_publicly(ninja, caplog):
@@ -242,7 +253,7 @@ async def test_denial_wins_and_disable_close_rescope_delete_take_effect(ninja):
     assert await host.say('账号 账号C', user='MEMBERA') == ['你暂无查询权限，已记录给主人']
 
 
-@pytest.mark.parametrize('change', ['password', 'disable', 'close_group', 'revoke', 'deny', 'leave', 'reload_access', 'reload_plugin'])
+@pytest.mark.parametrize('change', ['password', 'disable', 'close_group', 'narrow_acl', 'revoke', 'deny', 'leave', 'reload_access', 'reload_plugin'])
 async def test_changes_while_query_prepares_never_send_old_content(ninja, change):
     host = ninja
     account = await host.setup()
@@ -259,6 +270,9 @@ async def test_changes_while_query_prepares_never_send_old_content(ninja, change
                 await host.ninja_api('PATCH', 'accounts/' + account['id'], {'enabled': False})
             elif change == 'close_group':
                 await host.ninja_api('POST', 'groups', {'group': 'group-a', 'enabled': False})
+            elif change == 'narrow_acl':
+                configured = (await self.access_snapshot(bot, 'ninja3'))['functions']['query']
+                await self.manage_access(bot, 'ninja3', 'policy', function='query', policy={**configured, 'groups': []})
             elif change == 'revoke':
                 await self.manage_access(bot, 'ninja3', 'revoke', function='query', group=group, member=member)
             elif change == 'deny':
@@ -295,3 +309,103 @@ async def test_old_account_plugin_keeps_its_own_data_and_commands(ninja):
     assert (await host.access.access_snapshot('bot-a', 'account_sharing'))['functions']['account_sharing']['groups'] == []
     await host.say('账户列表', user='MEMBERA')
     assert all('fake-secret' not in str(m) for m in host.sender.messages)
+
+
+async def acl_request(host, body, *, bot='bot-a'):
+    response = await host.http.request(
+        'POST', '/api/ext/access-control/', params={'bot': bot, 'consumer': 'ninja3'}, json=body, headers={'Cookie': 'elaina_session=group-test'}
+    )
+    return response.status, await response.json()
+
+
+async def test_member_queries_never_write_authorization_and_owner_narrowing_survives_reloads(ninja):
+    host = ninja
+    account = await host.setup()
+    await grant(host)
+    await host.state.confirm_member('bot-a', 'group-a', 'MEMBERC', evidence='fake verified', member_role='member')
+    await host.access.manage_access('bot-a', 'ninja3', 'deny', function='query', group='group-a', member='MEMBERC')
+
+    async def version():
+        return (await host.access.access_snapshot('bot-a', 'ninja3'))['version']
+
+    before = await version()
+    assert SECRET in (await host.say('账号 账号A', user='MEMBERA'))[0]
+    assert await host.say('账号列表', user='MEMBERB') == ['你暂无查询权限，已记录给主人']
+    assert await version() == before
+    # The owner narrows the scope in the authenticated authorization page (and opens private for this consumer).
+    status, narrowed = await acl_request(
+        host, {'consumer': 'ninja3', 'operation': 'policy', 'function': 'query', 'policy': {'kind': 'explicit', 'groups': [], 'private': True}}
+    )
+    assert status == 200, narrowed
+    narrowed_version = await version()
+    for reload in (None, 'plugin', 'access'):
+        if reload == 'plugin':
+            await host.plugins.reload('ninja3')
+        elif reload == 'access':
+            await host.modules.disable('access_control', _persist=False)
+            await host.modules.enable('access_control', _skip_deps=True, _persist=False)
+            host.access = host.modules.get('access_control')
+        assert await host.say('账号 账号A', user='MEMBERA') == ['本群未开放账号查询']
+        assert await host.say('账号列表', user='MEMBERB') == ['本群未开放账号查询']
+        assert await version() == narrowed_version
+    assert [n['member'] for n in (await host.ninja_api('GET', 'notices'))[1]['data']] == ['MEMBERB']
+    status, report = await host.ninja_api('GET', 'status')
+    assert report['data']['restricted_by_acl'] == ['group-a'] and report['data']['groups'] == [{'group': 'group-a', 'plugin_open': True, 'acl_open': False}]
+    # Account configuration writes sync resources only; they never widen the group scope.
+    await host.ninja_api('PATCH', 'accounts/' + account['id'], {'password': 'fake-rotated'})
+    assert (await host.access.access_snapshot('bot-a', 'ninja3'))['functions']['query']['groups'] == []
+    assert await host.say('账号 账号A', user='MEMBERA') == ['本群未开放账号查询']
+    # Explicitly saving the group as open in the plugin syncs that group only, keeping everything else.
+    status, saved = await host.ninja_api('POST', 'groups', {'group': 'group-a', 'enabled': True})
+    assert (saved['data']['acl_sync']['policy_before'], saved['data']['acl_sync']['policy_after']) == ([], ['group-a'])
+    snapshot = await host.access.access_snapshot('bot-a', 'ninja3')
+    assert snapshot['functions']['query'] == {'kind': 'explicit', 'groups': ['group-a'], 'private': True}
+    assert [d['member'] for d in snapshot['denies']] == ['MEMBERC'] and [g['member'] for g in snapshot['grants']] == ['MEMBERA']
+    assert await host.say('账号 账号A', user='MEMBERA') == ['名称：账号A\n账号：fake-login\n密码：fake-rotated']
+    assert (await host.ninja_api('GET', 'status'))[1]['data']['restricted_by_acl'] == []
+
+
+async def test_notices_skip_explicit_restrictions_but_record_ordinary_unauthorized_and_unverified(ninja):
+    from core.plugin._blacklist import get_blacklist_map, set_blacklist_map
+
+    host = ninja
+    await host.setup()
+    await host.event('忍3', user='owner-a')
+    host.texts()
+    # Ordinary unauthorized (verified member without a grant) and unverified members are notified.
+    await host.state.confirm_member('bot-a', 'group-a', 'MEMBERB', evidence='fake verified', member_role='member')
+    assert await host.say('账号列表', user='MEMBERB') == ['你暂无查询权限，已通知主人']
+    assert await host.say('账号列表', user='MEMBERU') == ['你暂无查询权限，已通知主人']
+    reasons = {n['member']: n['reason'] for n in (await host.ninja_api('GET', 'notices'))[1]['data']}
+    assert reasons == {'MEMBERB': 'no_explicit_permission', 'MEMBERU': 'membership_unverified'}
+    host.sender.messages.clear()
+    # Explicit denial, framework blacklist and a group not opened in the plugin are not notified.
+    await host.access.manage_access('bot-a', 'ninja3', 'deny', function='query', group='group-a', member='MEMBERD')
+    assert await host.say('账号列表', user='MEMBERD') == ['你暂无查询权限']
+    assert await host.say('账号列表', user='MEMBERE', group='group-b') == ['本群未开放账号查询']
+    users = get_blacklist_map('bot-a', 'user')
+    set_blacklist_map('bot-a', 'user', {**users, 'MEMBERF': 'fake'})
+    try:
+        replies = await host.say('账号列表', user='MEMBERF')
+    finally:
+        set_blacklist_map('bot-a', 'user', users)
+    assert replies == [None]  # the framework's blacklist template reply; the plugin never runs
+    assert not [m for m in host.sender.messages if m[0] == 'push']
+    assert set(reasons) == {n['member'] for n in (await host.ninja_api('GET', 'notices'))[1]['data']}
+
+
+async def test_both_plugin_scope_and_authorization_must_pass(ninja):
+    host = ninja
+    account = await host.setup()
+    await host.ninja_api('POST', 'groups', {'group': 'group-b', 'enabled': False})
+    await host.ninja_api('PATCH', 'accounts/' + account['id'], {'open_groups': ['group-a', 'group-b']})
+    # The owner opens group-b in the authorization page only; the plugin keeps it closed.
+    configured = (await host.access.access_snapshot('bot-a', 'ninja3'))['functions']['query']
+    status, _ = await acl_request(
+        host, {'consumer': 'ninja3', 'operation': 'policy', 'function': 'query', 'policy': {**configured, 'groups': ['group-a', 'group-b']}}
+    )
+    assert status == 200
+    await grant(host, group='group-b')
+    assert (await host.access.evaluate('bot-a', 'ninja3', 'query', 'group-b', 'MEMBERA', account['id']))['allowed']
+    assert await host.say('账号 账号A', user='MEMBERA', group='group-b') == ['本群未开放账号查询']
+    assert SECRET not in str(host.sender.messages)

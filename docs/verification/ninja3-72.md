@@ -12,7 +12,7 @@ ruff format --check plugins/ninja3 tests/bot_modules/test_ninja3.py
 sed -n '/<script>/,/<\/script>/p' plugins/ninja3/page.html | sed '1s/.*<script>//;$s/<\/script>.*//' | node --check -
 ```
 
-本机 Python 3.13：test_ninja3 15 passed；tests/bot_modules 417 passed（基线 402 + 新增 15）。
+本机 Python 3.13：第 1 轮 test_ninja3 15 passed；第 2 轮 19 passed；tests/bot_modules 421 passed（基线 402 + 新增 19）。
 
 ## 红绿
 
@@ -35,3 +35,30 @@ sed -n '/<script>/,/<\/script>/p' plugins/ninja3/page.html | sed '1s/.*<script>/
 ## 继承问题（基线同样存在）
 
 测试 fixture 的假 `log_service` 缺少 `wakeup_update`／`db_fetch_one`，C2C 与 Bot 入群事件会在日志里打印 AttributeError；既有 account/access 测试同样出现，不影响断言。
+
+## 第 2 轮：总控配置权边界（基于 c712ca1）
+
+要求见 #72 总控评论（查询只读、主人收窄保留、两边同时放行、通知例外）。
+
+- 旧新探针（未提交的探针用例：授权管理收窄 → 插件重载 → 已授权成员查询）：
+  - 旧 c712ca1：查询把群范围写回 `['group-a']`（授权版本 5→6），并在群内发出账密。失败。
+  - 新：回复“本群未开放账号查询”，范围仍为 `[]`，版本不变。通过。
+- 新用例在 c712ca1 的 service.py 上失败 2 项：`test_backend_crud_defaults_closed_and_isolated_per_bot`（保存结果需返回同步记录）和 `test_member_queries_never_write_authorization_and_owner_narrowing_survives_reloads`。新代码通过。
+- 新增或扩展的用例：
+  - `test_member_queries_never_write_authorization_and_owner_narrowing_survives_reloads`：未授权和已授权查询都不改授权版本；经已鉴权“授权管理”接口收窄后，查询、插件重载、授权模块重载都不写回；账号保存不扩大群范围；再次保存群只同步该群，并保留私聊开关、拒绝、来源。
+  - `test_both_plugin_scope_and_authorization_must_pass`：授权管理放行但插件关闭的群不发账密。
+  - `test_notices_skip_explicit_restrictions_but_record_ordinary_unauthorized_and_unverified`：一般无授权和待核验会通知；明确拒绝、未开放群、框架黑名单不通知。
+  - 变化参数新增 `narrow_acl`：查询准备期间收窄授权范围时不发旧内容。
+- 变异（每次删一处守卫）：
+
+| 删除的守卫 | 失败用例 |
+| --- | --- |
+| 最终同步检查 | change 用例全部 9 个参数 |
+| 查询路径不同步授权（改为查询时同步） | narrowing 用例，以及通知用例 |
+| 授权未纳入范围的群不通知 | narrowing 用例 |
+| 同步时保留既有策略字段（改为重写整条策略） | narrowing 用例 |
+| 插件本身的开放群检查 | `test_both_plugin_scope_and_authorization_must_pass` |
+| 主人、唯一 @、明确授权、恢复屏障、十分钟合并、资源分类 | 同第 1 轮对应用例 |
+
+  “账号保存不触发群范围同步”的 `if group is not None` 变异是等价变异：`group=None` 时群范围不变，所以没有用例失败。
+- 假日志服务的 AttributeError 发生在框架用户追踪和日志副任务（`_track_worker`、`db_fetch_one`）中，不在被测入口内。每个入口用例都断言了插件的确切群回复或私聊推送（例如 `忍3` 的“已记录本私聊为主人通知地址”），所以入口没执行就会失败。框架黑名单用例断言回复只有框架模板（内容为 None），插件没有执行。
