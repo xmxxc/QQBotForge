@@ -83,12 +83,25 @@ async def test_account_form_new_edit_delete_and_rejection_in_a_real_browser(ninj
             await page.wait_for_function("() => document.getElementById('status').textContent.startsWith('已加载')")
 
             async def save(expect):
-                await page.click('#account button:not([type])')
+                # Discard the previous result so a repeated success cannot satisfy this wait.
+                await page.locator('#status').evaluate("element => element.textContent = ''")
+                async with page.expect_response(
+                    lambda response: '/api/ext/ninja3/accounts' in response.url and response.request.method in {'POST', 'PATCH'}
+                ) as submitted:
+                    await page.click('#account button:not([type])')
+                response = await submitted.value
                 try:
                     await page.wait_for_function('text => document.getElementById("status").textContent.includes(text)', arg=expect)
                 except Exception:
                     raise AssertionError(f'页面未显示“{expect}”：状态={await page.text_content("#status")!r} 页面错误={errors}') from None
-                return await page.text_content('#status')
+                message = await page.text_content('#status')
+                result = await response.json()
+                if response.ok:
+                    sync = {'not_needed': '启用状态未变，未改授权', 'saved': '已同步本账号', 'unavailable': '授权模块不可用', 'failed': '失败'}
+                    assert message == '账号已保存；授权同步：' + sync[result['data']['acl_sync']['status']]
+                else:
+                    assert message == result['error']
+                return message
 
             async def fill(name, login, password):
                 await page.fill('#name', name)
@@ -105,6 +118,7 @@ async def test_account_form_new_edit_delete_and_rejection_in_a_real_browser(ninj
             await page.click('#rows tr:has-text("账号A") button:text("编辑")')
             await page.click('#account button:text("新增")')
             assert await page.input_value('#name') == ''
+            assert await page.input_value('#id') == ''
             await fill('账号B', 'fake-login-b', 'fake-pass-b')
             await save('账号已保存')
             saved = await accounts()
@@ -119,14 +133,17 @@ async def test_account_form_new_edit_delete_and_rejection_in_a_real_browser(ninj
             saved = await accounts()
             assert (saved['账号A']['login'], saved['账号B']['login']) == ('fake-login-a', 'fake-login-b2') and len(saved) == 2
             await page.click('#account button:text("新增")')
+            assert await page.input_value('#id') == ''
             await fill('账号C', 'fake-login-c', 'fake-pass-c')
             await save('账号已保存')
             assert len(await accounts()) == 3
             # 4. Delete: list and form agree, no page error; 新增 still works afterwards.
+            await page.click('#rows tr:has-text("账号C") button:text("编辑")')
             page.once('dialog', lambda dialog: dialog.accept())
             await page.click('#rows tr:has-text("账号C") button:text("删除")')
             await page.wait_for_function("() => !document.getElementById('rows').textContent.includes('账号C')")
             assert set(await accounts()) == {'账号A', '账号B'} and await page.input_value('#name') == ''
+            assert await page.input_value('#id') == ''
             await fill('账号D', 'fake-login-d', 'fake-pass-d')
             await save('账号已保存')
             assert set(await accounts()) == {'账号A', '账号B', '账号D'}
