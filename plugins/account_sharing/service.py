@@ -23,6 +23,7 @@ from core.plugin._blacklist import get_blacklist_map
 from .group_delivery import ACCOUNT_CHANGED, GroupDelivery
 from .menus import MenuSessions
 from .storage import ExtensionStore
+from .text import operation_line
 from .text import results as results_text
 from .text import rules as rules_text
 from .text import tasks as tasks_text
@@ -290,7 +291,7 @@ class AccountSharing:
     def credentials(account):
         # Empty description/URL lines are omitted rather than left as trailing blank lines.
         lines = (account['name'], f'账号：{account["login"]}', f'密码：{account["password"]}', account['description'], account['url'])
-        return '\n'.join(line for line in lines if line)
+        return '\n'.join(line for line in lines if line and line.strip())
 
     async def query_content(self, bot, resource, rule_id):
         if rule_id:
@@ -1038,7 +1039,7 @@ class AccountSharing:
                 if action == '待办':
                     summary = tasks_text(await self.tasks(bot, json.loads(args) if args else {}))
                 else:
-                    summary = results_text([await self.task_action(bot, {'operation': 'retry_notification', 'id': args})]).split('\n', 1)[-1]
+                    summary = '通知重试结果：' + operation_line(await self.task_action(bot, {'operation': 'retry_notification', 'id': args}))
                 await self.safe_reply(event, summary if detail else '请在主人私聊或后台查看待办和通知详情')
                 return
             if action == '迁移':
@@ -1063,8 +1064,10 @@ class AccountSharing:
                     result = await self.rule_management(bot, 'delete', key=args)
                 else:
                     result = await self.rule_management(bot, 'list')
-                names = {a['id']: a['name'] for a in await self.accounts(bot)}
-                await self.safe_reply(event, rules_text(result, names) if detail else '规则操作已完成，详情请在主人私聊或后台查看')
+                if detail:
+                    await self.safe_reply(event, rules_text(result, {a['id']: a['name'] for a in await self.accounts(bot)}))
+                else:
+                    await self.safe_reply(event, '规则操作已完成，详情请在主人私聊或后台查看')
                 return
             if action == '确认绑定':
                 raise BusinessError('身份绑定确认已移至授权管理：授权管理 {"operation":"binding_confirm",...}')

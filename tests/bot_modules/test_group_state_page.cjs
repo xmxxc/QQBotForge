@@ -212,7 +212,7 @@ test('summaries keep unknown fields unknown and never report a pending recovery 
         {group: 'g3', reliable: false, status: 'historical', reason: 'future_code', roster: {complete: false, reason: 'state_changed'}},
     ]});
     const text = host.nodes['gs-summary'].textContent;
-    assert.match(text, /恢复基线：未就绪（事件字段不完整）/);
+    assert.match(text, /恢复基线：未就绪（需重建，请点击“重建恢复基线”；原因：事件字段不完整）/);
     assert.match(text, /g1：暂停使用（恢复基线未完成）；历史记录：Bot 在群（角色未知），主动消息未知；最近查询 未查询/);
     assert.match(text, /g2：失败（保存失败）/);
     assert.match(text, /g3：历史（其他原因（future_code））；Bot 在群状态未知/);
@@ -231,9 +231,19 @@ test('a late response cannot replace the readable summary of the current Bot', a
     host.nodes['gs-bot'].onchange();
     await host.reply(host.requests.at(-1), {bot: 'bot-b', recovery: {ready: true}, groups: [{group: 'gb', reliable: false, reason: 'timeout', state: 'unknown', roster: {}}]});
     await host.reply(earlier, {bot: 'bot-a', recovery: {ready: true}, groups: [{group: 'ga', reliable: true, roster: {complete: true}}]});
-    assert.match(host.nodes['gs-summary'].textContent, /gb：未知（查询超时）/);
+    assert.match(host.nodes['gs-summary'].textContent, /gb：失败（查询超时）/);
     assert.doesNotMatch(host.nodes['gs-summary'].textContent, /ga/);
     host.nodes['gs-group'].value = 'group-b';
     host.nodes['gs-group'].oninput();
     assert.equal(host.nodes['gs-summary'].textContent, '');
+});
+
+test('the status line labels the shared cases exactly like the QQ replies', async () => {
+    const cases = JSON.parse(fs.readFileSync(path.join(__dirname, 'group_state_labels.json'), 'utf8'));
+    const host = await page();
+    await host.reply(host.requests[0], {bot: 'bot-a', recovery: {ready: false, phase: 'processing'},
+        groups: cases.map(([fact], index) => ({...fact, group: 'g' + index, roster: {}}))});
+    const status = host.nodes['gs-status'].textContent;
+    cases.forEach(([, expected], index) => assert.ok(status.includes('g' + index + ' ' + expected + '，名册'), expected));
+    assert.match(host.nodes['gs-summary'].textContent, /恢复基线：未就绪（处理中，请稍后再查看）/);
 });

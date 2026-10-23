@@ -962,14 +962,15 @@ class GroupState:
                 data = json.loads(text.split(maxsplit=2)[2])
                 if not isinstance(data, dict) or set(data) - {'group', 'member', 'evidence', 'member_role'}:
                     raise ValueError('人工确认须为成员事实对象')
-                operation, result = 'confirm', await self.confirm_member(
+                operation = 'confirm'
+                result = await self.confirm_member(
                     event.appid, data.get('group'), data.get('member'), evidence=data.get('evidence'), member_role=data.get('member_role')
                 )
             elif len(words) == 1:
                 operation, result = 'overview', await self.snapshot(event.appid)
             else:
                 raise ValueError('群状态 / 群状态 刷新或名册 <群ID> / 群状态 核验 <群ID> <成员ID> / 群状态 确认 <JSON>')
-            content = short_reply(operation) if event.is_group else owner_reply(operation, result)
+            content = short_reply(operation) if event.is_group else owner_reply(operation, result, pause=self._pause_reason(event.appid))
         except ValueError as error:
             content = str(error)
         except (RuntimeError, sqlite3.Error, OSError):

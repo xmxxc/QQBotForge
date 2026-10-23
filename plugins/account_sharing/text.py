@@ -43,6 +43,10 @@ def status(value):
     return STATUS.get(value, MODES.get(value, f'其他（{value}）'))
 
 
+def named(table, code, noun):
+    return table.get(code) or (f'其他{noun}（{code}）' if code else f'未知{noun}')
+
+
 def operation_line(result):
     parts = []
     for key, name in FIELDS:
@@ -52,9 +56,13 @@ def operation_line(result):
             if isinstance(summary, dict):
                 text += f'（成功 {summary.get("success", "未知")}，失败 {summary.get("failed", "未知")}）'
             parts.append(text)
+    if result.get('mode_requested') and result.get('mode_requested') != result.get('mode'):
+        parts.append(f'请求{status(result["mode_requested"])}未生效')
+    # Raw codes from other modules: shown as-is rather than guessed into Chinese.
+    parts += [f'{name} {result[key]}' for key, name in (('reason', '原因'), ('error', '错误码')) if result.get(key)]
     when = time.strftime('%m-%d %H:%M', time.localtime(result['created_at'])) if isinstance(result.get('created_at'), (int, float)) else '时间未知'
     scope = '，'.join(f'{name} {result[key]}' for key, name in (('group', '群'), ('member', '成员')) if result.get(key))
-    return f'{when} {KINDS.get(result.get("kind"), result.get("kind"))} {str(result.get("id", ""))[:8]}{"（" + scope + "）" if scope else ""}：{"；".join(parts) or "无状态"}'
+    return f'{when} {named(KINDS, result.get("kind"), "操作")} {str(result.get("id", ""))[:8]}{"（" + scope + "）" if scope else ""}：{"；".join(parts) or "无状态"}'
 
 
 def results(rows):
@@ -72,7 +80,7 @@ def tasks(rows):
         return '账户管理待办：暂无'
     lines = [f'账户管理待办（共 {len(rows)} 项）']
     for index, task in enumerate(rows[:LIMIT], 1):
-        name = TASKS.get(task.get('type'), task.get('type'))
+        name = named(TASKS, task.get('type'), '待办')
         if task.get('type') == 'notification':
             lines.append(f'{index}. {name}：{operation_line(task)}；处理：账户管理 重试通知 {task.get("operation_id")}')
             continue

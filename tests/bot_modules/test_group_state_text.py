@@ -96,11 +96,12 @@ async def test_recovery_barrier_is_never_reported_as_success(group_host):
     host.lifecycle('GROUP_MEMBER_REMOVE', member='member-c', sequence=2, event_id=None, timestamp=1002)
     await until(lambda: state.recovery.get_status('bot-a').failed)
     overview = await reply(host, '群状态')
-    assert '恢复基线：未就绪' in overview and '恢复基线：已就绪' not in overview
+    assert '恢复基线：未就绪（需重建，请发“群状态 恢复”或在后台重建；原因：事件字段不完整）' in overview
     assert 'group-a：可靠' not in overview
     host.sender.response = (None, {'code': '11253'})
     rebuilt = await reply(host, '群状态 恢复')
     assert rebuilt.startswith('恢复基线重建：未完成，事实仍暂停使用')
+    assert '恢复基线：未就绪（需重建' in await reply(host, '群状态')
     assert '已完成' not in rebuilt
 
 
@@ -132,15 +133,22 @@ def test_page_and_reply_share_one_reason_table():
     assert page == REASONS
 
 
-def test_labels_keep_unknown_progress_and_failure_apart():
-    from modules.group_state.text import bot_state, label
+@pytest.mark.parametrize('fact,expected', json.loads((Path(__file__).with_name('group_state_labels.json')).read_text(encoding='utf-8')))
+def test_labels_keep_unknown_progress_and_failure_apart(fact, expected):
+    # The page test checks the same cases, so the two label rules cannot drift apart.
+    from modules.group_state.text import label
 
-    assert label({'reliable': False, 'status': 'pending', 'reason': 'persistence_pending'}) == '处理中（正在保存）'
-    assert label({'reliable': False, 'reason': '', 'continuity_reason': 'recovery_pending'}) == '暂停使用（恢复基线未完成）'
-    assert label({'reliable': False, 'status': 'historical', 'reason': 'persistence_failed'}) == '失败（保存失败）'
-    assert label({'reliable': False, 'status': 'historical', 'reason': 'process_restart'}) == '历史（重启或重载后需重新核验）'
-    assert label({'state': 'unknown', 'reliable': False, 'reason': 'timeout'}) == '未知（查询超时）'
-    assert label({'reliable': False, 'status': 'historical', 'reason': 'new_code'}) == '历史（其他原因（new_code））'
-    assert label(None) == '未知'
-    # Unknown fields stay unknown instead of becoming false/zero.
+    assert label(fact) == expected
+
+
+def test_unknown_fields_stay_unknown_and_recovery_names_the_next_step():
+    from modules.group_state.text import bot_state, recovery_line
+
     assert bot_state({'reliable': True, 'bot_state': {'member_role': None}}) == 'Bot 在群（角色未知），主动消息未知'
+    assert (
+        recovery_line({'ready': False, 'phase': 'processing', 'reason': 'unobserved_dispatch'})
+        == '恢复基线：未就绪（处理中，请稍后再查看；原因：有未处理的事件）'
+    )
+    # The module's own verdict wins over the phase (e.g. an HTTP callback was received).
+    assert recovery_line({'ready': False, 'phase': 'processing', 'reason': ''}, 'recovery_required').startswith('恢复基线：未就绪（需重建')
+    assert recovery_line({'ready': True}, 'persistence_pending') == '恢复基线：未就绪（处理中，请稍后再查看）'

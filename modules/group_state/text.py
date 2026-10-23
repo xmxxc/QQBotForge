@@ -56,6 +56,14 @@ REASONS = {
     'same_time_conflict': '同一时刻事件冲突',
     'conflicting_duplicate': '重复事件内容冲突',
     'incomplete_event': '事件字段不完整',
+    'baseline_established': '已建立恢复基线',
+    'missing_sequence': '事件序号缺失',
+    'overflow': '待补发事件过多',
+    'unobserved_dispatch': '有未处理的事件',
+    'unproven_event_source': '事件来源无法证明',
+    'old_callback_running': '旧回调仍在运行',
+    'consumer_invalidated': '消费方要求重建',
+    'dependency_invalidated': '依赖模块要求重建',
 }
 PROGRESS = {'refreshing', 'bot_state_refreshing', 'roster_refreshing', 'verifying', 'confirming', 'persistence_pending', 'recovery_processing', 'rebuilding'}
 UNKNOWN = {'', 'not_verified', 'unknown_group', 'response_unknown', 'unsupported'}
@@ -89,7 +97,7 @@ def label(fact):
         return f'处理中（{reason_text(reason)}）'
     if reason == 'permission_denied':
         return '无权限（平台无权限）'
-    if reason.endswith('_failed'):
+    if reason.endswith('_failed') or reason == 'timeout':
         return f'失败（{reason_text(reason)}）'
     if fact.get('state') == 'unknown' or reason in UNKNOWN:
         return '未知' + (f'（{reason_text(reason)}）' if reason else '')
@@ -100,7 +108,18 @@ def label(fact):
 
 def paused(fact):
     # A fact with its own reason may also wait on the recovery barrier.
+    fact = fact if isinstance(fact, dict) else {}
     return '；恢复基线未完成，暂不可用' if fact.get('continuity_reason') == 'recovery_pending' and fact.get('reason') else ''
+
+
+def recovery_line(recovery, pause=''):
+    """Processing only needs a later retry; everything else needs a rebuild. `pause` is the module's own verdict when known."""
+    if recovery.get('ready') is True and not pause:
+        return '恢复基线：已就绪'
+    processing = pause in {'recovery_processing', 'persistence_pending'} if pause else recovery.get('phase') in {'processing', 'recovering'}
+    state = '处理中，请稍后再查看' if processing else '需重建，请发“群状态 恢复”或在后台重建'
+    reason = reason_text(recovery.get('reason'))
+    return f'恢复基线：未就绪（{state}' + (f'；原因：{reason}' if reason else '') + '）'
 
 
 def when(value):
@@ -149,18 +168,18 @@ def roster_lines(result):
     return lines
 
 
-def owner_reply(operation, result):
+def owner_reply(operation, result, *, pause=''):
     """Owner private reply; detail (members, native IDs) never goes to group chats, see short_reply."""
     title = TITLES[operation]
     if operation == 'rebuild':
         if result.get('ready') is True:
             return f'{title}：已完成，事实恢复可用'
-        return f'{title}：未完成，事实仍暂停使用。请按待核验的群／成员逐项核验后再发“群状态 恢复”'
+        # False also covers busy notifications or changes during the rebuild, not only failed verification.
+        return f'{title}：未完成，事实仍暂停使用。请查看“群状态”中未就绪或待核验的群／成员，处理后再发“群状态 恢复”'
     if operation == 'overview':
-        recovery = result.get('recovery') or {}
-        ready = '已就绪' if recovery.get('ready') is True else f'未就绪（{reason_text(recovery.get("reason")) or "恢复基线未完成"}）'
         groups = result.get('groups') or []
-        return '\n'.join([f'{title}（仅已知群，不代表全部群）', f'恢复基线：{ready}', f'已知群 {len(groups)} 个', *map(group_line, groups)])
+        lines = [recovery_line(result.get('recovery') or {}, pause), f'已知群 {len(groups)} 个', *map(group_line, groups)]
+        return '\n'.join([f'{title}（仅已知群，不代表全部群）', *lines])
     if operation == 'refresh':
         lines = [f'群 {result.get("group")}：{label(result)}{paused(result)}', bot_state(result), f'最近查询 {when(result.get("checked_at"))}']
     elif operation == 'roster':
