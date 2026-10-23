@@ -162,6 +162,11 @@ class Audience:
             and all(self.access.decision_current(bot, decision) for decision in issued['decisions'])
         )
 
+    def facts_current(self, bot, report, *, consumer, function, group, resource, actions):
+        """Only the group facts behind this report (roster, members, roles, recovery) are unchanged."""
+        issued = self._issued(bot, report, consumer, function, group, resource, actions)
+        return bool(issued and self._roster_current(issued))
+
     def current(self, bot, report, *, consumer, function, group, resource, actions):
         """Every recipient decision and the roster proof still hold for this exact send."""
         issued = self._issued(bot, report, consumer, function, group, resource, actions)
