@@ -23,6 +23,9 @@ from core.plugin._blacklist import get_blacklist_map
 from .group_delivery import ACCOUNT_CHANGED, GroupDelivery
 from .menus import MenuSessions
 from .storage import ExtensionStore
+from .text import results as results_text
+from .text import rules as rules_text
+from .text import tasks as tasks_text
 
 log = get_logger(PLUGIN, '账户共享')
 PREFIX = '/api/ext/account-sharing/'
@@ -285,7 +288,9 @@ class AccountSharing:
 
     @staticmethod
     def credentials(account):
-        return f'{account["name"]}\n账号：{account["login"]}\n密码：{account["password"]}\n{account["description"]}\n{account["url"]}'
+        # Empty description/URL lines are omitted rather than left as trailing blank lines.
+        lines = (account['name'], f'账号：{account["login"]}', f'密码：{account["password"]}', account['description'], account['url'])
+        return '\n'.join(line for line in lines if line)
 
     async def query_content(self, bot, resource, rule_id):
         if rule_id:
@@ -1030,12 +1035,11 @@ class AccountSharing:
             args = words[2] if len(words) > 2 else ''
             detail = event.is_direct and not event.is_channel
             if action in {'待办', '重试通知'}:
-                result = (
-                    await self.tasks(bot, json.loads(args) if args else {})
-                    if action == '待办'
-                    else await self.task_action(bot, {'operation': 'retry_notification', 'id': args})
-                )
-                await self.safe_reply(event, json.dumps(result, ensure_ascii=False) if detail else '请在主人私聊或后台查看待办和通知详情')
+                if action == '待办':
+                    summary = tasks_text(await self.tasks(bot, json.loads(args) if args else {}))
+                else:
+                    summary = results_text([await self.task_action(bot, {'operation': 'retry_notification', 'id': args})]).split('\n', 1)[-1]
+                await self.safe_reply(event, summary if detail else '请在主人私聊或后台查看待办和通知详情')
                 return
             if action == '迁移':
                 result = await self.migrate(bot)
@@ -1059,13 +1063,14 @@ class AccountSharing:
                     result = await self.rule_management(bot, 'delete', key=args)
                 else:
                     result = await self.rule_management(bot, 'list')
-                await self.safe_reply(event, json.dumps(result, ensure_ascii=False) if detail else '规则操作已完成，详情请在主人私聊或后台查看')
+                names = {a['id']: a['name'] for a in await self.accounts(bot)}
+                await self.safe_reply(event, rules_text(result, names) if detail else '规则操作已完成，详情请在主人私聊或后台查看')
                 return
             if action == '确认绑定':
                 raise BusinessError('身份绑定确认已移至授权管理：授权管理 {"operation":"binding_confirm",...}')
             if action == '结果':
                 results = await self.store.all(bot, 'operations')
-                await self.safe_reply(event, json.dumps(results, ensure_ascii=False) if detail else '请在主人私聊或后台查看结果')
+                await self.safe_reply(event, results_text(results) if detail else '请在主人私聊或后台查看结果')
                 return
             if action in ACCESS_COMMANDS:
                 data = json.loads(args) if args else {}
