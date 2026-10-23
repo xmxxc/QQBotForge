@@ -16,6 +16,8 @@ env:
   CI_ASSETS_SHA: 04d901726cc6d94bae1b2b5524521f997a326e10
 
 jobs:
+  # Inlined from ElainaCore/ElainaBot_v2 .github/workflows/ci.yml@ci-assets
+  # (04d901726cc6d94bae1b2b5524521f997a326e10); the asset staging differs.
   check:
     runs-on: ubuntu-latest
     steps:
