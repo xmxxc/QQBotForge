@@ -84,3 +84,30 @@ sed -n '/<script>/,/<\/script>/p' plugins/ninja3/page.html | sed '1s/.*<script>/
 - 假日志服务的 AttributeError 发生在框架用户追踪和日志副任务（`_track_worker`、`db_fetch_one`）中，不在被测入口内。每个入口用例都断言了插件的确切群回复或私聊推送（例如 `忍3` 的“已记录本私聊为主人通知地址”），所以入口没执行就会失败。框架黑名单用例断言回复只有框架模板（内容为 None），插件没有执行。
 
 最终：test_ninja3 21 passed；tests/bot_modules 423 passed（基线 402 + 新增 21）。
+
+## 独立审查 F1 修复（基于 bcf2657）
+
+- **根因**：`plugins/ninja3/page.html` 的“新增”按钮 `id="reset"` 位于 `<form id="account">` 内。表单的具名控件会覆盖 `HTMLFormElement` 的同名成员（[LegacyOverrideBuiltIns]），于是 `$('account').reset` 返回这个按钮，`reset()` 抛出 TypeError。后果：
+  - 保存、删除在服务端已完成，页面却报错、不刷新。
+  - 编辑 A 后点“新增”清不掉隐藏 id，保存 B 时会以 PATCH 覆盖 A。
+- **修法**：只把按钮改名为 `id="account-new"`，并修改唯一的引用 `$('account-new').onclick`。其余按钮按文字或表单提交定位，群表单内没有同类冲突。后端和其他行为不变。
+- **仓库回归** `tests/bot_modules/test_ninja3_page.py`：
+  - `test_no_form_control_shadows_a_form_method`：静态解析页面，表单内控件的 id／name 不得为 `reset`、`submit`、`requestSubmit`、`checkValidity`、`reportValidity`。不依赖浏览器，CI 中也会运行。
+  - `test_account_form_new_edit_delete_and_rejection_in_a_real_browser`：真实 Chrome（playwright）驱动随附页面，`/api/ext/*` 走真实 `handle_ext_route`、真实插件、临时 SQLite，全部是假账密。覆盖以下流程：
+    - 新建 A，列表刷新，状态显示本次 `acl_sync`。
+    - 编辑 A → 新增 → 填 B → 保存：生成第二个 ID，A 的名称、登录名、密码都不变。
+    - 编辑只改指定记录，新增不遗留旧 ID。
+    - 删除后表单与列表一致，之后还能正常新增。
+    - 后端以重名拒绝时，页面显示错误，服务端数据和表单都保持原样。
+    - 全程没有页面异常。
+  - 作者增量自查补强：每次保存先清空测试页的旧状态，再等待本次 POST／PATCH 响应与页面完成刷新，逐次比对响应中的 `acl_sync` 和页面提示；新增与删除后显式断言隐藏 id 为空，删除前先进入该记录的编辑状态。
+  - 没有 playwright 或 Chrome 时，该用例以中文原因跳过。当前 CI 镜像没有 playwright，所以 CI 不运行浏览器流程，须在有浏览器的环境复核。
+- **红绿**：
+  - bcf2657 的页面：两项都失败，浏览器用例停在“页面未显示‘账号已保存’：状态='$(...).reset is not a function'”。
+  - 修复后：两项都通过。
+  - 审查者的覆盖探针：旧页面最终只有 1 个账号（A 被改名为 B），新页面有 2 个账号、无页面错误。审查者的整页探针按旧 id `#reset` 点击，在新页面上找不到该元素，这是探针写死了旧 id，不是产品回归。
+- **检查**：
+  - ruff check／format 通过。
+  - mypy（显式三个插件模块，配置同审查者）通过，0 问题。
+  - 平铺 ci-assets `04d901726cc6d94bae1b2b5524521f997a326e10` 的完整测试，在带 playwright 的环境中 866 passed，0 skipped。
+- **保留**：F2–F7（P3）未在本轮处理。
