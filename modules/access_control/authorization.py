@@ -158,6 +158,13 @@ class Authorization(AccessControl):
                 or any(name not in state['functions'] for name in identifiers(group.get('functions'), maximum=100))
             ):
                 raise ValueError('功能组结构无效')
+        rules = state.get('join_rules', [])
+        if not isinstance(rules, list) or len(rules) > 1000:
+            raise ValueError('入群规则结构无效')
+        for rule in rules:
+            if not isinstance(rule, dict) or rule.get('function') not in state['functions']:
+                raise ValueError('入群规则结构无效')
+            identifier(rule.get('group'))
         selection_state = {**state, 'function_groups': groups}
         for field in ('grants', 'denies', 'revocations'):
             if not isinstance(state.get(field), list):
@@ -191,6 +198,10 @@ class Authorization(AccessControl):
                     expiry(record['expires_at'])
                     if type(record.get('invoke')) is not bool:
                         raise ValueError('调用资格无效')
+                    if 'basis' in record and (
+                        record['basis'] != 'native_join' or not isinstance(record.get('join'), dict) or not isinstance(record['join'].get('event_id'), str)
+                    ):
+                        raise ValueError('入群来源依据无效')
 
     async def _scope(self, bot, consumer):
         key = identifier(bot), identifier(consumer)
@@ -364,6 +375,7 @@ class Authorization(AccessControl):
             'allow': {'function_scope', 'source'},
             'expiry': {'source', 'expires_at'},
             'adopt_legacy': {'source'},
+            'join_rule': {'enabled'},
         }
         if operation not in allowed or set(data) - allowed[operation]:
             raise ValueError('授权操作或字段无效')
@@ -378,6 +390,17 @@ class Authorization(AccessControl):
             affected = {function}
             if operation == 'policy':
                 state['functions'][function] = policy(data.get('policy'))
+            elif operation == 'join_rule':
+                # Only future trusted native joins are affected; existing sources stay until revoked.
+                if type(data.get('enabled')) is not bool:
+                    raise ValueError('入群规则须指定 enabled 布尔值')
+                identifier(group)
+                rules = [r for r in state.get('join_rules', []) if (r['function'], r['group']) != (function, group)]
+                if data['enabled']:
+                    rules.append({'function': function, 'group': group, 'created_at': self.clock()})
+                state['join_rules'] = rules
+                affected = set()
+                result = {'join_rules': copy.deepcopy(rules)}
             elif operation == 'function_group':
                 group_id = identifier(data.get('id'))
                 functions = identifiers(data.get('functions'), maximum=100)
@@ -524,19 +547,84 @@ class Authorization(AccessControl):
                             and not grant['cycle'].startswith(LEGACY_CYCLE)
                         ):
                             targets.append(grant)
-                if targets:
+                added = await self._join_grants(source, bot, consumer, state, change) if change.get('reason') == 'GROUP_MEMBER_ADD' else []
+                if targets or added:
                     self._retire(state, targets, 'group_lifecycle')
+                    state['grants'].extend(added)
                     try:
                         await self._persist(
                             bot,
                             consumer,
                             state,
-                            functions={name for name in state['functions'] if any(self._source_matches_function(state, grant, name) for grant in targets)},
+                            functions={
+                                name for name in state['functions'] if any(self._source_matches_function(state, grant, name) for grant in targets + added)
+                            },
                         )
-                    except sqlite3.IntegrityError:
-                        # This consumer remains quarantined; shared group facts
-                        # and unrelated consumers can still finish their update.
-                        continue
+                    except BaseException as error:
+                        # A source that failed to persist never stays usable in memory
+                        # (the consumer is quarantined until reload either way).
+                        for grant in added:
+                            if grant in state['grants']:
+                                state['grants'].remove(grant)
+                        if isinstance(error, sqlite3.IntegrityError):
+                            # This consumer remains quarantined; shared group facts
+                            # and unrelated consumers can still finish their update.
+                            continue
+                        raise
+
+    async def _join_grants(self, source, bot, consumer, state, change):
+        """Sources for one trusted native join under this consumer's rules; called under its scope lock.
+
+        The only automatic path: the group-state notification of that very join, while
+        its basis is current. Denial, blacklist, a closed policy scope, or an earlier
+        source or revocation for the same join event add nothing.
+        """
+        native = change.get('native') or {}
+        group, member, event_id = change['group'], native.get('member_openid'), native.get('event_id')
+        rules = [r for r in state.get('join_rules', []) if r['group'] == group]
+        if not rules or not member or not event_id:
+            return []
+        join = await source.native_join(bot, group, member)
+        if not join or join['event_id'] != event_id:
+            return []
+        if member in get_blacklist_map(bot, 'user') or group in get_blacklist_map(bot, 'group'):
+            return []
+        recorded = {
+            (r.get('join') or {}).get('event_id') for field in ('grants', 'revocations') for r in state[field] if r['member'] == member and r['group'] == group
+        }
+        added = []
+        for rule in rules:
+            function = rule['function']
+            denied = any(
+                function in self._function_members(state, d.get('function_scope', {'kind': 'function', 'id': d['function']}))
+                and d['group'] in {'', group}
+                and d['member'] in {'', member}
+                for d in state['denies']
+            )
+            if denied or group not in state['functions'][function]['groups'] or event_id in recorded:
+                continue
+            resource_scope = {'kind': 'all'}
+            added.append(
+                {
+                    'id': uuid4().hex,
+                    'function': function,
+                    'group': group,
+                    'member': member,
+                    'cycle': join['cycle'],
+                    'resources': self._resource_selection(state, consumer, resource_scope),
+                    'functions': [function],
+                    'function_scope': {'kind': 'function', 'id': function},
+                    'resource_scope': resource_scope,
+                    'resource_namespace': consumer,
+                    'mode': 'continuous',
+                    'invoke': True,
+                    'expires_at': None,
+                    'created_at': self.clock(),
+                    'basis': 'native_join',
+                    'join': {key: join[key] for key in ('event_id', 'timestamp', 'sequence', 'session_id')},
+                }
+            )
+        return added
 
     async def import_legacy(self, bot, consumer, function, *, legacy_function=None):
         """Carry one legacy function's sources into a scoped consumer without widening access.
@@ -698,7 +786,8 @@ class Authorization(AccessControl):
                 result['reason'] = 'group_facts_recovery_required'
             elif row.get('status') == 'left':
                 result['reason'] = 'member_left'
-            elif not proof['usable'] or row.get('status') != 'present':
+            elif (configured['kind'] != 'explicit' or not proof.get('join')) and (not proof['usable'] or row.get('status') != 'present'):
+                # Only explicit native-join sources accept a member backed by a current join basis alone.
                 result['reason'] = 'membership_unverified'
             elif configured['kind'] == 'group':
                 result.update(allowed=True, reason='group_member')
@@ -707,11 +796,22 @@ class Authorization(AccessControl):
             elif configured['kind'] == 'role':
                 result.update(allowed=row.get('member_role') in configured['roles'], reason='role_policy')
             else:
+                verified = proof['usable'] and row.get('status') == 'present'
+                join = proof.get('join')
+
+                def counts(grant):
+                    if grant.get('basis') == 'native_join':
+                        # Never revived by later verification: only while its own join basis is current.
+                        return bool(join) and grant['cycle'] == join['cycle'] and (grant.get('join') or {}).get('event_id') == join['event_id']
+                    return verified and grant['cycle'] == row.get('cycle')
+
                 grants = [
                     g
                     for g in state['grants']
-                    if self._source_matches_function(state, g, function) and g['group'] == group and g['member'] == member and g['cycle'] == row.get('cycle')
+                    if self._source_matches_function(state, g, function) and g['group'] == group and g['member'] == member and counts(g)
                 ]
+                if not verified:
+                    result['fact_kind'] = 'native_join'
                 current = [g for g in grants if g['expires_at'] is None or self.clock() < g['expires_at']]
                 result['sources'] = [{**copy.deepcopy(g), 'status': 'active' if g in current else 'expired'} for g in grants]
                 invoke = [g for g in current if g['invoke']]
@@ -723,7 +823,7 @@ class Authorization(AccessControl):
                     deadline = min(deadlines)
                     result.update(allowed=True, reason='explicit', valid_until=None if deadline == float('inf') else deadline)
                 else:
-                    result['reason'] = 'expired' if grants and not current else 'no_explicit_permission'
+                    result['reason'] = 'expired' if grants and not current else 'no_explicit_permission' if verified or grants else 'membership_unverified'
         if result['allowed'] and not self.decision_current(bot, result):
             result.update(allowed=False, reason='state_changed')
         return result
@@ -788,5 +888,7 @@ class Authorization(AccessControl):
             return False
         if 'fact' in decision:
             source = self.group_state()
+            if decision.get('fact_kind') == 'native_join':
+                return bool(source and getattr(source, 'join_current', None) and source.join_current(decision['fact']))
             return bool(source and source.fact_current(decision['fact']))
         return True

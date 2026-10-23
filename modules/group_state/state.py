@@ -50,6 +50,8 @@ class GroupState:
         self.roster_locks = {}
         self.durable = {}
         self.pending_writes = {}
+        # Native join bases are current only within one rebuild epoch per Bot.
+        self.join_epochs = {}
         # Set by connect(); a partial connect leaves later ones None.
         self.notifications = self.recovery = self.connection_subscription = None
 
@@ -634,6 +636,25 @@ class GroupState:
             return 'recovery_processing'
         return 'recovery_required'
 
+    def _join(self, bot, group, record):
+        """The member's native join basis while current: this generation and rebuild epoch, same cycle, not left."""
+        basis = record.get('native_join') if record else None
+        if not (
+            basis
+            and basis.get('generation') == self.generation
+            and basis.get('epoch') == self.join_epochs.get(bot, 0)
+            and basis.get('cycle') == record.get('cycle')
+            and record.get('status') != 'left'
+        ):
+            return None
+        return {**copy.deepcopy(basis), 'bot': bot, 'group': group, 'member': record.get('member')}
+
+    async def native_join(self, bot, group, member):
+        """Current native join basis regardless of pause, for writing a source inside a consumer notification."""
+        state = await self._state(bot)
+        record = state['groups'].get(group, {}).get('members', {}).get(member)
+        return self._join(bot, group, record)
+
     async def fact(self, bot, group, member=None):
         state = await self._state(bot)
         record = state['groups'].get(group)
@@ -656,6 +677,7 @@ class GroupState:
         status = self.recovery.get_status(bot)
         paused = self._pause_reason(bot)
         usable = bool(public and not paused and (row['reliable'] if member and row else public['reliable'] if not member else False))
+        join = self._join(bot, group, row) if row and not paused else None
         return {
             'bot': bot,
             'group': group,
@@ -666,12 +688,20 @@ class GroupState:
             'writer_revision': self.notifications.checkpoint(bot),
             'usable': usable,
             'reason': '' if usable else paused or 'unverified',
+            'join': join,
             'member': row,
             'group_state': public,
         }
 
     def fact_current(self, proof):
-        if not isinstance(proof, dict) or proof.get('generation') != self.generation or not proof.get('usable'):
+        return isinstance(proof, dict) and bool(proof.get('usable')) and self._fresh(proof)
+
+    def join_current(self, proof):
+        """Like ``fact_current`` for a proof whose member is backed only by its native join basis."""
+        return isinstance(proof, dict) and bool(proof.get('join')) and self._fresh(proof)
+
+    def _fresh(self, proof):
+        if proof.get('generation') != self.generation:
             return False
         bot = proof.get('bot')
         if not self._ready(bot) or self.pending_writes.get(bot):
@@ -760,9 +790,24 @@ class GroupState:
             added = event.event_type in {'GROUP_MEMBER_ADD', 'GROUP_ADD_ROBOT'}
             if is_member:
                 if added:
+                    cycle = uuid4().hex
+                    # A join basis needs WS continuity: an established baseline and no failure when the callback runs.
+                    status = self.recovery.get_status(bot)
+                    trusted = event.transport == 'websocket' and not status.failed and status.phase in {'ready', 'processing', 'recovering'}
                     target.update(
-                        cycle=uuid4().hex,
+                        cycle=cycle,
                         cycle_anchor=None,
+                        native_join={
+                            'event_id': event.event_id,
+                            'timestamp': timestamp,
+                            'sequence': event.sequence,
+                            'session_id': event.session_id,
+                            'cycle': cycle,
+                            'generation': self.generation,
+                            'epoch': self.join_epochs.get(bot, 0),
+                        }
+                        if trusted
+                        else None,
                         checked_at=None,
                         joined_at=None,
                         status='pending',
@@ -771,7 +816,7 @@ class GroupState:
                         reason='join_requires_verification',
                     )
                 else:
-                    target.update(status='left', state='left', reliable=True, reason='', left_at=timestamp)
+                    target.update(status='left', state='left', reliable=True, reason='', left_at=timestamp, native_join=None)
                 target.update(source='native_lifecycle', last_transition={'time': timestamp, 'event_id': event.event_id, 'type': event.event_type})
             else:
                 group.update(status='pending' if added else 'left', reliable=False, reason='bot_added_requires_baseline' if added else 'bot_removed')
@@ -791,7 +836,7 @@ class GroupState:
         self._invalidate(state, group, reason)
         group.update(reliable=False, reason=reason)
         for member in group['members'].values():
-            member.update(reliable=False, reason=reason)
+            member.update(reliable=False, reason=reason, native_join=None)
 
     def _merge_member(self, group, data, *, manual=False, previous=None, continuity_unknown=False):
         previous = previous if previous is not None else group['members'].get(data['member'], {})
@@ -832,6 +877,8 @@ class GroupState:
                 return False
             previous_revision = self.recovery.get_status(bot).revision
             self.recovery.invalidate(bot, reason='rebuilding')
+            # Continuity before this rebuild is unproven: earlier native join bases never return.
+            self.join_epochs[bot] = self.join_epochs.get(bot, 0) + 1
             checkpoint = self.recovery.get_status(bot)
             unsettled = [
                 status

@@ -22,6 +22,7 @@
 - 群资格相关原因：`group_facts_unavailable`（群状态未启用）、`group_facts_processing`（恢复补发、消费通知或写入尚在完成，`retryable=true`，稍后重试即可）、`group_facts_recovery_required`（须主人重建恢复基线）、`member_left`（已离群）、`membership_unverified`（成员待核验或事实不可靠）。其他 `retryable` 均为 false。主人解释返回这些原因；面向普通用户的提示由消费方决定，不应据此透露成员事实。
 - `decision_current(bot, decision)`：使用前不等待地复查模块代际、消费方版本、实时期限、当前框架拒绝及所需群状态凭据。群状态停用、重载或处理在途会使依赖它的决定失效。不要把客户端回传的决定当作可信凭据。
 - `access_snapshot(bot, consumer)`：主人管理副本；不读其他模块数据库来判断权限。
+- 入群规则（#73）：`manage_access(bot, consumer, 'join_rule', function=..., group=..., enabled=bool)` 维护 `join_rules`，默认无。仅在群状态 `GROUP_MEMBER_ADD` 消费通知内、该成员原生入群依据当前且事件一致、群在功能范围、无明确拒绝和框架黑名单、同一事件未建立或撤销过来源时，新增 `basis='native_join'` 的持续来源（单功能、本消费方全部资源、invoke、无期限），与同通知的离群撤销同一次持久化。`explicit` 评估中这类来源只在凭据 `join` 当前且周期与事件 ID 一致时计入，决定带 `fact_kind='native_join'` 并由 `decision_current` 用 `join_current` 复查；`group`／`members`／`role` 策略及其他来源不接受入群依据。关闭规则不撤销已有来源。详见 `docs/adr/0001-native-join-admission.md`。
 
 已鉴权 HTTP：`GET /api/ext/access-control/?bot=...&consumer=...` 查看；同路径 POST 操作对象，始终包含 consumer/operation。后台继续使用框架会话与同源写入校验，返回 no-store。主人私聊命令使用同一操作：
 

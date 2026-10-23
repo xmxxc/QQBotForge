@@ -11,7 +11,7 @@
 ### 事实来源：群状态“原生入群依据”
 
 - 只在群状态恢复订阅回调内产生；不使用普通生命周期订阅、插件事件或消息。条件全部成立：传输为 `websocket`；事件 ID、时间、成员原生 ID 齐全；不是同 ID 冲突或重复；时间严格晚于该成员上一转换（否则为迟到／同秒冲突）；回调开始时本 Bot 的恢复订阅已有基线且无失败（`phase` 为 `ready`／`processing`／`recovering`，可信同会话补发包含在内）。
-- 成员事实不变：仍是 `pending`、`reliable=false`，`usable`、完整名册、全员报告语义不变。另记 `native_join = {event_id, timestamp, sequence, session_id, cycle, generation, epoch}`，并把 `cycle_anchor` 记为事件时间。
+- 成员事实不变：仍是 `pending`、`reliable=false`，`usable`、完整名册、全员报告语义不变。另记 `native_join = {event_id, timestamp, sequence, session_id, cycle, generation, epoch}`；周期锚点等其他字段照旧。
 - 依据只在“同模块代际 + 同依据轮次 + 同入群周期 + 未离群”时当前。依据轮次在每次 `rebuild` 开始时递增；首次 READY、新会话、失败、重启／重载、不可信事件都要求重建，因此旧依据随之失效且不会恢复。离群、新周期和不可信事件暂停时同时清空该记录。可信同会话 RESUMED 不重建，依据保留。
 - 公开接口（窄）：
   - `await state.native_join(bot, group, member)`：返回当前依据副本或 `None`，不看暂停状态，只供在群状态消费通知内写入来源。
