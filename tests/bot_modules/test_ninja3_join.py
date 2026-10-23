@@ -14,6 +14,7 @@ import pytest
 from account_host import account_host as account_host  # noqa: F401
 from socket_platform import until
 from test_access_control import access_host as access_host  # noqa: F401
+from test_access_control import request
 from test_ninja3 import SECRET
 from test_ninja3 import ninja as ninja  # noqa: F401
 
@@ -489,3 +490,43 @@ async def test_owner_rule_narrowed_in_authorization_survives_queries_and_reloads
     assert await host.say('账号列表', user='MEMBERN') == REFUSED
     with pytest.raises(ValueError):
         await host.access.manage_access('bot-a', 'ninja3', 'join_rule', function='query', group='group-a', enabled='yes')
+
+
+async def test_rule_off_alone_waits_for_a_started_write_and_stops_later_joins(ninja, monkeypatch):
+    host, frames = ninja, Frames(ninja)
+    await host.setup()
+    await auto(host)
+    entered, released = hold(monkeypatch, host.access.store, ninja_row)
+    first = frames.feed('GROUP_MEMBER_ADD', 'MEMBERJ')
+    await until(entered.is_set)
+    rule_off = asyncio.create_task(auto(host, enabled=False))
+    await asyncio.sleep(0.05)
+    # Serialized behind the consumer lock: the started decision and write finish first.
+    assert not rule_off.done()
+    released.set()
+    assert (await rule_off)['acl_sync']['auto_grant_after'] is False
+    await settle(host, first)
+    (source,) = await autos(host)
+    snapshot = await host.access.access_snapshot('bot-a', 'ninja3')
+    assert snapshot['join_rules'] == [] and source['join']['event_id'] == f'event-{first}'
+    # Established like an owner source (revocable in authorization); no join after rule-off adds one.
+    assert await host.say('账号列表', user='MEMBERJ') == LISTED
+    await settle(host, frames.feed('GROUP_MEMBER_ADD', 'MEMBERK'))
+    assert not await autos(host, 'MEMBERK') and await host.say('账号列表', user='MEMBERK') == REFUSED
+
+
+async def test_owner_management_entry_can_only_turn_join_rules_off(ninja):
+    host = ninja
+    await host.setup()
+    await auto(host)
+    body = {'operation': 'join_rule', 'function': 'query', 'group': 'group-a'}
+    # Neither for ninja3 nor for the original account plugin can the generic entry enable automatic grants.
+    await host.create(name='旧插件账户')
+    for consumer in ('ninja3', 'account_sharing'):
+        for enabled in (True, 'yes', None):
+            response = await request(host, {'consumer': consumer, **body, **({} if enabled is None else {'enabled': enabled})}, consumer=consumer)
+            assert response.status == 422, await response.text()
+    assert (await host.access.access_snapshot('bot-a', 'account_sharing')).get('join_rules', []) == []
+    response = await request(host, {'consumer': 'ninja3', **body, 'enabled': False}, consumer='ninja3')
+    assert response.status == 200, await response.text()
+    assert (await host.access.access_snapshot('bot-a', 'ninja3'))['join_rules'] == []
