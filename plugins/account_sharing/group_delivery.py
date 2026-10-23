@@ -11,6 +11,8 @@ import copy
 
 from .validation import identifier, identity_key
 
+ACCOUNT_CHANGED = '账户信息刚更新，请重新查询。'
+
 
 class GroupDelivery:
     def __init__(self, service):
@@ -38,7 +40,13 @@ class GroupDelivery:
     async def report(self, bot, group, resource):
         acl = await self.service.ensure(bot)
         context = self.send_context(group, resource)
-        return await acl.audience_report(bot, context['consumer'], context['function'], group, resource, actions=context['actions'])
+        report = await acl.audience_report(bot, context['consumer'], context['function'], group, resource, actions=context['actions'])
+        # Accounts need explicit grants for everyone; admission or roles never count.
+        implicit = [row['member'] for row in report['members'] if any(a['allowed'] and a['reason'] != 'explicit' for a in row['actions'].values())]
+        if implicit:
+            report['failures'] += [{'member': m, 'reasons': {'invoke': 'explicit_required', 'view': 'explicit_required'}} for m in implicit]
+            report.update(eligible=False, reason='member_ineligible')
+        return report
 
     async def configure(self, bot, data):
         if not isinstance(data, dict) or set(data) - {'group', 'resource', 'enabled', 'auto_restore'}:
@@ -127,7 +135,7 @@ class GroupDelivery:
         saved = await self.service.store.all(bot, 'group_delivery')
         return [self.public(await self.mode(bot, row['group'], row['resource']), bot) for row in saved]
 
-    async def try_send(self, event, context, resource):
+    async def try_send(self, event, context, resource, via_rule=None):
         """Group send only while the whole-group report is current; returns True when handled here."""
         bot, group = event.appid, context['group']
         mode = await self.mode(bot, group, resource)
@@ -135,9 +143,23 @@ class GroupDelivery:
             return False
         await self.configure(bot, {'group': group, 'resource': resource})
         decision = await self.service.decision(bot, context, resource, 'view')
+        version = self.service.account_version(bot, resource)
         content = await self.service.query_content(bot, resource, None)
-        if not content or not self.can_send(bot, mode) or not self.service.access().decision_current(bot, decision):
+        if not content or not await self.service.rule_current(bot, via_rule):
             return False
+        # Every read is done: check the account content, the whole-group report and the
+        # asker's decision synchronously, and send with nothing awaited in between.
+        # Report or decision no longer current: go private, where the asker is evaluated again.
+        if (
+            not self.can_send(bot, mode)
+            or not decision['allowed']
+            or not self.service.access().decision_current(bot, decision)
+        ):
+            return False
+        if not self.service.account_unchanged(bot, resource, version):
+            # Edited while being read: send neither the old content nor a private downgrade.
+            await self.service.safe_reply(event, ACCOUNT_CHANGED)
+            return True
         state = self.service.reply_outcome(await self.service.safe_reply(event, content))
         await self.service.operation(bot, 'delivery', group=group, member=context['member'], resource=resource, delivery=state, target='group')
         # A failed or unknown public send is never retried elsewhere.

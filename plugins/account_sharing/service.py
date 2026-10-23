@@ -20,7 +20,7 @@ from core.base.config import cfg
 from core.base.logger import PLUGIN, get_logger
 from core.plugin._blacklist import get_blacklist_map
 
-from .group_delivery import GroupDelivery
+from .group_delivery import ACCOUNT_CHANGED, GroupDelivery
 from .menus import MenuSessions
 from .storage import ExtensionStore
 
@@ -96,8 +96,9 @@ class AccountSharing:
         self.notification_locks = {}
         self.declared = {}
         self.inventory_version = {}
-        self.inventory_writes = set()
         self.context_versions = {}
+        self.account_versions = {}
+        self.account_writes = set()
         self.clock = clock
         self.menus = MenuSessions(self.store, lambda: self.clock())
         self.group_delivery = GroupDelivery(self)
@@ -145,8 +146,17 @@ class AccountSharing:
             self.declared[bot] = key
         return acl
 
-    def accounts_changed(self, bot):
+    def accounts_changed(self, bot, resource):
         self.inventory_version[bot] = self.inventory_version.get(bot, 0) + 1
+        self.account_versions[bot, resource] = self.account_version(bot, resource) + 1
+
+    def account_version(self, bot, resource):
+        """Bumped after each save or delete of this account; sends compare it after their last await."""
+        return self.account_versions.get((bot, resource), 0)
+
+    def account_unchanged(self, bot, resource, version):
+        # A write in flight may already be committed before its version bump.
+        return (bot, resource) not in self.account_writes and self.account_version(bot, resource) == version
 
     # ---------- reply results ----------
 
@@ -202,13 +212,13 @@ class AccountSharing:
                 # Journal first, remove the account before cross-module cleanup. A
                 # failed cleanup stays inaccessible and DELETE of this ID retries it.
                 await self.store.put(bot, 'account_cleanup', key, {'id': key})
-                self.accounts_changed(bot)
-                self.inventory_writes.add(bot)
+                self.accounts_changed(bot, key)
+                self.account_writes.add((bot, key))
                 try:
                     await self.store.delete(bot, 'accounts', key)
                 finally:
-                    self.inventory_writes.discard(bot)
-                    self.accounts_changed(bot)
+                    self.account_writes.discard((bot, key))
+                    self.accounts_changed(bot, key)
                 try:
                     await self.cleanup_account(bot, key)
                 except (BusinessError, RuntimeError, ValueError, sqlite3.Error, OSError) as error:
@@ -221,12 +231,12 @@ class AccountSharing:
             validate_account(data, create=operation == 'create')
             account = old or {'id': uuid4().hex, 'enabled': True, 'description': '', 'url': '', 'groups': []}
             account.update(data)
-            self.inventory_writes.add(bot)
+            self.account_writes.add((bot, account['id']))
             try:
                 await self.store.put(bot, 'accounts', account['id'], account)
             finally:
-                self.inventory_writes.discard(bot)
-                self.accounts_changed(bot)
+                self.account_writes.discard((bot, account['id']))
+                self.accounts_changed(bot, account['id'])
             await self._sync_resources(bot)
             log.info(f'[{bot}] 保存账户 {account["id"]}')
             return account
@@ -534,7 +544,22 @@ class AccountSharing:
 
     async def decision(self, bot, context, resource, action):
         acl = await self.ensure(bot)
-        return await acl.evaluate(bot, CONSUMER, FUNCTION, context['group'], context['member'], resource, action=action)
+        decision = await acl.evaluate(bot, CONSUMER, FUNCTION, context['group'], context['member'], resource, action=action)
+        if decision['allowed'] and decision['reason'] != 'explicit':
+            # Group admission or roles never replace an explicit account grant.
+            decision = {**decision, 'allowed': False, 'reason': 'explicit_required'}
+        return decision
+
+    async def rule_current(self, bot, via_rule):
+        """A keyword-triggered query still matches the same enabled rule revision."""
+        if via_rule is None:
+            return True
+        rule_id, revision = via_rule
+        try:
+            rule = await self.qa().manage(bot, FUNCTION, 'get', key=rule_id)
+        except (BusinessError, RuntimeError):
+            return False
+        return bool(rule and rule['enabled'] and rule.get('revision', 0) == revision)
 
     async def account_contexts(self, bot, private_id, *, resource=''):
         """One current resource-view context per group that can actually query an account."""
@@ -639,11 +664,14 @@ class AccountSharing:
                 event,
                 match['target'] if match['kind'] == 'resource' else '',
                 rule_id=match['rule_id'] if match['kind'] == 'text' else None,
+                via_rule=(match['rule_id'], match['revision']),
                 expected_context=context,
             )
         else:
             items = [
-                (m['name'], {'kind': 'query', 'resource': m['target']}) if m['kind'] == 'resource' else (m['name'], {'kind': 'reply', 'rule': m['rule_id']})
+                (m['name'], {'kind': 'query', 'resource': m['target'], 'via': [m['rule_id'], m['revision']]})
+                if m['kind'] == 'resource'
+                else (m['name'], {'kind': 'reply', 'rule': m['rule_id'], 'via': [m['rule_id'], m['revision']]})
                 for m in candidates
             ]
             await self.present_menu(
@@ -753,7 +781,7 @@ class AccountSharing:
         def current():
             return (
                 self.active
-                and bot not in self.inventory_writes
+                and not any(b == bot for b, _ in self.account_writes)
                 and self.access_provider() is acl
                 and qa.active
                 and self.qa_provider() is qa
@@ -790,7 +818,7 @@ class AccountSharing:
             if event.is_group and outcome != 'sent':
                 await self.safe_reply(event, '目录私发未完成，请检查私聊接收许可或身份绑定。')
 
-    async def query(self, event, resource, *, rule_id=None, expected_context=None):
+    async def query(self, event, resource, *, rule_id=None, expected_context=None, via_rule=None):
         context_version = self.context_versions.get((event.appid, event.raw_user_id), 0)
         context = await self.resolve_context(event, resource=resource)
         if expected_context and context and any(context.get(k) != expected_context.get(k) for k in ('group', 'member')):
@@ -807,7 +835,7 @@ class AccountSharing:
         if not decision['allowed']:
             await self.deny(event)
             return
-        if event.is_group and resource and await self.group_delivery.try_send(event, context, resource):
+        if event.is_group and resource and await self.group_delivery.try_send(event, context, resource, via_rule):
             return
         acl = self.access()
         if event.is_group:
@@ -824,15 +852,23 @@ class AccountSharing:
             if not target or target['group'] != group:
                 await self.deny(event)
                 return
+        version = self.account_version(bot, resource)
         content = await self.query_content(bot, resource, rule_id)
-        # Final gate right before sending: binding, private denial, decision, current content.
+        if content is None or not await self.rule_current(bot, via_rule):
+            await self.deny(event)
+            return
+        # Final gate right before sending, after the last await: unchanged account content,
+        # binding, private denial and an explicit (never admission/role) current decision.
         if (
-            content is None
-            or not self.active
+            not self.active
+            or target['decision'].get('reason') != 'explicit'
             or not acl.context_current(bot, target)
             or context_version != self.context_versions.get((bot, event.raw_user_id), 0)
         ):
             await self.deny(event)
+            return
+        if not self.account_unchanged(bot, resource, version):
+            await self.safe_reply(event, ACCOUNT_CHANGED)
             return
         sender = self.sender_provider(bot)
         try:
@@ -897,10 +933,11 @@ class AccountSharing:
                 if not chosen or chosen.get('group') != context['group'] or chosen.get('member') != context['member']:
                     raise ValueError('菜单已失效，请重新发送：账户列表')
             # Every action re-resolves the clicker's own context and current eligibility.
+            via = tuple(action['via']) if action.get('via') else None
             if action['kind'] == 'query':
-                await self.query(event, action['resource'], expected_context=context)
+                await self.query(event, action['resource'], expected_context=context, via_rule=via)
             elif action['kind'] == 'reply':
-                await self.query(event, '', rule_id=action['rule'], expected_context=context)
+                await self.query(event, '', rule_id=action['rule'], expected_context=context, via_rule=via)
             elif action['kind'] == 'group':
                 if await self.resolve_context(event, select=action['group'], resource=context.get('resource', '')):
                     await self.directory(event)
