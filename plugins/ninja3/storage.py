@@ -1,10 +1,17 @@
-"""Bundled SQLite v1 records; independent of other extension installations and of account_sharing data."""
+"""Bundled SQLite records (user_version 1; 2 once password tasks exist); independent of other extensions and account_sharing data."""
 
 import asyncio
 import json
+import os
 import sqlite3
 import threading
 from pathlib import Path
+
+CREDENTIALS = ('login', 'password')
+
+
+class AccountLockedError(RuntimeError):
+    """Account has an unresolved password task; credential edits and deletion wait for it."""
 
 
 class ExtensionStore:
@@ -17,17 +24,24 @@ class ExtensionStore:
         self._closed = False
 
     def _open(self):
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            pass  # Existing database permissions remain the operator's responsibility.
+        else:
+            os.close(descriptor)
         conn = sqlite3.connect(self.path, check_same_thread=False)
         try:
             version = conn.execute('PRAGMA user_version').fetchone()[0]
-            if version > 1:
+            if version > 2:
                 raise RuntimeError('扩展数据库版本高于当前程序')
             conn.execute('PRAGMA journal_mode=WAL')
             conn.execute(
                 'CREATE TABLE IF NOT EXISTS extension_records (bot TEXT, collection TEXT, id TEXT, payload TEXT NOT NULL, PRIMARY KEY(bot, collection, id))'
             )
-            conn.execute('PRAGMA user_version=1')
+            if version == 0:
+                conn.execute('PRAGMA user_version=1')
             conn.commit()
             return conn
         except Exception:
@@ -47,6 +61,26 @@ class ExtensionStore:
     async def _execute(self, sql, params, read=False):
         return await asyncio.to_thread(self._run, sql, params, read)
 
+    def _atomic(self, action):
+        with self._lock:
+            if self._closed:
+                raise RuntimeError('扩展存储已关闭')
+            if self._connection is None:
+                self._connection = self._open()
+            conn = self._connection
+            conn.execute('BEGIN IMMEDIATE')
+            try:
+                result = action(conn)
+                conn.commit()
+                return result
+            except BaseException:
+                conn.rollback()
+                raise
+
+    async def atomic(self, action):
+        """One SQLite transaction; cancellation cannot recall work already running in its thread."""
+        return await asyncio.to_thread(self._atomic, action)
+
     async def ready(self):
         await self._execute('SELECT 1', ())
 
@@ -57,13 +91,46 @@ class ExtensionStore:
         rows = await self._execute('SELECT payload FROM extension_records WHERE bot=? AND collection=? AND id=?', (bot, collection, key), True)
         return rows[0] if rows else None
 
-    async def put(self, bot, collection, key, record):
+    async def put(self, bot, collection, key, record, base=None):
+        """base: the account as the caller read it; credentials changed since then (e.g. a
+        committed password task) are never overwritten by a stale read-modify-write."""
+        if collection == 'accounts':
+
+            def save(conn):
+                row = conn.execute('SELECT payload FROM extension_records WHERE bot=? AND collection=? AND id=?', (bot, collection, key)).fetchone()
+                old = json.loads(row[0]) if row else {}
+                if row and base is not None and any(old.get(field) != base.get(field) for field in CREDENTIALS):
+                    raise AccountLockedError('账号凭据刚刚变化，请刷新后重试')
+                # Scope/enablement edits stay possible; credentials belong to the open intent.
+                if row and any(old.get(field) != record.get(field) for field in CREDENTIALS):
+                    self._guard_account(conn, bot, key)
+                conn.execute(
+                    'INSERT INTO extension_records VALUES (?,?,?,?) ON CONFLICT(bot,collection,id) DO UPDATE SET payload=excluded.payload',
+                    (bot, collection, key, json.dumps(record, ensure_ascii=False)),
+                )
+
+            return await self.atomic(save)
         await self._execute(
             'INSERT INTO extension_records VALUES (?,?,?,?) ON CONFLICT(bot,collection,id) DO UPDATE SET payload=excluded.payload',
             (bot, collection, key, json.dumps(record, ensure_ascii=False)),
         )
 
+    @staticmethod
+    def _guard_account(conn, bot, key):
+        if (
+            conn.execute("SELECT 1 FROM sqlite_master WHERE name='ninja3_password_tasks'").fetchone()
+            and conn.execute('SELECT 1 FROM ninja3_password_tasks WHERE bot=? AND account=? AND active=1', (bot, key)).fetchone()
+        ):
+            raise AccountLockedError('账号改密任务未解决，禁止修改登录凭据或删除')
+
     async def delete(self, bot, collection, key):
+        if collection == 'accounts':
+
+            def remove(conn):
+                self._guard_account(conn, bot, key)
+                conn.execute('DELETE FROM extension_records WHERE bot=? AND collection=? AND id=?', (bot, collection, key))
+
+            return await self.atomic(remove)
         await self._execute('DELETE FROM extension_records WHERE bot=? AND collection=? AND id=?', (bot, collection, key))
 
     def close(self):

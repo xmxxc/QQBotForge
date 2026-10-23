@@ -46,12 +46,13 @@ async def unload():
     unregister_page('ninja3')
     unregister_route('*', PREFIX + '*')
     if _instance is not None:
+        await _instance.password_tasks.shutdown()
         _instance.close()
         _instance = None
 
 
 @handler(
-    r'^(?:授权(?:\s.*)?|账号列表|账号\s+\S.*|忍3)$',
+    r'^(?:忍3(?:改密|确认|重试|任务|取消|恢复|放弃)(?:\s.*)?|授权(?:\s.*)?|账号列表|账号\s+\S.*|忍3)$',
     name='忍者必须死3',
     priority=20,
     block=True,
@@ -62,7 +63,9 @@ async def entry(event, _match):
         await event.reply('忍者必须死3 未加载，请联系主人')
         return
     content = (event.content or '').strip()
-    if content.startswith('授权'):
+    if content.startswith(('忍3改密', '忍3确认', '忍3重试', '忍3任务', '忍3取消', '忍3恢复', '忍3放弃')):
+        await _instance.password_command(event)
+    elif content.startswith('授权'):
         await _instance.authorize(event)
     elif content == '账号列表':
         await _instance.query(event)

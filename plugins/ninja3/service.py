@@ -21,7 +21,8 @@ from core.base.config import cfg
 from core.base.logger import PLUGIN, get_logger
 from core.plugin._blacklist import get_blacklist_map
 
-from .storage import ExtensionStore
+from .password_tasks import PasswordTasks, TaskError
+from .storage import AccountLockedError, ExtensionStore
 
 log = get_logger(PLUGIN, '忍者必须死3')
 PREFIX = '/api/ext/ninja3/'
@@ -86,6 +87,7 @@ class Ninja3:
         self.revisions = {}
         self.writes = {}
         self.notice_locks = {}
+        self.password_tasks = PasswordTasks(self.store, notify=self.password_receipt, clock=clock)
 
     @staticmethod
     def _access_module():
@@ -104,9 +106,11 @@ class Ninja3:
 
     async def initialize(self):
         await self.store.ready()
+        await self.password_tasks.initialize()
 
     def close(self):
         self.active = False
+        self.password_tasks.closed = True
         self.store.close()
 
     def access(self):
@@ -242,11 +246,12 @@ class Ninja3:
                 raise BusinessError('未知账号操作')
             data = await self.validate_account(bot, dict(data) if isinstance(data, dict) else data, key, create=operation == 'create')
             # New accounts are closed until explicitly enabled and opened in groups.
+            base = dict(old) if old else None
             account = old or {'id': uuid4().hex, 'description': '', 'url': '', 'enabled': False, 'open_groups': []}
             was_enabled = old['enabled'] if old else None
             account.update(data)
             with self.writing(bot):
-                await self.store.put(bot, 'accounts', account['id'], account)
+                await self.store.put(bot, 'accounts', account['id'], account, base=base)
             log.info(f'[{bot}] 保存账号 {account["id"]} 启用={account["enabled"]} 开放群={len(account["open_groups"])}')
             # Only creation or an actual enablement change touches authorization; editing
             # other fields never lifts a restriction the owner set in the authorization page.
@@ -267,8 +272,9 @@ class Ninja3:
                     # Drop references first so a re-added group starts closed for every account.
                     for account in await self.store.all(bot, 'accounts'):
                         if key in account['open_groups']:
+                            base = dict(account)
                             account['open_groups'] = [g for g in account['open_groups'] if g != key]
-                            await self.store.put(bot, 'accounts', account['id'], account)
+                            await self.store.put(bot, 'accounts', account['id'], account, base=base)
                     await self.store.delete(bot, 'groups', key)
                 log.info(f'[{bot}] 删除群 {key}')
                 return {'group': key, 'acl_sync': await self.sync_group(bot, key)}
@@ -401,6 +407,76 @@ class Ninja3:
             lines.append('本群尚未开放，请在后台开放本群及账号后生效')
         await self.reply(event, '\n'.join(lines))
 
+    def account_paused(self, bot, account):
+        """Current durable task pause; future emergency checks must be ORed, never reset here."""
+        return self.password_tasks.is_paused(bot, account)
+
+    async def password_receipt(self, bot, task):
+        owner = await self.store.get(bot, 'owners', 'observed_c2c')
+        sender = self.sender_provider(bot)
+        if (
+            not owner
+            or sender is None
+            or owner.get('authenticated_id') not in (cfg.get_bot_config(bot) or {}).get('owner_ids', [])
+            or owner['private_id'] in get_blacklist_map(bot, 'user')
+        ):
+            return 'unavailable'
+        content = self.password_summary(task)
+        return self.outcome(await sender.send_to_user(owner['private_id'], content))
+
+    @staticmethod
+    def password_summary(task):
+        labels = {'not_submitted': '尚未提交', 'reported_success': '远端报告成功', 'rejected': '远端明确拒绝', 'unknown': '远端结果未知'}
+        return f'忍3改密任务 {task["id"]}：{labels[task["remote"]]}；本地 {task["local"]}；状态 {task["state"]}。详细记录可在已登录后台查看。'
+
+    async def password_command(self, event):
+        if not self.is_owner(event):
+            await self.reply(event, '仅主人可以操作改密任务')
+            return
+        if event.is_channel:
+            await self.reply(event, '请使用主人群聊或私聊')
+            return
+        bot = event.appid
+        pieces = (event.content or '').strip().split(maxsplit=1)
+        command, argument = pieces[0], pieces[1].strip() if len(pieces) > 1 else ''
+        actor = 'qq:' + event.user_id
+        try:
+            if command == '忍3改密':
+                accounts = await self.store.all(bot, 'accounts')
+                if not argument:
+                    # Group replies are public: account names are listed only in private chat.
+                    names = '可选：' + '、'.join(a['name'] for a in accounts) if event.is_direct else '可选名称请在主人私聊或后台查看'
+                    await self.reply(event, '尚未选择账号。发送“忍3改密 名称”选择一个账号；再普通确认。' + names)
+                    return
+                account = next((a for a in accounts if a['name'] == argument), None)
+                if account is None:
+                    raise TaskError('账号不存在，请只提供单个账号名称')
+                task = await self.password_tasks.select(bot, account['id'], actor)
+                if task['state'] == 'selected':
+                    await self.reply(event, f'已选择账号。发送“忍3确认 {task["id"]}”确认随机改密；未确认不会开始。')
+                    return
+            elif not argument or len(argument) != 32:
+                raise TaskError('请提供有效改密任务编号')
+            elif command == '忍3确认':
+                task = await self.password_tasks.confirm(bot, argument, actor)
+            elif command == '忍3重试':
+                task = await self.password_tasks.retry(bot, argument, actor)
+            elif command == '忍3放弃':
+                task = await self.password_tasks.release(bot, argument)
+            elif command == '忍3取消':
+                task = await self.password_tasks.cancel(bot, argument)
+            elif command == '忍3恢复':
+                task = await self.password_tasks.recover(bot, argument)
+            else:
+                task = await self.password_tasks.get(bot, argument)
+            # Group acknowledgement contains no detailed remote result or credentials.
+            await self.reply(event, f'改密任务 {task["id"]} 已记录，请在主人私聊或后台查看结果。' if event.is_group else self.password_summary(task))
+        except TaskError as error:
+            await self.reply(event, str(error))
+        except (sqlite3.Error, OSError, RuntimeError) as error:
+            log.error(f'[{bot}] 改密任务操作失败: {type(error).__name__}')
+            await self.reply(event, '改密任务暂不可用，账号保持原有暂停状态，请查看后台')
+
     # ---------- member queries ----------
 
     async def query(self, event, name=None):
@@ -423,7 +499,11 @@ class Ninja3:
                 return
             decisions = [invoke]
             # Account rows (with credentials) are read only for a currently granted caller.
-            accounts = [a for a in await self.store.all(bot, 'accounts') if a['enabled'] and group in a['open_groups']]
+            paused = self.password_tasks.paused_accounts(bot)
+            if paused is None:
+                await self.reply(event, UNAVAILABLE)
+                return
+            accounts = [a for a in await self.store.all(bot, 'accounts') if a['enabled'] and group in a['open_groups'] and a['id'] not in paused]
             if name is None:
                 lines = [f'{i}. {a["name"]}' for i, a in enumerate(accounts, 1)]
                 content = '本群开放账号：\n' + '\n'.join(lines) + '\n发送“账号 名称”获取' if lines else '本群暂无开放账号'
@@ -448,7 +528,12 @@ class Ninja3:
         # Final synchronous gate after the last preparatory await: unchanged accounts,
         # open groups and module instances, and current decisions (sources, denial,
         # resource enablement, policy scope, group facts, reloads). Send immediately.
-        if not (self.unchanged(bot, revision) and self.access_provider() is acl and all(acl.decision_current(bot, d) for d in decisions)):
+        if not (
+            self.unchanged(bot, revision)
+            and self.access_provider() is acl
+            and all(acl.decision_current(bot, d) for d in decisions)
+            and self.password_tasks.query_current(bot, accounts if name is None else [account])
+        ):
             await self.reply(event, CHANGED)
             return
         state = await self.reply(event, content)
@@ -585,6 +670,27 @@ class Ninja3:
             return web.json_response({'success': False, 'error': '请选择有效 Bot'}, status=404)
         parts = request.path[len(PREFIX) :].strip('/').split('/')
         try:
+            if parts[0] == 'password-tasks':
+                tasks = self.password_tasks
+                if request.method == 'GET' and len(parts) <= 2:
+                    result = await tasks.list(bot) if len(parts) == 1 else await tasks.get(bot, parts[1])
+                elif request.method == 'POST' and len(parts) == 1:
+                    body = await request.json()
+                    if not isinstance(body, dict) or set(body) != {'account'} or not isinstance(body['account'], str):
+                        raise TaskError('请明确选择一个账号，不接收指定密码')
+                    result = await tasks.select(bot, body['account'], 'backend')
+                elif request.method == 'POST' and len(parts) == 3 and parts[2] in {'confirm', 'retry', 'cancel', 'recover', 'release'}:
+                    body = await request.json()
+                    if body != {}:
+                        raise TaskError('任务操作不接收额外参数')
+                    # The authenticated panel is the single owner session ('backend' actor).
+                    if parts[2] in {'confirm', 'retry'}:
+                        result = await getattr(tasks, parts[2])(bot, parts[1], 'backend')
+                    else:
+                        result = await getattr(tasks, parts[2])(bot, parts[1])
+                else:
+                    raise BusinessError('方法不适用', 405)
+                return web.json_response({'success': True, 'data': result})
             if parts in (['status'], ['operations']) and request.method == 'GET':
                 data = await self.status(bot) if parts == ['status'] else await self.store.all(bot, 'operations')
                 return web.json_response({'success': True, 'data': data})
@@ -609,8 +715,10 @@ class Ninja3:
                 result = await manage(bot, operation, data, key)
                 return web.json_response({'success': True, 'data': result}, status=201 if operation == 'create' else 200)
             raise BusinessError('入口不存在', 404)
-        except (BusinessError, json.JSONDecodeError) as error:
+        except (BusinessError, TaskError, json.JSONDecodeError) as error:
             return web.json_response({'success': False, 'error': str(error)}, status=getattr(error, 'status', 422))
+        except AccountLockedError as error:
+            return web.json_response({'success': False, 'error': str(error)}, status=409)
         except (sqlite3.Error, OSError, RuntimeError):
             log.error(f'[{bot}] 忍者必须死3 持久化不可用')
             return web.json_response({'success': False, 'error': UNAVAILABLE}, status=503)
