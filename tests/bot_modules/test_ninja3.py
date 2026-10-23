@@ -437,10 +437,15 @@ async def test_owner_resource_narrowing_in_authorization_survives_other_plugin_s
     assert await host.say('账号 账号A', user='MEMBERA') == ['该账号暂不可查询，请联系主人']
     assert (await host.ninja_api('GET', 'status'))[1]['data']['restricted_by_acl'] == ['账号A']
     assert await host.say('账号 账号B', user='MEMBERA') == ['名称：账号B\n账号：fake-login\n密码：fake-b2']
-    # Saving that account in the plugin is the explicit, recorded re-sync.
+    # Editing other fields of that account, enablement unchanged, does not lift the restriction either.
+    status, edited = await host.ninja_api('PATCH', 'accounts/' + a['id'], {'password': 'fake-a2', 'enabled': True})
+    assert edited['data']['acl_sync'] == {'status': 'not_needed'}
+    assert not (await host.access.access_snapshot('bot-a', 'ninja3'))['resources'][a['id']]['enabled']
+    await host.ninja_api('PATCH', 'accounts/' + a['id'], {'enabled': False})
+    # Disabling and re-enabling it in the plugin is the explicit, recorded re-sync.
     status, saved = await host.ninja_api('PATCH', 'accounts/' + a['id'], {'enabled': True})
     assert (saved['data']['acl_sync']['resource_before'], saved['data']['acl_sync']['resource_after']) == (False, True)
-    assert SECRET in (await host.say('账号 账号A', user='MEMBERA'))[0]
+    assert 'fake-a2' in (await host.say('账号 账号A', user='MEMBERA'))[0]
 
 
 async def test_group_sync_reads_authorization_last_so_concurrent_owner_edits_are_kept(ninja):

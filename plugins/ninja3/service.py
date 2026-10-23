@@ -243,10 +243,15 @@ class Ninja3:
             data = await self.validate_account(bot, dict(data) if isinstance(data, dict) else data, key, create=operation == 'create')
             # New accounts are closed until explicitly enabled and opened in groups.
             account = old or {'id': uuid4().hex, 'description': '', 'url': '', 'enabled': False, 'open_groups': []}
+            was_enabled = old['enabled'] if old else None
             account.update(data)
             with self.writing(bot):
                 await self.store.put(bot, 'accounts', account['id'], account)
             log.info(f'[{bot}] 保存账号 {account["id"]} 启用={account["enabled"]} 开放群={len(account["open_groups"])}')
+            # Only creation or an actual enablement change touches authorization; editing
+            # other fields never lifts a restriction the owner set in the authorization page.
+            if was_enabled == account['enabled']:
+                return {**self.public(account), 'acl_sync': {'status': 'not_needed'}}
             return {**self.public(account), 'acl_sync': await self.sync_account(bot, account['id'])}
 
     async def manage_group(self, bot, operation, data=None, key=''):
