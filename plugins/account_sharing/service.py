@@ -84,6 +84,7 @@ def validate_account(data, *, create=False):
 class AccountSharing:
     CONSUMER = CONSUMER
     FUNCTION = FUNCTION
+    record_drain_timeout = 10  # Seconds per wait while finishing a cancelled migration's record.
 
     def __init__(self, path, *, access_provider=None, sender_provider=None, qa_provider=None, clock=time.time):
         self.store = ExtensionStore(path)
@@ -460,11 +461,12 @@ class AccountSharing:
             except asyncio.CancelledError:
                 report[name] = {'status': 'cancelled', 'error': '操作已取消，本阶段是否已写入未知，可重新迁移'}
                 raise
-            except (ValueError, RuntimeError) as error:
-                report[name] = {'status': 'failed', 'error': str(error)}
-            except (AttributeError, LookupError, TypeError):
+            except (AttributeError, LookupError, TypeError, json.JSONDecodeError):
+                # Before ValueError: a JSONDecodeError is one, but its text is not a reason.
                 log.warning(f'[{bot}] migration {name}: malformed legacy data', exc_info=True)
                 report[name] = {'status': 'failed', 'error': '旧资料结构无效'}
+            except (ValueError, RuntimeError) as error:
+                report[name] = {'status': 'failed', 'error': str(error)}
             except (sqlite3.Error, OSError):
                 report[name] = {'status': 'failed', 'error': storage_error}
 
@@ -526,10 +528,8 @@ class AccountSharing:
         await self.notify_result(bot, result)
         return report
 
-    record_drain_timeout = 10
-
     async def drain_record(self, bot, operation_id, report, write):
-        """Finish a cancelled migration's record without letting it replace the cancel.
+        """Finish a migration's record after a cancel without letting it replace the cancel.
 
         The write runs in its own task; later cancels only interrupt the waits, and
         both waits are bounded. Never raises: the caller re-raises the original cancel.
@@ -544,7 +544,7 @@ class AccountSharing:
         # SQL already handed to the store thread may still commit after an abandoned wait.
         outcome = 'outcome unknown' if not task.done() or task.cancelled() else f'not saved ({type(task.exception()).__name__})'
         statuses = {name: report[name]['status'] for name in ('authorization', 'bindings', 'rules')}
-        log.error(f'[{bot}] cancelled migration operation={operation_id} record {outcome}; stages={statuses}')
+        log.error(f'[{bot}] migration operation={operation_id} interrupted by cancel, record {outcome}; stages={statuses}')
 
     @staticmethod
     async def wait_through_cancel(task, timeout):

@@ -314,6 +314,10 @@ async def paused_migration(host):
     return task, lock
 
 
+async def migration_operations(host):
+    return [r for r in await service(host).store.all('bot-a', 'operations') if r['kind'] == 'migration']
+
+
 async def cancelled_args(task):
     try:
         await asyncio.wait_for(task, 5)
@@ -345,7 +349,7 @@ async def test_repeated_cancel_keeps_the_original_and_still_records_the_commit(a
     assert not task.done()
     release.set()
     assert await cancelled_args(task) == ('original-cancel',)
-    [operation] = [r for r in await store.all('bot-a', 'operations') if r['kind'] == 'migration']
+    [operation] = await migration_operations(host)
     assert operation['authorization'] == 'imported' and operation['binding'] == 'cancelled' and operation['migration'] == 'cancelled'
 
 
@@ -370,10 +374,6 @@ async def test_permanent_record_failure_keeps_cancel_logs_redacted_and_retry_wor
     report, _ = await migrate_by_owner_private_chat(host)
     assert report['authorization']['status'] == 'unchanged' and report['bindings']['status'] == 'imported' and report['status'] == 'imported'
     assert (await last_operation(host))['migration'] == 'imported'
-
-
-async def migration_operations(host):
-    return [r for r in await service(host).store.all('bot-a', 'operations') if r['kind'] == 'migration']
 
 
 async def test_stuck_store_write_is_bounded_and_reported_as_unknown(account_host, caplog):
@@ -443,3 +443,19 @@ async def test_malformed_nested_legacy_scope_fails_authorization_with_identities
     assert report['authorization'] == {'status': 'failed', 'error': '旧授权记录结构无效'}
     assert report['bindings']['status'] == 'imported' and report['status'] == 'partial'
     assert (await acl.access_snapshot('bot-a', 'account_sharing'))['grants'] == []
+
+
+async def test_non_json_legacy_whitelist_key_is_a_structured_authorization_failure(account_host):
+    host = account_host
+    await legacy_authorization(host)
+    acl = host.access
+    row = await acl.store.get('bot-a', 'access', 'state')
+    row['whitelist'] = {'not-json': True}
+    await acl.store.put('bot-a', 'access', 'state', row)
+    acl.states.pop('bot-a', None)
+    await seed_legacy(host)
+    await c2c(host, '你好', 'private-a')
+    status, data = await host.account_api('POST', 'migration', {})
+    assert status == 200, data
+    assert data['data']['authorization'] == {'status': 'failed', 'error': '旧资料结构无效'}
+    assert data['data']['bindings']['status'] == 'imported' and data['data']['status'] == 'partial'
