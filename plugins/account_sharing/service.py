@@ -462,7 +462,7 @@ class AccountSharing:
                 raise
             except (ValueError, RuntimeError) as error:
                 report[name] = {'status': 'failed', 'error': str(error)}
-            except (KeyError, TypeError):
+            except (AttributeError, KeyError, TypeError):
                 log.warning(f'[{bot}] migration {name}: malformed legacy data', exc_info=True)
                 report[name] = {'status': 'failed', 'error': '旧资料结构无效'}
             except (sqlite3.Error, OSError):
@@ -484,10 +484,11 @@ class AccountSharing:
             accounts = {a['id'] for a in await self.accounts(bot)}
             return {'status': 'checked', 'total': len(listed), 'dangling': [r['id'] for r in listed if r['kind'] == 'resource' and r['target'] not in accounts]}
 
-        async def record():
+        async def record(**fields):
             return await self.operation(
                 bot,
                 'migration',
+                **fields,
                 authorization=report['authorization']['status'],
                 binding=report['bindings']['status'],
                 rules=report['rules']['status'],
@@ -501,13 +502,14 @@ class AccountSharing:
         try:
             for name, run, storage_error in stages:
                 await stage(name, run, storage_error)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancel:
             # Earlier stages may have committed: keep a record (retry notification from 待办).
             for name, _, _ in stages:
                 report.setdefault(name, {'status': 'not_run', 'reason': 'cancelled'})
             report['status'] = 'cancelled'
-            await record()
-            raise
+            operation_id = uuid4().hex
+            await self.drain_record(bot, operation_id, report, record(id=operation_id))
+            raise cancel
         import_statuses = [report[name]['status'] for name in ('authorization', 'bindings')]
         if 'failed' in [*import_statuses, report['rules']['status']]:
             # The rules stage only checks; success there alone is not a partial import.
@@ -516,6 +518,36 @@ class AccountSharing:
             report['status'] = 'imported' if 'imported' in import_statuses else 'unchanged'
         await self.notify_result(bot, await record())
         return report
+
+    record_drain_timeout = 10
+
+    async def drain_record(self, bot, operation_id, report, write):
+        """Finish a cancelled migration's record without letting it replace the cancel.
+
+        The write runs in its own task: a later cancel only interrupts the wait,
+        and the wait is bounded. Never raises; the caller re-raises the original cancel.
+        """
+        task = asyncio.ensure_future(write)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.record_drain_timeout
+        while not task.done() and deadline > loop.time():
+            try:
+                await asyncio.wait({task}, timeout=deadline - loop.time())
+            except asyncio.CancelledError:
+                continue
+        if not task.done():
+            # SQL already handed to the store thread may still commit: outcome unknown.
+            task.cancel()
+            while not task.done():
+                try:
+                    await asyncio.wait({task})
+                except asyncio.CancelledError:
+                    continue
+        if not task.cancelled() and task.exception() is None:
+            return
+        outcome = 'unconfirmed' if task.cancelled() else type(task.exception()).__name__
+        stages = {name: report[name]['status'] for name in ('authorization', 'bindings', 'rules')}
+        log.error(f'[{bot}] cancelled migration operation={operation_id} record not saved ({outcome}); stages={stages}')
 
     # ---------- owner results ----------
 

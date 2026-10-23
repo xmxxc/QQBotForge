@@ -298,3 +298,126 @@ async def test_concurrent_binding_revoke_and_migration_never_revive_the_link(acc
         assert report['bindings']['status'] == ('unchanged' if migration_first else 'failed'), report
         assert (await acl.binding_snapshot('bot-a'))['bindings'] == []
     assert len((await acl.binding_snapshot('bot-a'))['revocations']) == 1
+
+
+async def paused_migration(host):
+    await legacy_authorization(host)
+    await seed_legacy(host)
+    await c2c(host, '你好', 'private-a')
+    lock = host.access.bindings.locks['bot-a']
+    await lock.acquire()
+    task = asyncio.create_task(service(host).migrate('bot-a'))
+    async with asyncio.timeout(5):
+        while not lock._waiters:
+            await asyncio.sleep(0)
+    return task, lock
+
+
+async def cancelled_args(task):
+    try:
+        await asyncio.wait_for(task, 5)
+    except asyncio.CancelledError as error:
+        return error.args
+    raise AssertionError('cancelled migration completed')
+
+
+async def test_repeated_cancel_keeps_the_original_and_still_records_the_commit(account_host, monkeypatch):
+    host = account_host
+    task, lock = await paused_migration(host)
+    store = service(host).store
+    original_put = store.put
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_put(bot, collection, key, value):
+        if collection == 'operations':
+            started.set()
+            await release.wait()
+        return await original_put(bot, collection, key, value)
+
+    monkeypatch.setattr(store, 'put', slow_put)
+    task.cancel('original-cancel')
+    lock.release()
+    await asyncio.wait_for(started.wait(), 5)
+    for _ in range(3):
+        task.cancel('later-cancel')
+        await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    assert await cancelled_args(task) == ('original-cancel',)
+    [operation] = [r for r in await store.all('bot-a', 'operations') if r['kind'] == 'migration']
+    assert operation['authorization'] == 'imported' and operation['binding'] == 'cancelled' and operation['migration'] == 'cancelled'
+
+
+async def test_permanent_record_failure_keeps_cancel_logs_redacted_and_retry_works(account_host, caplog):
+    host = account_host
+    task, lock = await paused_migration(host)
+    store = service(host).store
+    with sqlite3.connect(store.path) as db:
+        db.execute(
+            "CREATE TRIGGER fail_operation BEFORE INSERT ON extension_records WHEN NEW.collection='operations' BEGIN SELECT RAISE(ABORT, 'secret-detail'); END"
+        )
+    task.cancel('original-cancel')
+    lock.release()
+    assert await cancelled_args(task) == ('original-cancel',)
+    assert await store.all('bot-a', 'operations') == []
+    [line] = [r.getMessage() for r in caplog.records if 'record not saved' in r.getMessage()]
+    assert 'operation=' in line and '(IntegrityError)' in line and "'authorization': 'imported'" in line and 'secret-detail' not in line
+    # The committed authorization stays; a retry reports it as present and records normally.
+    assert [g['id'] for g in (await host.access.access_snapshot('bot-a', 'account_sharing'))['grants']] == ['legacy-source']
+    with sqlite3.connect(store.path) as db:
+        db.execute('DROP TRIGGER fail_operation')
+    report, _ = await migrate_by_owner_private_chat(host)
+    assert report['authorization']['status'] == 'unchanged' and report['bindings']['status'] == 'imported' and report['status'] == 'imported'
+    assert (await last_operation(host))['migration'] == 'imported'
+
+
+async def test_stuck_record_write_is_bounded_and_not_claimed_saved(account_host, monkeypatch, caplog):
+    host = account_host
+    task, lock = await paused_migration(host)
+    service(host).record_drain_timeout = 0.05
+    store = service(host).store
+    original_put = store.put
+    abandoned = asyncio.Event()
+
+    async def stuck_put(bot, collection, key, value):
+        if collection != 'operations':
+            return await original_put(bot, collection, key, value)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            abandoned.set()
+
+    monkeypatch.setattr(store, 'put', stuck_put)
+    task.cancel('original-cancel')
+    lock.release()
+    assert await cancelled_args(task) == ('original-cancel',)
+    # The finishing write was stopped before migrate returned, not left running in the background.
+    assert abandoned.is_set()
+    assert any('record not saved (unconfirmed)' in r.getMessage() for r in caplog.records)
+
+
+async def test_malformed_nested_legacy_scope_fails_authorization_with_identities_imported(account_host):
+    host = account_host
+    await legacy_authorization(host)
+    acl = host.access
+    row = await acl.store.get('bot-a', 'access', 'state')
+    row['grants'][0]['resource_scope'] = {'kind': 'resources', 'ids': 'not-a-list'}
+    await acl.store.put('bot-a', 'access', 'state', row)
+    acl.states.pop('bot-a', None)
+    await seed_legacy(host)
+    await c2c(host, '你好', 'private-a')
+    status, data = await host.account_api('POST', 'migration', {})
+    assert status == 200 and data['success'] is True, data
+    report = data['data']
+    assert report['authorization'] == {'status': 'failed', 'error': '旧授权记录结构无效'}
+    assert report['bindings']['status'] == 'imported' and report['status'] == 'partial'
+    assert (await acl.access_snapshot('bot-a', 'account_sharing'))['grants'] == []
+    # A passing rules check alone never turns two failed imports into a partial success.
+    await service(host).store.put(
+        'bot-a',
+        'bindings',
+        json.dumps(['group-a', 'member-b']),
+        {'group': 'group-a', 'member': 'member-b', 'private_id': 'never-observed', 'source': 'owner_confirmed', 'confirmed_by': 'owner-a', 'evidence': 'x'},
+    )
+    status, data = await host.account_api('POST', 'migration', {})
+    assert status == 422 and data['data']['rules']['status'] == 'checked' and data['data']['status'] == 'failed', data

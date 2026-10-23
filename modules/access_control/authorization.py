@@ -553,6 +553,14 @@ class Authorization(AccessControl):
         report = {'grants': 0, 'denies': 0, 'revocations': 0, 'policy_groups': [], 'skipped': 0, 'dropped_resources': 0}
 
         def covers(record):
+            # Every legacy record passes here first: reject shapes the conversion would trip on.
+            if (
+                not isinstance(record, dict)
+                or any(not isinstance(record.get(k, {}), dict) for k in ('function_scope', 'resource_scope'))
+                or any(not isinstance(record.get(k, []), list) for k in ('resources', 'functions'))
+                or not isinstance(record.get('resource_scope', {}).get('ids', []), list)
+            ):
+                raise ValueError('旧授权记录结构无效')
             scope = record.get('function_scope', {'kind': 'function', 'id': record.get('function')})
             return record.get('function') == legacy_function or scope.get('kind') == 'all' or legacy_function in record.get('functions', [])
 
