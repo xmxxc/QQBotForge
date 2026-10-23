@@ -457,9 +457,13 @@ class AccountSharing:
             # Each stage reports what actually happened; a failed one keeps its own boundary.
             try:
                 report[name] = await run()
+            except asyncio.CancelledError:
+                report[name] = {'status': 'cancelled', 'error': '操作已取消，本阶段是否已写入未知，可重新迁移'}
+                raise
             except (ValueError, RuntimeError) as error:
                 report[name] = {'status': 'failed', 'error': str(error)}
             except (KeyError, TypeError):
+                log.warning(f'[{bot}] migration {name}: malformed legacy data', exc_info=True)
                 report[name] = {'status': 'failed', 'error': '旧资料结构无效'}
             except (sqlite3.Error, OSError):
                 report[name] = {'status': 'failed', 'error': storage_error}
@@ -480,28 +484,37 @@ class AccountSharing:
             accounts = {a['id'] for a in await self.accounts(bot)}
             return {'status': 'checked', 'total': len(listed), 'dangling': [r['id'] for r in listed if r['kind'] == 'resource' and r['target'] not in accounts]}
 
-        await stage('authorization', authorization, '授权资料写入失败')
-        await stage('bindings', bindings, '身份资料写入失败')
-        await stage('rules', rules, '规则读取失败')
-        imports = [report[name]['status'] for name in ('authorization', 'bindings')]
-        statuses = [*imports, report['rules']['status']]
-        if 'failed' in statuses:
+        async def record():
+            return await self.operation(
+                bot,
+                'migration',
+                authorization=report['authorization']['status'],
+                binding=report['bindings']['status'],
+                rules=report['rules']['status'],
+                migration=report['status'],
+                notification='pending',
+                delivery='not_requested',
+                report=report,
+            )
+
+        stages = (('authorization', authorization, '授权资料写入失败'), ('bindings', bindings, '身份资料写入失败'), ('rules', rules, '规则读取失败'))
+        try:
+            for name, run, storage_error in stages:
+                await stage(name, run, storage_error)
+        except asyncio.CancelledError:
+            # Earlier stages may have committed: keep a record (retry notification from 待办).
+            for name, _, _ in stages:
+                report.setdefault(name, {'status': 'not_run', 'reason': 'cancelled'})
+            report['status'] = 'cancelled'
+            await record()
+            raise
+        import_statuses = [report[name]['status'] for name in ('authorization', 'bindings')]
+        if 'failed' in [*import_statuses, report['rules']['status']]:
             # The rules stage only checks; success there alone is not a partial import.
-            report['status'] = 'partial' if any(s in {'imported', 'unchanged'} for s in imports) else 'failed'
+            report['status'] = 'partial' if any(s in {'imported', 'unchanged'} for s in import_statuses) else 'failed'
         else:
-            report['status'] = 'imported' if 'imported' in imports else 'unchanged'
-        result = await self.operation(
-            bot,
-            'migration',
-            authorization=report['authorization']['status'],
-            binding=report['bindings']['status'],
-            rules=report['rules']['status'],
-            migration=report['status'],
-            notification='pending',
-            delivery='not_requested',
-            report=report,
-        )
-        await self.notify_result(bot, result)
+            report['status'] = 'imported' if 'imported' in import_statuses else 'unchanged'
+        await self.notify_result(bot, await record())
         return report
 
     # ---------- owner results ----------

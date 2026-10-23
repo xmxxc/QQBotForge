@@ -221,15 +221,16 @@ class Bindings:
                     raise ValueError('绑定迁移结构无效')
                 key = identity_key(identifier(record.get('group')), identifier(record.get('member')))
                 private_id = identifier(record.get('private_id'))
-                if key in candidate.get('revoked', {}):
-                    raise ValueError('该关联已撤销，历史迁移不能恢复，须新申请并由主人核实')
-                if private_id not in candidate['private']:
-                    raise ValueError('旧绑定缺少已观察私聊身份')
                 if key in candidate['bindings']:
+                    # A current binding (also one re-confirmed after a revoke) is kept as is.
                     if candidate['bindings'][key]['private_id'] != private_id:
                         raise ValueError('旧绑定与现存关联冲突')
                     existing['bindings'] += 1
                     continue
+                if key in candidate.get('revoked', {}):
+                    raise ValueError('该关联已撤销，历史迁移不能恢复，须新申请并由主人核实')
+                if private_id not in candidate['private']:
+                    raise ValueError('旧绑定缺少已观察私聊身份')
                 candidate['bindings'][key] = {**copy.deepcopy(record), 'id': record.get('id', key)}
                 imported['bindings'] += 1
             for record in bundle['binding_requests']:

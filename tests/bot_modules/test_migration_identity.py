@@ -181,19 +181,8 @@ async def test_unobserved_legacy_identity_and_revoked_link_are_not_imported(acco
 
 async def test_identity_write_failure_is_failed_while_authorization_reports_its_own_result(account_host):
     host = account_host
-    account = await host.create(name='旧账户')
+    await legacy_authorization(host)
     acl = host.access
-    legacy_grant = {
-        'id': 'legacy-source',
-        'group': 'group-a',
-        'member': 'member-a',
-        'cycle': 'old',
-        'function': 'account_sharing',
-        'resources': [account['id']],
-        'resource_namespace': 'account_sharing',
-    }
-    await acl.store.put('bot-a', 'access', 'state', {'version': 1, 'whitelist': {}, 'members': {}, 'grants': [legacy_grant], 'denies': [], 'revocations': []})
-    acl.states.pop('bot-a', None)
     await seed_legacy(host)
     await c2c(host, '你好', 'private-a')
     with sqlite3.connect(acl.store.path) as db:
@@ -228,8 +217,25 @@ async def test_all_failed_migration_is_not_reported_as_success(account_host):
     assert (await last_operation(host))['migration'] == 'failed'
 
 
-async def test_cancelled_migration_waiting_for_identity_lock_records_no_result(account_host):
+async def legacy_authorization(host):
+    account = await host.create(name='旧账户')
+    acl = host.access
+    grant = {
+        'id': 'legacy-source',
+        'group': 'group-a',
+        'member': 'member-a',
+        'cycle': 'old',
+        'function': 'account_sharing',
+        'resources': [account['id']],
+        'resource_namespace': 'account_sharing',
+    }
+    await acl.store.put('bot-a', 'access', 'state', {'version': 1, 'whitelist': {}, 'members': {}, 'grants': [grant], 'denies': [], 'revocations': []})
+    acl.states.pop('bot-a', None)
+
+
+async def test_cancel_after_authorization_commit_records_the_committed_stage(account_host):
     host = account_host
+    await legacy_authorization(host)
     await seed_legacy(host)
     await c2c(host, '你好', 'private-a')
     acl = host.access
@@ -247,7 +253,48 @@ async def test_cancelled_migration_waiting_for_identity_lock_records_no_result(a
         pass
     else:
         raise AssertionError('cancelled migration completed')
-    assert [r for r in await service(host).store.all('bot-a', 'operations') if r['kind'] == 'migration'] == []
+    operation = await last_operation(host)
+    assert operation['authorization'] == 'imported' and operation['binding'] == 'cancelled' and operation['rules'] == 'not_run'
+    assert operation['migration'] == 'cancelled' and operation['notification'] == 'pending'
+    assert [g['id'] for g in (await acl.access_snapshot('bot-a', 'account_sharing'))['grants']] == ['legacy-source']
     assert (await acl.binding_snapshot('bot-a'))['bindings'] == []
     report, _ = await migrate_by_owner_private_chat(host)
-    assert report['bindings']['status'] == 'imported' and report['status'] == 'imported'
+    assert report['authorization']['status'] == 'unchanged' and report['bindings']['status'] == 'imported' and report['status'] == 'imported'
+
+
+async def test_owner_reconfirmed_binding_after_revoke_is_compatible_but_not_revived_otherwise(account_host):
+    host = account_host
+    await seed_legacy(host)
+    await c2c(host, '你好', 'private-a')
+    assert (await migrate_by_owner_private_chat(host))[0]['bindings']['status'] == 'imported'
+    assert await admin(host, {'operation': 'binding_revoke', 'group': 'group-a', 'member': 'member-a'}) == 200
+    current = await bind(host, 'group-a', 'member-a', 'private-a')
+    report, _ = await migrate_by_owner_private_chat(host)
+    assert report['bindings']['status'] == 'unchanged' and report['bindings']['existing']['bindings'] == 1, report
+    assert (await host.access.binding_snapshot('bot-a'))['bindings'] == [current]
+
+
+async def test_concurrent_binding_revoke_and_migration_never_revive_the_link(account_host):
+    host = account_host
+    await seed_legacy(host)
+    await c2c(host, '你好', 'private-a')
+    assert (await migrate_by_owner_private_chat(host))[0]['bindings']['status'] == 'imported'
+    acl = host.access
+    for migration_first in (True, False):
+        lock = acl.bindings.locks['bot-a']
+        await lock.acquire()
+        revoke = acl.bindings.manage('bot-a', 'binding_revoke', {'group': 'group-a', 'member': 'member-a'}, 'web_admin')
+        first = asyncio.create_task(service(host).migrate('bot-a') if migration_first else revoke)
+        async with asyncio.timeout(5):
+            while len(lock._waiters or ()) < 1:
+                await asyncio.sleep(0)
+        second = asyncio.create_task(revoke if migration_first else service(host).migrate('bot-a'))
+        async with asyncio.timeout(5):
+            while len(lock._waiters or ()) < 2:
+                await asyncio.sleep(0)
+        lock.release()
+        results = await asyncio.gather(first, second)
+        report = results[0] if migration_first else results[1]
+        assert report['bindings']['status'] == ('unchanged' if migration_first else 'failed'), report
+        assert (await acl.binding_snapshot('bot-a'))['bindings'] == []
+    assert len((await acl.binding_snapshot('bot-a'))['revocations']) == 1
