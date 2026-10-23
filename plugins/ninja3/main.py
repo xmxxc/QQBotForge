@@ -5,7 +5,7 @@ from pathlib import Path
 from aiohttp import web
 
 from core.plugin import context
-from core.plugin.decorators import handler, on_load, on_unload
+from core.plugin.decorators import handler, interceptor, on_load, on_unload
 from core.plugin.web_pages import register_page, register_route, unregister_page, unregister_route
 
 from .service import PREFIX, UNAVAILABLE, Ninja3
@@ -70,3 +70,14 @@ async def entry(event, _match):
         await _instance.owner_status(event)
     else:
         await _instance.query(event, content.split(maxsplit=1)[1].strip())
+
+
+@interceptor(priority=200)
+async def menu_route(event):
+    return await _instance.route(event) if _instance is not None else False
+
+
+@handler(r'^n3:', name='忍3菜单回调', event_types=['INTERACTION_CREATE'], priority=30, block=True)
+async def menu_callback(event, _match):
+    if _instance is not None:
+        await _instance.on_interaction(event)

@@ -11,6 +11,7 @@ Group replies are public; the plugin never claims a complete roster.
 import asyncio
 import contextlib
 import json
+import re
 import sqlite3
 import time
 from uuid import uuid4
@@ -57,6 +58,10 @@ REASONS = {
 CHANGED = '账号或授权刚刚变化，请重新发送查询'
 
 
+def unknown_code(code):
+    return str(code) == '-1' or isinstance(code, int) and 500 <= code <= 599
+
+
 class BusinessError(ValueError):
     def __init__(self, message, status=422):
         self.status = status
@@ -86,6 +91,7 @@ class Ninja3:
         self.revisions = {}
         self.writes = {}
         self.notice_locks = {}
+        self.menus = {}  # Process-local references: reload invalidates every old menu.
 
     @staticmethod
     def _access_module():
@@ -295,18 +301,18 @@ class Ninja3:
             data = result[1] if len(result) > 1 else None
             if result[0]:
                 return 'sent'
-            return 'unknown' if isinstance(data, dict) and str(data.get('code')) == '-1' else 'failed'
+            return 'unknown' if isinstance(data, dict) and unknown_code(data.get('code')) else 'failed'
         if not isinstance(result, dict):
             return 'unknown'
         code = result.get('code')
         if code in (None, 0):
             return 'sent'
-        return 'unknown' if str(code) == '-1' else 'failed'
+        return 'unknown' if unknown_code(code) else 'failed'
 
-    async def reply(self, event, content):
+    async def reply(self, event, content, **kwargs):
         sender = self.sender_provider(event.appid)
         try:
-            return self.outcome(await sender.reply(event, content)) if sender else 'unavailable'
+            return self.outcome(await sender.reply(event, content, **kwargs)) if sender else 'unavailable'
         except Exception:  # noqa: BLE001 - transport failures leave the result unknown
             return 'unknown'
 
@@ -403,7 +409,7 @@ class Ninja3:
 
     # ---------- member queries ----------
 
-    async def query(self, event, name=None):
+    async def query(self, event, name=None, *, resource=None, page=0, menu=None):
         """``name=None`` lists the names; otherwise answers that account in this group."""
         bot, group, member = event.appid, event.group_id, event.raw_user_id
         if not event.is_group or event.is_channel or not group:
@@ -419,25 +425,47 @@ class Ninja3:
                 return
             invoke = await acl.evaluate(bot, CONSUMER, FUNCTION, group, member, action='invoke')
             if not (invoke['allowed'] and invoke['reason'] == 'explicit'):
-                await self.refuse(event, invoke, 'list' if name is None else 'query')
+                await self.refuse(event, invoke, 'list' if name is None and resource is None else 'query')
                 return
             decisions = [invoke]
             # Account rows (with credentials) are read only for a currently granted caller.
             accounts = [a for a in await self.store.all(bot, 'accounts') if a['enabled'] and group in a['open_groups']]
-            if name is None:
-                lines = [f'{i}. {a["name"]}' for i, a in enumerate(accounts, 1)]
-                content = '本群开放账号：\n' + '\n'.join(lines) + '\n发送“账号 名称”获取' if lines else '本群暂无开放账号'
-            else:
-                account = next((a for a in accounts if a['name'] == name), None)
-                if account is None:
-                    await self.reply(event, f'本群没有开放名为“{name}”的账号，发送“账号列表”查看')
+            if name is None and resource is None:
+                available = []
+                for account in accounts:
+                    view = await acl.evaluate(bot, CONSUMER, FUNCTION, group, member, account['id'], action='view')
+                    if view['allowed'] and view['reason'] == 'explicit':
+                        available.append(account)
+                        decisions.append(view)
+                if not self.current(event, revision, acl, decisions, menu):
+                    await self.reply(event, CHANGED)
                     return
-                view = await acl.evaluate(bot, CONSUMER, FUNCTION, group, member, account['id'], action='view')
-                if not (view['allowed'] and view['reason'] == 'explicit'):
-                    await self.refuse(event, view, 'query')
+                if not available:
+                    await self.reply(event, '本群暂无开放账号')
                     return
-                decisions.append(view)
-                content = self.credentials(account)
+                last = (len(available) - 1) // 6
+                if not 0 <= page <= last:
+                    await self.reply(event, '菜单已变化，请重新发送：账号列表')
+                    return
+                shown = available[page * 6 : (page + 1) * 6]
+                items = [(a['name'], {'resource': a['id']}) for a in shown]
+                if page:
+                    items.append(('上一页', {'page': page - 1}))
+                if page < last:
+                    items.append(('下一页', {'page': page + 1}))
+                title = f'本群开放账号（{page + 1}/{last + 1}）：'
+                await self.offer(event, title, items, lambda: self.current(event, revision, acl, decisions, menu))
+                return
+            account = next((a for a in accounts if (a['id'] == resource if resource else a['name'] == name)), None)
+            if account is None:
+                await self.reply(event, '该账号暂不可查询，请重新发送：账号列表' if resource else f'本群没有开放名为“{name}”的账号，发送“账号列表”查看')
+                return
+            view = await acl.evaluate(bot, CONSUMER, FUNCTION, group, member, account['id'], action='view')
+            if not (view['allowed'] and view['reason'] == 'explicit'):
+                await self.refuse(event, view, 'query')
+                return
+            decisions.append(view)
+            content = self.credentials(account)
         except BusinessError as error:
             await self.reply(event, str(error) if error.status != 503 else '账号查询暂不可用，请联系主人')
             return
@@ -448,11 +476,201 @@ class Ninja3:
         # Final synchronous gate after the last preparatory await: unchanged accounts,
         # open groups and module instances, and current decisions (sources, denial,
         # resource enablement, policy scope, group facts, reloads). Send immediately.
-        if not (self.unchanged(bot, revision) and self.access_provider() is acl and all(acl.decision_current(bot, d) for d in decisions)):
+        if not self.current(event, revision, acl, decisions, menu):
             await self.reply(event, CHANGED)
             return
         state = await self.reply(event, content)
-        log.info(f'[{bot}] 账号{"列表" if name is None else "查询"} group={group} member={member} result={state}')
+        log.info(f'[{bot}] 账号{"列表" if name is None and resource is None else "查询"} group={group} member={member} result={state}')
+
+    def current(self, event, revision, acl, decisions, menu=None):
+        # #75 account pause and #78 persistent emergency checks must join this gate,
+        # after all preparation and immediately before every sensitive send.
+        return (
+            self.unchanged(event.appid, revision)
+            and self.plugin_available(event.appid)
+            and self.access_provider() is acl
+            and all(acl.decision_current(event.appid, d) for d in decisions)
+            and (menu is None or self.menu_current(event, menu))
+        )
+
+    @staticmethod
+    def plugin_available(bot):
+        # Interceptors and non-message dispatch do not enforce plugin Bot bindings.
+        from core.application import get_app
+
+        app = get_app()
+        manager = app.plugin_manager if app else None
+        if manager is None:
+            return False
+        plugin = manager.plugins.get('ninja3')
+        bindings = manager.get_plugin_bots().get('ninja3', [])
+        return bool(plugin and plugin.enabled and (not bindings or bot in bindings))
+
+    def menu_current(self, event, menu):
+        return (
+            self.active
+            and self.plugin_available(event.appid)
+            and event.is_group
+            and not event.is_channel
+            and menu['bot'] == event.appid
+            and menu['group'] == event.group_id
+            and menu['expires_at'] > self.clock()
+        )
+
+    async def offer(self, event, title, items, current):
+        now = self.clock()
+        self.menus = {key: value for key, value in self.menus.items() if value['expires_at'] > now}
+        token = uuid4().hex
+        session = self.menus[token] = {
+            'bot': event.appid,
+            'group': event.group_id,
+            'expires_at': now + 300,
+            'actions': [action for _, action in items],
+        }
+
+        # Shared group menu: no creator identity or credentials are retained.
+        def check():
+            return self.menu_current(event, session) and current()
+
+        content = title + '\n' + '\n'.join(f'{i}. {label}' for i, (label, _) in enumerate(items, 1))
+        content += f'\n五分钟内发送“忍3选择 {token} <编号>”'
+        buttons = [{'text': label[:20], 'type': 1, 'data': f'n3:{token}:{i}', 'tips': f'发送：忍3选择 {token} {i}'} for i, (label, _) in enumerate(items, 1)]
+        rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+        if not check():
+            await self.reply(event, CHANGED)
+            return
+        if cfg.get_bot_setting(event.appid, 'message.use_markdown', True):
+            state = await self.reply(event, content, buttons=rows)
+            if state != 'failed':  # sent, unavailable or unknown: never duplicate.
+                return
+        # Rejection was an await; the same final gate applies to the fallback.
+        if check():
+            await self.reply(event, content + '\n按钮暂不可用，请使用以上文字编号。', msg_type=0)
+        else:
+            await self.reply(event, CHANGED)
+
+    async def menu(self, event):
+        bot, group = event.appid, event.group_id
+        revision = self.revision(bot)
+        try:
+            acl = self.access()
+            opened = await self.store.get(bot, 'groups', group)
+            snapshot = await acl.access_snapshot(bot, CONSUMER)
+            policy = snapshot['functions'].get(FUNCTION)
+            if not opened or not opened['enabled'] or not policy or group not in policy['groups']:
+                return False
+
+            def current():
+                state = acl.scope_states.get((bot, CONSUMER))
+                return (
+                    self.unchanged(bot, revision)
+                    and self.plugin_available(bot)
+                    and self.access_provider() is acl
+                    and acl.active
+                    and acl.generation == snapshot['generation']
+                    and state is not None
+                    and state['version'] == snapshot['version']
+                    and (bot, CONSUMER) not in acl.scope_pending
+                    and event.raw_user_id not in get_blacklist_map(bot, 'user')
+                    and group not in get_blacklist_map(bot, 'group')
+                )
+
+            items = [('账号列表', {'kind': 'list'})]
+            if self.is_owner(event):
+                items += [('修改密码', {'manage': '修改密码'}), ('紧急模式', {'manage': '紧急模式'})]
+            await self.offer(event, '忍者必须死3 菜单', items, current)
+            return True
+        except (BusinessError, RuntimeError, ValueError, sqlite3.Error, OSError):
+            return False
+
+    async def select(self, event, token, number):
+        menu = self.menus.get(token)
+        if not (menu and self.menu_current(event, menu) and 1 <= number <= len(menu['actions'])):
+            await self.reply(event, '菜单已失效，请重新发送：账号列表')
+            return
+        action = menu['actions'][number - 1]
+        if 'manage' in action:
+            if not self.is_owner(event):
+                await self.reply(event, '仅主人可以管理')
+                return
+            # Validate current plugin/ACL group scope even for unimplemented actions.
+            if not await self.scope_open(event):
+                await self.reply(event, '本群未开放账号查询')
+                return
+            if self.menu_current(event, menu) and self.is_owner(event):
+                await self.reply(event, action['manage'] + '尚未交付，当前不可用')
+        else:
+            # Resolve eligibility and credentials anew using the actual sender/clicker.
+            await self.query(event, resource=action.get('resource'), page=action.get('page', 0), menu=menu)
+
+    async def scope_open(self, event):
+        try:
+            revision = self.revision(event.appid)
+            opened = await self.store.get(event.appid, 'groups', event.group_id)
+            acl = self.access()
+            snapshot = await acl.access_snapshot(event.appid, CONSUMER)
+            return bool(
+                self.plugin_available(event.appid)
+                and self.access_provider() is acl
+                and acl.active
+                and (event.appid, CONSUMER) not in acl.scope_pending
+                and self.unchanged(event.appid, revision)
+                and opened
+                and opened['enabled']
+                and event.group_id in snapshot['functions'].get(FUNCTION, {}).get('groups', [])
+            )
+        except (BusinessError, RuntimeError, ValueError, sqlite3.Error, OSError):
+            return False
+
+    async def route(self, event):
+        if not self.plugin_available(event.appid) or not event.is_group or event.is_channel:
+            return False
+        content = (event.content or '').strip()
+        # Exact commands only. Interceptors precede the framework non-@ admission gate.
+        if event.event_type == 'GROUP_MESSAGE_CREATE':
+            if event.is_at_other_bot or event.is_at_other_user:
+                return False
+            if not event.is_at_self and not (
+                cfg.get_bot_setting(event.appid, 'non_at_message.enabled', False)
+                or event.group_id in (cfg.get_bot_setting(event.appid, 'non_at_message.group_whitelist', []) or [])
+            ):
+                return False
+        elif event.event_type != 'GROUP_AT_MESSAGE_CREATE':
+            return False
+        match = re.fullmatch(r'忍3选择 ([0-9a-f]{32}) ([1-9][0-9]?)', content)
+        if match:
+            await self.select(event, match[1], int(match[2]))
+            return True
+        if content not in {'', '菜单', '账号列表'} or (not content and not event.is_at_self):
+            return False
+        if not await self.scope_open(event):
+            return False
+        if content == '账号列表':
+            await self.query(event)
+            return True
+        return await self.menu(event)
+
+    async def on_interaction(self, event):
+        raw = event.interaction_data or {}
+        event.set_callback_code(0)  # Receipt only; business authorization is separate.
+        if not (
+            raw.get('type') in {11, 12}
+            and raw.get('scene') == 'group'
+            and raw.get('chat_type', 1) == 1
+            and event.group_id
+            and event.raw_user_id
+            and raw.get('application_id', event.appid) == event.appid
+            and not event.channel_id
+            and not event.is_channel
+            and event.raw_user_id not in get_blacklist_map(event.appid, 'user')
+            and event.group_id not in get_blacklist_map(event.appid, 'group')
+        ):
+            return
+        match = re.fullmatch(r'n3:([0-9a-f]{32}):([1-9][0-9]?)', event.content or '')
+        if match:
+            await self.select(event, match[1], int(match[2]))
+        else:
+            await self.reply(event, '菜单引用无效，请重新发送：账号列表')
 
     async def refuse(self, event, decision, action):
         bot, group, member = event.appid, event.group_id, event.raw_user_id

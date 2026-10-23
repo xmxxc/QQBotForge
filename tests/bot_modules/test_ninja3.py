@@ -31,7 +31,7 @@ async def ninja(account_host):
         )
         return response.status, await response.json()
 
-    async def say(text, *, user, group='group-a', bot='bot-a', mentions=(), at_bot=True):
+    async def say(text, *, user, group='group-a', bot='bot-a', mentions=(), at_bot=True, event_type='GROUP_AT_MESSAGE_CREATE'):
         from core.base import tasks
         from core.message.event import Event
 
@@ -41,7 +41,7 @@ async def ninja(account_host):
         event = Event.from_websocket(
             bot,
             {
-                't': 'GROUP_AT_MESSAGE_CREATE',
+                't': event_type,
                 'd': {'id': 'fake-message', 'content': content, 'group_openid': group, 'author': {'id': user, 'member_openid': user}, 'mentions': payload},
             },
         )
@@ -125,7 +125,7 @@ async def test_owner_mention_grant_covers_future_accounts_and_member_queries_pub
     assert [r['groups'] for r in snapshot['resources'].values()] == [[]]
     (source,) = grants(snapshot)
     assert (source['group'], source['mode'], source['resource_scope'], source['expires_at']) == ('group-a', 'continuous', {'kind': 'all'}, None)
-    assert await host.say('账号列表', user='MEMBERA') == ['本群开放账号：\n1. 账号A\n发送“账号 名称”获取']
+    assert (await host.say('账号列表', user='MEMBERA'))[0].startswith('本群开放账号（1/1）：\n1. 账号A\n')
     # Public group reply without trailing empty description/url lines; nothing private.
     assert await host.say('账号 账号A', user='MEMBERA') == [f'名称：账号A\n账号：fake-login\n密码：{SECRET}']
     assert not [m for m in host.sender.messages if m[0] in {'push', 'group-push'}]
@@ -314,7 +314,7 @@ async def test_old_account_plugin_keeps_its_own_data_and_commands(ninja):
     await host.setup(name='旧账户', password='fake-new-plugin')
     await grant(host)
     # The new commands never reach the old plugin, and the old commands never reach the new one.
-    assert await host.say('账号列表', user='MEMBERA') == ['本群开放账号：\n1. 旧账户\n发送“账号 名称”获取']
+    assert (await host.say('账号列表', user='MEMBERA'))[0].startswith('本群开放账号（1/1）：\n1. 旧账户\n')
     await host.event('账户管理 列表', user='owner-a')
     assert host.texts() == [f'{old["id"]} 旧账户 启用']
     status, accounts = await host.account_api()
