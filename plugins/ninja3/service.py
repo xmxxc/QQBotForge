@@ -370,12 +370,6 @@ class Ninja3:
 
     # ---------- member queries ----------
 
-    async def open_accounts(self, bot, group):
-        record = await self.store.get(bot, 'groups', group)
-        if not record or not record['enabled']:
-            return None
-        return [a for a in await self.store.all(bot, 'accounts') if a['enabled'] and group in a['open_groups']]
-
     async def query(self, event, name=None):
         """``name=None`` lists the names; otherwise answers that account in this group."""
         bot, group, member = event.appid, event.group_id, event.raw_user_id
@@ -385,8 +379,8 @@ class Ninja3:
         revision = self.revision(bot)
         try:
             acl = await self.ensure(bot)
-            accounts = await self.open_accounts(bot, group)
-            if accounts is None:
+            opened = await self.store.get(bot, 'groups', group)
+            if not opened or not opened['enabled']:
                 await self.reply(event, '本群未开放账号查询')
                 return
             invoke = await acl.evaluate(bot, CONSUMER, FUNCTION, group, member, action='invoke')
@@ -394,6 +388,8 @@ class Ninja3:
                 await self.refuse(event, invoke, 'list' if name is None else 'query')
                 return
             decisions = [invoke]
+            # Account rows (with credentials) are read only for a currently granted caller.
+            accounts = [a for a in await self.store.all(bot, 'accounts') if a['enabled'] and group in a['open_groups']]
             if name is None:
                 lines = [f'{i}. {a["name"]}' for i, a in enumerate(accounts, 1)]
                 content = '本群开放账号：\n' + '\n'.join(lines) + '\n发送“账号 名称”获取' if lines else '本群暂无开放账号'
@@ -434,8 +430,10 @@ class Ninja3:
         if reason in {'denied', 'framework_denied'}:
             await self.reply(event, '你暂无查询权限')
             return
-        await self.reply(event, '你暂无查询权限，已通知主人')
-        await self.notice(bot, group, member, action, reason)
+        record = await self.notice(bot, group, member, action, reason)
+        # Claim a notice only when this attempt actually reached the owner.
+        sent = record['count'] == 1 and record['notification'] == 'sent'
+        await self.reply(event, '你暂无查询权限，已通知主人' if sent else '你暂无查询权限，已记录给主人')
 
     # ---------- owner notices ----------
 
@@ -496,7 +494,7 @@ class Ninja3:
         lines = [f'忍者必须死3：账号 {len(accounts)} 个（启用 {sum(a["enabled"] for a in accounts)}），开放群 {sum(g["enabled"] for g in groups)} 个']
         if pending:
             lines.append(f'未送达的未授权通知 {len(pending)} 条，请在后台查看')
-        if event.is_direct:
+        if event.is_direct and not event.is_channel:
             lines.append('已记录本私聊为主人通知地址')
         await self.reply(event, '\n'.join(lines))
 

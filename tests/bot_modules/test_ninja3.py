@@ -139,8 +139,8 @@ async def test_grant_requires_owner_native_single_mention_and_never_crosses_bot_
     assert await host.say('授权', user='owner-a') == ['请发送“授权”并 @ 一位要授权的成员']
     assert not (await host.access.access_snapshot('bot-a', 'ninja3'))['grants']
     assert await grant(host)
-    assert await host.say('账号 账号A', user='MEMBERA', group='group-b') == ['你暂无查询权限，已通知主人']
-    assert await host.say('账号 账号A', user='MEMBERA', bot='bot-b') == ['你暂无查询权限，已通知主人']
+    assert await host.say('账号 账号A', user='MEMBERA', group='group-b') == ['你暂无查询权限，已记录给主人']
+    assert await host.say('账号 账号A', user='MEMBERA', bot='bot-b') == ['你暂无查询权限，已记录给主人']
     assert not (await host.access.access_snapshot('bot-b', 'ninja3'))['grants']
     # The old account consumer gains nothing from the new plugin's grant.
     assert not (await host.access.access_snapshot('bot-a', 'account_sharing'))['grants']
@@ -149,8 +149,8 @@ async def test_grant_requires_owner_native_single_mention_and_never_crosses_bot_
     await host.state.confirm_member('bot-a', 'group-a', 'MEMBERB', evidence='fake verified', member_role='member')
     await host.access.manage_access('bot-a', 'ninja3', 'policy', function='query', policy={'kind': 'group', 'groups': ['group-a', 'group-b']})
     assert (await host.access.evaluate('bot-a', 'ninja3', 'query', 'group-a', 'MEMBERB'))['allowed']
-    assert await host.say('账号 账号A', user='MEMBERB') == ['你暂无查询权限，已通知主人']
-    assert await host.say('账号列表', user='MEMBERB') == ['你暂无查询权限，已通知主人']
+    assert await host.say('账号 账号A', user='MEMBERB') == ['你暂无查询权限，已记录给主人']
+    assert await host.say('账号列表', user='MEMBERB') == ['你暂无查询权限，已记录给主人']
 
 
 async def test_unready_recovery_returns_pending_without_confirming_or_granting(ninja):
@@ -172,12 +172,17 @@ async def test_unauthorized_attempts_notify_owner_once_per_ten_minutes_and_keep_
     assert '已记录本私聊为主人通知地址' in host.texts()[-1]
     now = [1000.0]
     host.ninja().clock = lambda: now[0]
+    store, read = host.ninja().store, []
+    real_all = store.all
+    store.all = lambda bot, collection: read.append(collection) or real_all(bot, collection)
     assert await host.say('账号列表', user='MEMBERA') == ['你暂无查询权限，已通知主人']
+    assert 'accounts' not in read  # an ungranted caller never loads account rows
+    store.all = real_all
     pushes = [m for m in host.sender.messages if m[0] == 'push']
     assert len(pushes) == 1 and pushes[0][1] == 'owner-a' and 'MEMBERA' in pushes[0][2] and '授权 @该成员' in pushes[0][2]
     host.sender.messages.clear()
     now[0] += 599
-    assert await host.say('账号 账号A', user='MEMBERA') == ['你暂无查询权限，已通知主人']
+    assert await host.say('账号 账号A', user='MEMBERA') == ['你暂无查询权限，已记录给主人']
     assert not [m for m in host.sender.messages if m[0] == 'push']
     (notice,) = (await host.ninja_api('GET', 'notices'))[1]['data']
     assert (notice['count'], notice['action'], notice['notification']) == (2, 'query', 'sent')
@@ -189,7 +194,7 @@ async def test_unauthorized_attempts_notify_owner_once_per_ten_minutes_and_keep_
     # Unreachable owner (bot-b never chatted privately): the notice stays as an authenticated todo.
     host.sender.messages.clear()
     await host.setup(bot='bot-b')
-    await host.say('账号列表', user='MEMBERA', bot='bot-b')
+    assert await host.say('账号列表', user='MEMBERA', bot='bot-b') == ['你暂无查询权限，已记录给主人']
     (pending,) = (await host.ninja_api('GET', 'notices', bot='bot-b'))[1]['data']
     assert pending['notification'] == 'unavailable' and not [m for m in host.sender.messages if m[0] == 'push']
     await host.event('忍3', user='owner-b', bot='bot-b')
@@ -234,7 +239,7 @@ async def test_denial_wins_and_disable_close_rescope_delete_take_effect(ninja):
     host.lifecycle('GROUP_MEMBER_REMOVE', member='MEMBERA', sequence=2, timestamp=1000)
     await until(lambda: not grants(host.access.scope_states[('bot-a', 'ninja3')]))
     await until(lambda: host.state.recovery.get_status('bot-a').ready and not host.state.notifications.busy('bot-a'))
-    assert await host.say('账号 账号C', user='MEMBERA') == ['你暂无查询权限，已通知主人']
+    assert await host.say('账号 账号C', user='MEMBERA') == ['你暂无查询权限，已记录给主人']
 
 
 @pytest.mark.parametrize('change', ['password', 'disable', 'close_group', 'revoke', 'deny', 'leave', 'reload_access', 'reload_plugin'])
