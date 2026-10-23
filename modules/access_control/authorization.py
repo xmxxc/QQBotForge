@@ -552,8 +552,8 @@ class Authorization(AccessControl):
         await self._scope(bot, consumer)  # Load before taking the same scope lock.
         report = {'grants': 0, 'denies': 0, 'revocations': 0, 'policy_groups': [], 'skipped': 0, 'dropped_resources': 0}
 
-        def covers(record):
-            # Every legacy record passes here first: reject shapes the conversion would trip on.
+        def check_shape(record):
+            # Reject shapes the conversion would trip on (or silently misread).
             if (
                 not isinstance(record, dict)
                 or any(not isinstance(record.get(k, {}), dict) for k in ('function_scope', 'resource_scope'))
@@ -561,6 +561,9 @@ class Authorization(AccessControl):
                 or not isinstance(record.get('resource_scope', {}).get('ids', []), list)
             ):
                 raise ValueError('旧授权记录结构无效')
+
+        def covers(record):
+            check_shape(record)  # Every legacy grant, revocation and deny passes here first.
             scope = record.get('function_scope', {'kind': 'function', 'id': record.get('function')})
             return record.get('function') == legacy_function or scope.get('kind') == 'all' or legacy_function in record.get('functions', [])
 

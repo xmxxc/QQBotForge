@@ -213,7 +213,8 @@ async def test_all_failed_migration_is_not_reported_as_success(account_host):
     report = data['data']
     assert report['authorization'] == {'status': 'failed', 'error': '旧资料结构无效'}
     assert report['bindings'] == {'status': 'failed', 'error': '旧绑定缺少已观察私聊身份'}
-    assert report['status'] == 'failed'
+    # A passing rules check alone never turns two failed imports into a partial success.
+    assert report['rules']['status'] == 'checked' and report['status'] == 'failed'
     assert (await last_operation(host))['migration'] == 'failed'
 
 
@@ -359,7 +360,7 @@ async def test_permanent_record_failure_keeps_cancel_logs_redacted_and_retry_wor
     task.cancel('original-cancel')
     lock.release()
     assert await cancelled_args(task) == ('original-cancel',)
-    assert await store.all('bot-a', 'operations') == []
+    assert await migration_operations(host) == []
     [line] = [r.getMessage() for r in caplog.records if 'record not saved' in r.getMessage()]
     assert 'operation=' in line and '(IntegrityError)' in line and "'authorization': 'imported'" in line and 'secret-detail' not in line
     # The committed authorization stays; a retry reports it as present and records normally.
@@ -371,29 +372,59 @@ async def test_permanent_record_failure_keeps_cancel_logs_redacted_and_retry_wor
     assert (await last_operation(host))['migration'] == 'imported'
 
 
-async def test_stuck_record_write_is_bounded_and_not_claimed_saved(account_host, monkeypatch, caplog):
+async def migration_operations(host):
+    return [r for r in await service(host).store.all('bot-a', 'operations') if r['kind'] == 'migration']
+
+
+async def test_stuck_store_write_is_bounded_and_reported_as_unknown(account_host, caplog):
     host = account_host
     task, lock = await paused_migration(host)
-    service(host).record_drain_timeout = 0.05
     store = service(host).store
-    original_put = store.put
-    abandoned = asyncio.Event()
+    service(host).record_drain_timeout = 0.05
+    # The real store thread blocks before its INSERT; only the wait can be bounded, not the thread.
+    store._lock.acquire()
+    try:
+        task.cancel('original-cancel')
+        lock.release()
+        assert await cancelled_args(task) == ('original-cancel',)
+        messages = [r.getMessage() for r in caplog.records]
+        assert any('record outcome unknown' in m for m in messages) and not any('not saved' in m for m in messages)
+    finally:
+        store._lock.release()
+    # The abandoned write may still commit later; it is the cancelled record, never a success.
+    async with asyncio.timeout(5):
+        while not (operations := await migration_operations(host)):
+            await asyncio.sleep(0.01)
+    assert [r['migration'] for r in operations] == ['cancelled']
 
-    async def stuck_put(bot, collection, key, value):
-        if collection != 'operations':
-            return await original_put(bot, collection, key, value)
-        try:
-            await asyncio.Event().wait()
-        finally:
-            abandoned.set()
 
-    monkeypatch.setattr(store, 'put', stuck_put)
-    task.cancel('original-cancel')
-    lock.release()
+async def test_cancel_while_recording_a_finished_migration_keeps_cancel_and_record(account_host, monkeypatch):
+    host = account_host
+    await legacy_authorization(host)
+    await seed_legacy(host)
+    await c2c(host, '你好', 'private-a')
+    svc = service(host)
+    original_operation = svc.operation
+    reached = asyncio.Event()
+
+    async def gated_operation(*args, **kwargs):
+        # Hold the real store lock so the INSERT thread waits; the cancel lands meanwhile.
+        svc.store._lock.acquire()
+        reached.set()
+        return await original_operation(*args, **kwargs)
+
+    monkeypatch.setattr(svc, 'operation', gated_operation)
+    task = asyncio.create_task(svc.migrate('bot-a'))
+    try:
+        await asyncio.wait_for(reached.wait(), 5)
+        task.cancel('original-cancel')
+        await asyncio.sleep(0)
+    finally:
+        svc.store._lock.release()
     assert await cancelled_args(task) == ('original-cancel',)
-    # The finishing write was stopped before migrate returned, not left running in the background.
-    assert abandoned.is_set()
-    assert any('record not saved (unconfirmed)' in r.getMessage() for r in caplog.records)
+    # Recorded before the cancel propagated: no polling needed.
+    operations = await migration_operations(host)
+    assert [(r['authorization'], r['binding'], r['migration']) for r in operations] == [('imported', 'imported', 'imported')]
 
 
 async def test_malformed_nested_legacy_scope_fails_authorization_with_identities_imported(account_host):
@@ -412,12 +443,3 @@ async def test_malformed_nested_legacy_scope_fails_authorization_with_identities
     assert report['authorization'] == {'status': 'failed', 'error': '旧授权记录结构无效'}
     assert report['bindings']['status'] == 'imported' and report['status'] == 'partial'
     assert (await acl.access_snapshot('bot-a', 'account_sharing'))['grants'] == []
-    # A passing rules check alone never turns two failed imports into a partial success.
-    await service(host).store.put(
-        'bot-a',
-        'bindings',
-        json.dumps(['group-a', 'member-b']),
-        {'group': 'group-a', 'member': 'member-b', 'private_id': 'never-observed', 'source': 'owner_confirmed', 'confirmed_by': 'owner-a', 'evidence': 'x'},
-    )
-    status, data = await host.account_api('POST', 'migration', {})
-    assert status == 422 and data['data']['rules']['status'] == 'checked' and data['data']['status'] == 'failed', data

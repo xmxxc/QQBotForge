@@ -462,7 +462,7 @@ class AccountSharing:
                 raise
             except (ValueError, RuntimeError) as error:
                 report[name] = {'status': 'failed', 'error': str(error)}
-            except (AttributeError, KeyError, TypeError):
+            except (AttributeError, LookupError, TypeError):
                 log.warning(f'[{bot}] migration {name}: malformed legacy data', exc_info=True)
                 report[name] = {'status': 'failed', 'error': '旧资料结构无效'}
             except (sqlite3.Error, OSError):
@@ -484,11 +484,11 @@ class AccountSharing:
             accounts = {a['id'] for a in await self.accounts(bot)}
             return {'status': 'checked', 'total': len(listed), 'dangling': [r['id'] for r in listed if r['kind'] == 'resource' and r['target'] not in accounts]}
 
-        async def record(**fields):
+        async def record(operation_id):
             return await self.operation(
                 bot,
                 'migration',
-                **fields,
+                id=operation_id,
                 authorization=report['authorization']['status'],
                 binding=report['bindings']['status'],
                 rules=report['rules']['status'],
@@ -499,6 +499,7 @@ class AccountSharing:
             )
 
         stages = (('authorization', authorization, '授权资料写入失败'), ('bindings', bindings, '身份资料写入失败'), ('rules', rules, '规则读取失败'))
+        operation_id = uuid4().hex
         try:
             for name, run, storage_error in stages:
                 await stage(name, run, storage_error)
@@ -507,8 +508,7 @@ class AccountSharing:
             for name, _, _ in stages:
                 report.setdefault(name, {'status': 'not_run', 'reason': 'cancelled'})
             report['status'] = 'cancelled'
-            operation_id = uuid4().hex
-            await self.drain_record(bot, operation_id, report, record(id=operation_id))
+            await self.drain_record(bot, operation_id, report, record(operation_id))
             raise cancel
         import_statuses = [report[name]['status'] for name in ('authorization', 'bindings')]
         if 'failed' in [*import_statuses, report['rules']['status']]:
@@ -516,7 +516,14 @@ class AccountSharing:
             report['status'] = 'partial' if any(s in {'imported', 'unchanged'} for s in import_statuses) else 'failed'
         else:
             report['status'] = 'imported' if 'imported' in import_statuses else 'unchanged'
-        await self.notify_result(bot, await record())
+        write = asyncio.ensure_future(record(operation_id))
+        try:
+            result = await asyncio.shield(write)
+        except asyncio.CancelledError as cancel:
+            # Committed stages still get their record before the cancel propagates.
+            await self.drain_record(bot, operation_id, report, write)
+            raise cancel
+        await self.notify_result(bot, result)
         return report
 
     record_drain_timeout = 10
@@ -524,30 +531,30 @@ class AccountSharing:
     async def drain_record(self, bot, operation_id, report, write):
         """Finish a cancelled migration's record without letting it replace the cancel.
 
-        The write runs in its own task: a later cancel only interrupts the wait,
-        and the wait is bounded. Never raises; the caller re-raises the original cancel.
+        The write runs in its own task; later cancels only interrupt the waits, and
+        both waits are bounded. Never raises: the caller re-raises the original cancel.
         """
-        task = asyncio.ensure_future(write)
+        task = asyncio.ensure_future(write)  # A task already running is drained as is.
+        await self.wait_through_cancel(task, self.record_drain_timeout)
+        if not task.done():
+            task.cancel()
+            await self.wait_through_cancel(task, self.record_drain_timeout)
+        if task.done() and not task.cancelled() and task.exception() is None:
+            return
+        # SQL already handed to the store thread may still commit after an abandoned wait.
+        outcome = 'outcome unknown' if not task.done() or task.cancelled() else f'not saved ({type(task.exception()).__name__})'
+        statuses = {name: report[name]['status'] for name in ('authorization', 'bindings', 'rules')}
+        log.error(f'[{bot}] cancelled migration operation={operation_id} record {outcome}; stages={statuses}')
+
+    @staticmethod
+    async def wait_through_cancel(task, timeout):
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + self.record_drain_timeout
+        deadline = loop.time() + timeout
         while not task.done() and deadline > loop.time():
             try:
                 await asyncio.wait({task}, timeout=deadline - loop.time())
             except asyncio.CancelledError:
                 continue
-        if not task.done():
-            # SQL already handed to the store thread may still commit: outcome unknown.
-            task.cancel()
-            while not task.done():
-                try:
-                    await asyncio.wait({task})
-                except asyncio.CancelledError:
-                    continue
-        if not task.cancelled() and task.exception() is None:
-            return
-        outcome = 'unconfirmed' if task.cancelled() else type(task.exception()).__name__
-        stages = {name: report[name]['status'] for name in ('authorization', 'bindings', 'rules')}
-        log.error(f'[{bot}] cancelled migration operation={operation_id} record not saved ({outcome}); stages={stages}')
 
     # ---------- owner results ----------
 
