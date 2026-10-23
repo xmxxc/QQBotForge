@@ -29,7 +29,7 @@ REASONS = {
     'consumer_failed': '消费通知失败',
     'permission_denied': '平台无权限',
     'query_failed': '查询失败',
-    'timeout': '查询超时',
+    'timeout': '超时',
     'response_unknown': '平台返回无法识别',
     'unsupported': '当前 Bot 不支持查询',
     'refresh_failed': '刷新失败',
@@ -64,6 +64,10 @@ REASONS = {
     'old_callback_running': '旧回调仍在运行',
     'consumer_invalidated': '消费方要求重建',
     'dependency_invalidated': '依赖模块要求重建',
+    'unconfirmed': '事件处理未确认完成',
+    'error': '事件处理出错',
+    'cancelled': '事件处理已取消',
+    'unloaded': '模块已卸载',
 }
 PROGRESS = {'refreshing', 'bot_state_refreshing', 'roster_refreshing', 'verifying', 'confirming', 'persistence_pending', 'recovery_processing', 'rebuilding'}
 UNKNOWN = {'', 'not_verified', 'unknown_group', 'response_unknown', 'unsupported'}

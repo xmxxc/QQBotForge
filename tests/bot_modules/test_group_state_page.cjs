@@ -197,7 +197,7 @@ test('the status line names complete, in-progress, unknown and historical facts 
     assert.doesNotMatch(status, /process_restart|not_verified/);
     host.nodes['gs-roster'].onclick();
     await host.reply(host.requests.at(-1), {complete: false, reason: 'timeout', members: []});
-    assert.equal(host.nodes['gs-status'].textContent, '已更新：名册核验：不完整，原因：查询超时');
+    assert.equal(host.nodes['gs-status'].textContent, '已更新：名册核验：不完整，原因：超时');
     host.nodes['gs-verify'].onclick();
     await host.reply(host.requests.at(-1), {member: 'm1', state: 'unknown', reliable: false, status: 'pending', reason: 'permission_denied'});
     assert.equal(host.nodes['gs-status'].textContent, '已更新：单人核验：m1：无权限（平台无权限），角色未知，是否 Bot 未知');
@@ -231,7 +231,7 @@ test('a late response cannot replace the readable summary of the current Bot', a
     host.nodes['gs-bot'].onchange();
     await host.reply(host.requests.at(-1), {bot: 'bot-b', recovery: {ready: true}, groups: [{group: 'gb', reliable: false, reason: 'timeout', state: 'unknown', roster: {}}]});
     await host.reply(earlier, {bot: 'bot-a', recovery: {ready: true}, groups: [{group: 'ga', reliable: true, roster: {complete: true}}]});
-    assert.match(host.nodes['gs-summary'].textContent, /gb：失败（查询超时）/);
+    assert.match(host.nodes['gs-summary'].textContent, /gb：失败（超时）/);
     assert.doesNotMatch(host.nodes['gs-summary'].textContent, /ga/);
     host.nodes['gs-group'].value = 'group-b';
     host.nodes['gs-group'].oninput();

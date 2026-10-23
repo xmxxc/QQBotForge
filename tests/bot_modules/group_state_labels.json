@@ -5,7 +5,7 @@
   [{"reliable": false, "status": "verified", "reason": "", "continuity_reason": "recovery_pending"}, "暂停使用（恢复基线未完成）"],
   [{"reliable": false, "status": "historical", "reason": "permission_denied"}, "无权限（平台无权限）"],
   [{"reliable": false, "status": "historical", "reason": "persistence_failed"}, "失败（保存失败）"],
-  [{"reliable": false, "state": "unknown", "status": "pending", "reason": "timeout"}, "失败（查询超时）"],
+  [{"reliable": false, "state": "unknown", "status": "pending", "reason": "timeout"}, "失败（超时）"],
   [{"reliable": false, "status": "historical", "reason": "response_unknown"}, "未知（平台返回无法识别）"],
   [{"reliable": false, "status": "observed", "reason": "requires_verification"}, "待核验（需核验）"],
   [{"reliable": false, "status": "historical", "reason": "process_restart"}, "历史（重启或重载后需重新核验）"],
