@@ -8,6 +8,10 @@
 # tests directory. A source test file is never replaced by different content.
 set -euo pipefail
 
+if [ "$#" -ne 2 ]; then
+  echo "usage: stage-ci-assets.sh <source-dir> <assets-dir>" >&2
+  exit 2
+fi
 src="$1/tests"
 assets="$2/tests"
 
@@ -16,6 +20,10 @@ if [ ! -d "$assets" ]; then
   exit 1
 fi
 mkdir -p "$src"
+nested_before=0
+if [ -e "$src/tests" ]; then
+  nested_before=1
+fi
 
 conflicts=0
 while IFS= read -r -d '' file; do
@@ -24,7 +32,7 @@ while IFS= read -r -d '' file; do
     echo "::error::asset would overwrite source test: tests/$rel"
     conflicts=1
   fi
-done < <(find "$assets" -type f -print0)
+done < <(find "$assets" ! -type d -print0)
 if [ "$conflicts" -ne 0 ]; then
   exit 1
 fi
@@ -38,10 +46,10 @@ while IFS= read -r -d '' file; do
     echo "::error::asset not staged at tests/$rel"
     exit 1
   fi
-done < <(find "$assets" -type f -print0)
-if [ -e "$src/tests" ] && [ ! -e "$assets/tests" ]; then
+done < <(find "$assets" ! -type d -print0)
+if [ "$nested_before" -eq 0 ] && [ -e "$src/tests" ] && [ ! -e "$assets/tests" ]; then
   echo "::error::nested test root: $src/tests"
   exit 1
 fi
 
-echo "staged $(find "$assets" -type f | wc -l) asset files into $src ($(find "$src" -type f | wc -l) files total)"
+echo "staged $(find "$assets" ! -type d | wc -l) asset files into $src ($(find "$src" ! -type d | wc -l) files total)"
