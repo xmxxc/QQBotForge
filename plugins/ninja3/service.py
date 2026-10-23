@@ -40,7 +40,7 @@ GRANT = {
 }
 NOTICE_WINDOW = 600
 ACCOUNT_FIELDS = {'name', 'login', 'password', 'description', 'url', 'enabled', 'open_groups'}
-GROUP_FIELDS = {'group', 'name', 'enabled'}
+GROUP_FIELDS = {'group', 'name', 'enabled', 'auto_grant'}
 PAUSED = {'recovery_processing', 'persistence_pending', 'recovery_required'}
 REASONS = {
     'no_explicit_permission': '未授权',
@@ -178,15 +178,24 @@ class Ninja3:
         return await self.sync(bot, {'account': key}, apply)
 
     async def sync_group(self, bot, group):
-        """Only this group in the policy scope; kind, private switch, other groups, sources and denials are kept."""
+        """Only this group in the policy scope and its native-join rule; kind, private switch, other groups, sources and denials are kept."""
 
         async def apply(acl):
             record = await self.store.get(bot, 'groups', group)
+            # Automatic grants on trusted native joins only for an open group the owner opted in.
+            wanted = bool(record and record['enabled'] and record.get('auto_grant'))
+            rules = (await acl.access_snapshot(bot, CONSUMER)).get('join_rules', [])
+            had = any((r['function'], r['group']) == (FUNCTION, group) for r in rules)
+            if had and not wanted:
+                # Stop automatic grants before anything else changes.
+                await acl.manage_access(bot, CONSUMER, 'join_rule', function=FUNCTION, group=group, enabled=False)
             configured = (await acl.access_snapshot(bot, CONSUMER))['functions'][FUNCTION]
             groups = [g for g in configured['groups'] if g != group] + ([group] if record and record['enabled'] else [])
             if groups != configured['groups']:
                 await acl.manage_access(bot, CONSUMER, 'policy', function=FUNCTION, policy={**configured, 'groups': groups})
-            return {'policy_before': configured['groups'], 'policy_after': groups}
+            if wanted and not had:
+                await acl.manage_access(bot, CONSUMER, 'join_rule', function=FUNCTION, group=group, enabled=True)
+            return {'policy_before': configured['groups'], 'policy_after': groups, 'auto_grant_before': had, 'auto_grant_after': wanted}
 
         return await self.sync(bot, {'group': group}, apply)
 
@@ -277,13 +286,17 @@ class Ninja3:
             group = native(data.get('group'), '群')
             if 'enabled' in data and not isinstance(data['enabled'], bool):
                 raise BusinessError('开放状态须为布尔值')
+            if 'auto_grant' in data and not isinstance(data['auto_grant'], bool):
+                raise BusinessError('入群自动授权须为布尔值')
             record = await self.store.get(bot, 'groups', group) or {'group': group, 'name': '', 'enabled': False}
+            record.setdefault('auto_grant', False)
+            record['auto_grant'] = data.get('auto_grant', record['auto_grant'])
             if 'name' in data:
                 record['name'] = text(data['name'], '群备注')[:100]
             record['enabled'] = data.get('enabled', record['enabled'])
             with self.writing(bot):
                 await self.store.put(bot, 'groups', group, record)
-            log.info(f'[{bot}] 保存群 {group} 开放={record["enabled"]}')
+            log.info(f'[{bot}] 保存群 {group} 开放={record["enabled"]} 入群自动授权={record["auto_grant"]}')
             return {**record, 'acl_sync': await self.sync_group(bot, group)}
 
     # ---------- replies ----------
@@ -377,6 +390,8 @@ class Ninja3:
                     and g.get('mode') == 'continuous'
                     and g.get('resource_scope') == GRANT['resource_scope']
                     and g['expires_at'] is None
+                    # An automatic join source lapses with its join basis; the owner's grant stands alone.
+                    and g.get('basis') != 'native_join'
                 ),
                 None,
             )
@@ -556,7 +571,17 @@ class Ninja3:
             reason = '' if snapshot else 'unavailable'
         policy = snapshot['functions'][FUNCTION] if snapshot else None
         resources = snapshot['resources'] if snapshot else {}
-        rows = [{'group': g['group'], 'plugin_open': g['enabled'], 'acl_open': bool(policy and g['group'] in policy['groups'])} for g in groups]
+        rules = {r['group'] for r in snapshot.get('join_rules', []) if r['function'] == FUNCTION} if snapshot else set()
+        rows = [
+            {
+                'group': g['group'],
+                'plugin_open': g['enabled'],
+                'acl_open': bool(policy and g['group'] in policy['groups']),
+                'plugin_auto_grant': g['enabled'] and g.get('auto_grant', False),
+                'acl_auto_grant': g['group'] in rules,
+            }
+            for g in groups
+        ]
         items = [
             {
                 'id': a['id'],
@@ -567,9 +592,11 @@ class Ninja3:
             for a in accounts
         ]
         # Both must pass; a mismatch only ever restricts. Saving the group/account again syncs it.
-        mismatched = [r['group'] for r in rows if r['plugin_open'] and not r['acl_open']] + [
-            i['name'] for i in items if i['plugin_enabled'] and i['acl_resource'] != 'enabled'
-        ]
+        mismatched = (
+            [r['group'] for r in rows if r['plugin_open'] and not r['acl_open']]
+            + [r['group'] + '（入群自动授权不一致）' for r in rows if r['plugin_open'] and r['acl_open'] and r['plugin_auto_grant'] != r['acl_auto_grant']]
+            + [i['name'] for i in items if i['plugin_enabled'] and i['acl_resource'] != 'enabled']
+        )
         return {'acl': 'available' if snapshot else reason, 'policy': policy, 'groups': rows, 'accounts': items, 'restricted_by_acl': mismatched}
 
     # ---------- HTTP ----------

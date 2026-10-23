@@ -105,6 +105,8 @@ async def test_backend_crud_defaults_closed_and_isolated_per_bot(ninja):
         'status': 'saved',
         'policy_before': [],
         'policy_after': ['group-a'],
+        'auto_grant_before': False,
+        'auto_grant_after': False,
     }
     assert (await host.access.access_snapshot('bot-a', 'ninja3'))['functions']['query']['groups'] == ['group-a']
     operations = (await host.ninja_api('GET', 'operations'))[1]['data']
@@ -360,7 +362,9 @@ async def test_member_queries_never_write_authorization_and_owner_narrowing_surv
         assert await version() == narrowed_version
     assert [n['member'] for n in (await host.ninja_api('GET', 'notices'))[1]['data']] == ['MEMBERB']
     status, report = await host.ninja_api('GET', 'status')
-    assert report['data']['restricted_by_acl'] == ['group-a'] and report['data']['groups'] == [{'group': 'group-a', 'plugin_open': True, 'acl_open': False}]
+    assert report['data']['restricted_by_acl'] == ['group-a'] and report['data']['groups'] == [
+        {'group': 'group-a', 'plugin_open': True, 'acl_open': False, 'plugin_auto_grant': False, 'acl_auto_grant': False}
+    ]
     # Account configuration writes sync resources only; they never widen the group scope.
     await host.ninja_api('PATCH', 'accounts/' + account['id'], {'password': 'fake-rotated'})
     assert (await host.access.access_snapshot('bot-a', 'ninja3'))['functions']['query']['groups'] == []
