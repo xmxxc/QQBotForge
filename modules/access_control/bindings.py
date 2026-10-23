@@ -199,13 +199,23 @@ class Bindings:
         state = await self.state(bot)
         async with self.locks.setdefault(bot, asyncio.Lock()):
             candidate = copy.deepcopy(state)
+            imported = {'private_identities': 0, 'bindings': 0, 'requests': 0}
+            existing = dict(imported)
+            # Records already present are kept: only the same semantic identity
+            # is compatible, never whole-record equality across formats.
             for record in bundle['private_identities']:
                 if not isinstance(record, dict) or record.get('identity_observed') is not True or record.get('source') != 'observed_c2c':
                     raise ValueError('迁移私聊身份须有原观察来源')
                 key = identifier(record.get('private_id'))
-                if key in candidate['private'] and candidate['private'][key] != record:
-                    raise ValueError('迁移私聊身份与现存记录冲突')
+                if key in candidate['private']:
+                    # Same Bot, same native C2C author: one observation. Legacy
+                    # union aliases stay source metadata and never alter it.
+                    if candidate['private'][key].get('source') != 'observed_c2c':
+                        raise ValueError('迁移私聊身份与现存记录冲突')
+                    existing['private_identities'] += 1
+                    continue
                 candidate['private'][key] = copy.deepcopy(record)
+                imported['private_identities'] += 1
             for record in bundle['bindings']:
                 if not isinstance(record, dict):
                     raise ValueError('绑定迁移结构无效')
@@ -215,22 +225,37 @@ class Bindings:
                     raise ValueError('该关联已撤销，历史迁移不能恢复，须新申请并由主人核实')
                 if private_id not in candidate['private']:
                     raise ValueError('旧绑定缺少已观察私聊身份')
-                item = {**copy.deepcopy(record), 'id': record.get('id', key)}
-                if key in candidate['bindings'] and candidate['bindings'][key] != item:
-                    raise ValueError('旧绑定与现存关联冲突')
-                candidate['bindings'][key] = item
+                if key in candidate['bindings']:
+                    if candidate['bindings'][key]['private_id'] != private_id:
+                        raise ValueError('旧绑定与现存关联冲突')
+                    existing['bindings'] += 1
+                    continue
+                candidate['bindings'][key] = {**copy.deepcopy(record), 'id': record.get('id', key)}
+                imported['bindings'] += 1
             for record in bundle['binding_requests']:
                 if not isinstance(record, dict):
                     raise ValueError('旧申请结构无效')
                 key = identifier(record.get('id'))
-                if key in candidate['requests'] and candidate['requests'][key] != record:
-                    raise ValueError('旧申请ID冲突')
+                if key in candidate['requests']:
+                    # Later status (confirmed, rejected, revoked) wins over history.
+                    if any(candidate['requests'][key].get(name) != record.get(name) for name in ('private_id', 'group', 'member')):
+                        raise ValueError('旧申请ID冲突')
+                    existing['requests'] += 1
+                    continue
                 candidate['requests'][key] = copy.deepcopy(record)
+                imported['requests'] += 1
             self.validate(candidate)
             # No grants, denies or membership facts are imported by this operation.
-            state.update(candidate)
-            await self.save(bot, state)
-            return {'bindings': len(candidate['bindings']), 'requests': len(candidate['requests'])}
+            if any(imported.values()):
+                state.update(candidate)
+                await self.save(bot, state)
+            return {
+                'status': 'imported' if any(imported.values()) else 'unchanged',
+                'bindings': len(candidate['bindings']),
+                'requests': len(candidate['requests']),
+                'imported': imported,
+                'existing': existing,
+            }
 
     async def manage(self, bot, operation, data, actor):
         if operation == 'binding_confirm':

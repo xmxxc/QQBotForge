@@ -451,17 +451,55 @@ class AccountSharing:
     async def migrate(self, bot):
         """Owner-run migration of legacy authorization and plugin bindings; never widens access."""
         acl = await self.ensure(bot)
-        report = {'authorization': await acl.import_legacy(bot, CONSUMER, FUNCTION)}
-        bundle = {name: await self.store.all(bot, name) for name in ('private_identities', 'bindings', 'binding_requests')}
-        try:
-            report['bindings'] = await acl.bindings.import_history(bot, bundle) if any(bundle.values()) else {'bindings': 0, 'requests': 0}
-        except ValueError as error:
-            report['bindings'] = {'error': str(error)}
-        rules = await self.qa().manage(bot, FUNCTION, 'list')
-        accounts = {a['id'] for a in await self.accounts(bot)}
-        report['rules'] = {'total': len(rules), 'dangling': [r['id'] for r in rules if r['kind'] == 'resource' and r['target'] not in accounts]}
+        report = {}
+
+        async def stage(name, run, storage_error):
+            # Each stage reports what actually happened; a failed one keeps its own boundary.
+            try:
+                report[name] = await run()
+            except (ValueError, RuntimeError) as error:
+                report[name] = {'status': 'failed', 'error': str(error)}
+            except (KeyError, TypeError):
+                report[name] = {'status': 'failed', 'error': '旧资料结构无效'}
+            except (sqlite3.Error, OSError):
+                report[name] = {'status': 'failed', 'error': storage_error}
+
+        async def authorization():
+            result = await acl.import_legacy(bot, CONSUMER, FUNCTION)
+            changed = any(result[k] for k in ('grants', 'denies', 'revocations', 'policy_groups'))
+            return {'status': 'imported' if changed else 'unchanged', **result}
+
+        async def bindings():
+            bundle = {name: await self.store.all(bot, name) for name in ('private_identities', 'bindings', 'binding_requests')}
+            if not any(bundle.values()):
+                return {'status': 'not_run', 'reason': 'no_legacy_records', 'bindings': 0, 'requests': 0}
+            return await acl.bindings.import_history(bot, bundle)
+
+        async def rules():
+            listed = await self.qa().manage(bot, FUNCTION, 'list')
+            accounts = {a['id'] for a in await self.accounts(bot)}
+            return {'status': 'checked', 'total': len(listed), 'dangling': [r['id'] for r in listed if r['kind'] == 'resource' and r['target'] not in accounts]}
+
+        await stage('authorization', authorization, '授权资料写入失败')
+        await stage('bindings', bindings, '身份资料写入失败')
+        await stage('rules', rules, '规则读取失败')
+        imports = [report[name]['status'] for name in ('authorization', 'bindings')]
+        statuses = [*imports, report['rules']['status']]
+        if 'failed' in statuses:
+            # The rules stage only checks; success there alone is not a partial import.
+            report['status'] = 'partial' if any(s in {'imported', 'unchanged'} for s in imports) else 'failed'
+        else:
+            report['status'] = 'imported' if 'imported' in imports else 'unchanged'
         result = await self.operation(
-            bot, 'migration', authorization='imported', binding='imported', notification='pending', delivery='not_requested', report=report
+            bot,
+            'migration',
+            authorization=report['authorization']['status'],
+            binding=report['bindings']['status'],
+            rules=report['rules']['status'],
+            migration=report['status'],
+            notification='pending',
+            delivery='not_requested',
+            report=report,
         )
         await self.notify_result(bot, result)
         return report
@@ -1138,7 +1176,10 @@ class AccountSharing:
                     raise BusinessError('方法不适用', 405)
                 return web.json_response({'success': True, 'data': result})
             if parts == ['migration'] and request.method == 'POST':
-                return web.json_response({'success': True, 'data': await self.migrate(bot)})
+                report = await self.migrate(bot)
+                if report['status'] == 'failed':
+                    return web.json_response({'success': False, 'error': '迁移未完成，各阶段原因见 data', 'data': report}, status=422)
+                return web.json_response({'success': True, 'data': report})
             if parts == ['group-delivery']:
                 if request.method == 'GET':
                     result = await self.group_delivery.list(bot)
