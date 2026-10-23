@@ -62,11 +62,23 @@ async def group_host(tmp_path, monkeypatch):
                 self.messages.append(('push-image', user_id, media['file_info'][5:]) if media else ('push', user_id, content))
             return ok, data, {}
 
+        async def send_to_group(self, group_id, content=None, **kwargs):
+            self.messages.append(('group-push', group_id, content))
+            return True, {'id': 'fake-group-push'}, {}
+
         async def post_json(self, endpoint, data):
             # Media URL upload (POST .../files, srv_send_msg false): file_info names the URL.
             return True, {'file_info': 'file:' + data['url']}
 
+        # Buttons: recorded per reply; reject_buttons simulates a platform refusal.
+        reject_buttons = False
+        keyboards = []
+
         async def reply(self, event, content=None, **kwargs):
+            if kwargs.get('buttons') is not None:
+                if self.reject_buttons:
+                    return {'code': 'fake-button-rejected', 'message': 'rejected'}
+                self.keyboards.append(kwargs['buttons'])
             self.messages.append((event.appid, event.group_id if event.is_group else event.raw_user_id, content))
             # Same shape as Sender.reply: the platform response dict.
             return {'id': 'fake-reply'}

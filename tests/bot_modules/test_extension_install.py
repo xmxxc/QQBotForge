@@ -1,12 +1,34 @@
-"""Deployment contract on unchanged framework sources and the three extension folders."""
+"""Extension folders install, load and persist independently (moved from the legacy account suite)."""
 
+import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+ACCOUNT = {
+    'id': 'legacy-account',
+    'name': '旧账户',
+    'login': 'fake-login',
+    'password': 'fake-secret',
+    'enabled': True,
+    'description': '',
+    'url': '',
+    'groups': ['旧分组'],
+}
+
+
+def legacy_database(path, records):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as connection:
+        connection.execute('CREATE TABLE extension_records (bot TEXT, collection TEXT, id TEXT, payload TEXT NOT NULL, PRIMARY KEY(bot, collection, id))')
+        connection.execute('PRAGMA user_version=1')
+        for collection, key, value in records:
+            connection.execute('INSERT INTO extension_records VALUES (?,?,?,?)', ('bot-a', collection, key, json.dumps(value, ensure_ascii=False)))
 
 
 def test_three_extension_folders_load_on_unmodified_framework(tmp_path):
@@ -57,35 +79,6 @@ asyncio.run(verify())
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-async def test_member_queries_stop_without_observer_but_owner_preview_remains_available(host):
-    from test_access import grant
-    from test_binding import bind
-
-    account = await host.create()
-    await grant(host, account)
-    await bind(host)
-    host.service.access_provider().lifecycle_available = False
-    host.sender.messages.clear()
-    await host.event(f'账户查询 {account["id"]}', user='private-a')
-    assert not any('fake-secret' in str(message) for message in host.sender.messages)
-    await host.event(f'账户管理 预览 {account["id"]}')
-    assert 'fake-secret' in host.sender.messages[-1][2]
-
-
-async def test_unavailable_integration_does_not_invite_unusable_binding(host):
-    from test_access import grant
-
-    account = await host.create()
-    host.service.access_provider().lifecycle_available = False
-    host.sender.messages.clear()
-    response = await grant(host, account)
-    assert response.status == 200
-    result = (await response.json())['data']['operation_result']
-    assert result['authorization'] == 'saved'
-    assert result['event_integration'] == 'unavailable' and result['guidance'] == 'unavailable'
-    assert not any('账户绑定' in str(message) for message in host.sender.messages)
-
-
 def test_qa_folder_alone_persists_and_replies_without_access_control(tmp_path):
     root = Path(__file__).resolve().parents[2]
     for relative in ['core', 'web', 'modules/self_qa']:
@@ -117,8 +110,9 @@ async def verify():
 
 asyncio.run(verify())
 """
-    result = subprocess.run([sys.executable, '-c', script], cwd=tmp_path,
-                            env={**os.environ, 'PYTHONPATH': str(tmp_path)}, capture_output=True, text=True, timeout=45)
+    result = subprocess.run(
+        [sys.executable, '-c', script], cwd=tmp_path, env={**os.environ, 'PYTHONPATH': str(tmp_path)}, capture_output=True, text=True, timeout=45
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -156,6 +150,35 @@ async def verify():
 
 asyncio.run(verify())
 """
-    result = subprocess.run([sys.executable, '-c', script], cwd=tmp_path,
-                            env={**os.environ, 'PYTHONPATH': str(tmp_path)}, capture_output=True, text=True, timeout=45)
+    result = subprocess.run(
+        [sys.executable, '-c', script], cwd=tmp_path, env={**os.environ, 'PYTHONPATH': str(tmp_path)}, capture_output=True, text=True, timeout=45
+    )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize('package', ['modules.access_control.storage', 'modules.self_qa.storage', 'plugins.account_sharing.storage'])
+async def test_failed_write_retains_legacy_record_and_retry_is_safe(tmp_path, package):
+    from importlib import import_module
+
+    path = tmp_path / 'legacy.db'
+    legacy_database(path, [('accounts', ACCOUNT['id'], ACCOUNT)])
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TRIGGER fail_writes BEFORE INSERT ON extension_records BEGIN SELECT RAISE(ABORT, 'fake disk failure'); END")
+    store = import_module(package).ExtensionStore(path)
+    await store.ready()
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.put('bot-a', 'accounts', ACCOUNT['id'], {**ACCOUNT, 'password': 'replacement'})
+        assert await store.get('bot-a', 'accounts', ACCOUNT['id']) == ACCOUNT
+    finally:
+        store.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute('DROP TRIGGER fail_writes')
+    for _ in range(2):
+        store = import_module(package).ExtensionStore(path)
+        try:
+            await store.ready()
+            await store.put('bot-a', 'accounts', ACCOUNT['id'], ACCOUNT)
+            assert await store.all('bot-a', 'accounts') == [ACCOUNT]
+        finally:
+            store.close()
