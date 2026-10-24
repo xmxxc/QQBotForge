@@ -496,3 +496,182 @@ async def test_cancelled_setup_leaves_no_hooks_and_retry_is_clean(api_client, au
     status, data = await toggle(api_client, auth_cookies, 'probe58_cancel')
     assert data['success'] is True, data
     assert env.owners() == ['probe58_cancel-display']
+
+
+# ==================== 启用标记保存失败 (setup 已成功) ====================
+
+
+def _block_modules_dir(env):
+    """把 modules 目录移走并在原位放普通文件：_save_enabled_map 的 makedirs 会真实抛错。"""
+    saved = env.modules_dir + '-saved'
+    os.rename(env.modules_dir, saved)
+    with open(env.modules_dir, 'w', encoding='utf-8') as f:
+        f.write('blocker')
+    return saved
+
+
+def _unblock_modules_dir(env, saved):
+    if os.path.isfile(env.modules_dir):
+        os.unlink(env.modules_dir)
+        os.rename(saved, env.modules_dir)
+
+
+async def test_persist_failure_after_setup_keeps_manageable_instance(api_client, auth_cookies, env):
+    name = 'probe58_persist'
+    saved = env.modules_dir + '-saved'
+    source = f"""
+import os
+
+__module_meta__ = {{'name': 'persist-probe'}}
+_LOG = {env.log_path!r}
+
+
+async def setup(ctx):
+    async def on_event(*args):
+        pass
+
+    ctx.register_hook('probe58', on_event)
+    subscription = ctx.subscribe_group_lifecycle(on_event)
+    with open(_LOG, 'a', encoding='utf-8') as f:
+        f.write('setup\\n')
+    if not os.path.exists({saved!r} + '.done'):
+        open({saved!r} + '.done', 'w').close()
+        os.rename({env.modules_dir!r}, {saved!r})
+        with open({env.modules_dir!r}, 'w') as f:
+            f.write('blocker')
+    return {{'subscription': subscription}}
+
+
+async def teardown():
+    with open(_LOG, 'a', encoding='utf-8') as f:
+        f.write('teardown\\n')
+"""
+    env.write_module(name, source=source)
+    mm = await start(env)
+    try:
+        status, data = await toggle(api_client, auth_cookies, name)
+        assert status == 200
+        assert data['success'] is False
+        assert '启用标记保存失败' in data['message']
+        # setup 已成功：实例完整运行，可被管理；内存标记已回滚，不谎报已持久化
+        subscription = mm.get(name)['subscription']
+        assert mm.is_enabled(name)
+        assert mm.get_context(name) is not None and mm.get_module(name) is not None
+        assert subscription.active
+        assert env.owners() == ['persist-probe']
+        assert not mm.is_module_enabled_persist(name)
+        status_row = {m['name']: m for m in mm.list_modules()}[name]
+        assert status_row['persist_enabled'] is False and '启用标记保存失败' in status_row['error']
+    finally:
+        _unblock_modules_dir(env, saved)
+    assert env.persisted() == {}
+
+    # 存储恢复后重试：不重新 setup，只补写标记
+    status, data = await toggle(api_client, auth_cookies, name)
+    assert data['success'] is True, data
+    assert env.events() == ['deps:probe58_persist', 'setup']
+    assert env.persisted() == {name: True}
+    assert {m['name']: m for m in mm.list_modules()}[name]['error'] is None
+
+    status, data = await toggle(api_client, auth_cookies, name, 'disable')
+    assert status == 200 and data['success'] is True, data
+    assert not mm.is_enabled(name) and mm.get_context(name) is None
+    assert not subscription.active
+    assert env.owners() == []
+    assert env.persisted() == {name: False}
+
+    status, data = await toggle(api_client, auth_cookies, name)
+    assert data['success'] is True, data
+    assert env.events().count('setup') == 2
+    assert env.owners() == ['persist-probe']
+
+
+async def test_persist_failure_for_running_module_is_reported_then_retried(api_client, auth_cookies, env):
+    env.write_module('probe58_prun')
+    mm = await start(env)
+    assert await mm.enable('probe58_prun', _persist=False)
+
+    saved = _block_modules_dir(env)
+    try:
+        status, data = await toggle(api_client, auth_cookies, 'probe58_prun')
+        assert status == 200 and data['success'] is False
+        assert '启用标记保存失败' in data['message']
+        assert mm.is_enabled('probe58_prun') and not mm.is_module_enabled_persist('probe58_prun')
+    finally:
+        _unblock_modules_dir(env, saved)
+
+    status, data = await toggle(api_client, auth_cookies, 'probe58_prun')
+    assert data['success'] is True, data
+    assert env.persisted() == {'probe58_prun': True}
+    assert [e for e in env.events() if e.startswith('setup')] == ['setup:probe58_prun:1.0.0']
+
+
+# ==================== 平台路径别名 ====================
+
+
+async def test_symlinked_module_dir_still_enables(api_client, auth_cookies, env):
+    mm = await start(env)
+    real = os.path.join(env.base_dir, 'releases', 'probe58_link-v1')
+    os.makedirs(os.path.dirname(real))
+    env.write_module('probe58_link')
+    os.rename(os.path.join(env.modules_dir, 'probe58_link'), real)
+    os.symlink(real, os.path.join(env.modules_dir, 'probe58_link'))
+
+    status, data = await toggle(api_client, auth_cookies, 'probe58_link')
+    assert data['success'] is True, data
+    assert mm.is_enabled('probe58_link')
+
+
+@pytest.mark.parametrize('alias', ['C:probe58_win', 'c:probe58_win', 'C:'])
+async def test_windows_drive_relative_alias_rejected_under_ntpath(api_client, auth_cookies, env, monkeypatch, alias):
+    """Windows 路径语义（stdlib ntpath）映射到临时 POSIX 目录；非原生 Windows 实测。"""
+    import importlib.util
+    import ntpath
+    from pathlib import Path
+
+    name = 'probe58_win'
+    env.write_module(name)
+    Path(env.modules_dir, 'main.py').write_text("async def setup(ctx):\n    return {'wrong_root_executed': True}\n")
+    mm = await start(env)
+    physical, logical, real_os = Path(env.modules_dir), r'C:\modules', os
+
+    def physical_path(path):
+        path = str(path)
+        if path.lower().startswith(logical.lower()):
+            return str(physical / path[len(logical) :].lstrip('\\/').replace('\\', '/'))
+        return path.replace('\\', '/')
+
+    class WinPath:
+        def __getattr__(self, key):
+            return getattr(ntpath, key)
+
+        def isdir(self, path):
+            return real_os.path.isdir(physical_path(path))
+
+        def isfile(self, path):
+            return real_os.path.isfile(physical_path(path))
+
+    mm._dir = logical
+    read, spec = manager_mod.read_dict_assignment, importlib.util.spec_from_file_location
+
+    def mapped_spec(mod_name, location, **kwargs):
+        if 'submodule_search_locations' in kwargs:
+            kwargs['submodule_search_locations'] = [physical_path(p) for p in kwargs['submodule_search_locations']]
+        return spec(mod_name, physical_path(location), **kwargs)
+
+    fake_os = SimpleNamespace(
+        path=WinPath(), listdir=lambda p: real_os.listdir(physical_path(p)), makedirs=lambda p, **kw: real_os.makedirs(physical_path(p), **kw)
+    )
+    monkeypatch.setattr(manager_mod, 'os', fake_os)
+    monkeypatch.setattr(manager_mod, 'read_dict_assignment', lambda p, *a: read(physical_path(p), *a))
+    monkeypatch.setattr(importlib.util, 'spec_from_file_location', mapped_spec)
+    try:
+        # 正常控制：合法名称在同一映射下可以启用
+        assert (await toggle(api_client, auth_cookies, name))[1]['success']
+        status, data = await toggle(api_client, auth_cookies, alias)
+        assert data['success'] is False, data
+        assert [m['name'] for m in mm.list_modules() if m['enabled']] == [name]
+        assert [e for e in env.events() if e.startswith('setup')] == ['setup:probe58_win:1.0.0']
+        assert mm.get(alias) is None
+    finally:
+        sys.modules.pop('modules.' + alias, None)

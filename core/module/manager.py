@@ -216,9 +216,11 @@ class ModuleManager:
             return current
 
         mod_dir = os.path.join(self._dir, name)
-        if os.path.dirname(mod_dir) != self._dir:  # 如 Windows 盘符相对路径
+        # 按平台路径语义只接受单级组件（Windows 的 C:x、C: 带盘符），再要求名称是目录中的真实条目，
+        # 挡住大小写、末尾点号等指向同一目录的别名；symlink 条目照常可用。
+        if os.path.splitdrive(name)[0] or os.path.basename(name) != name or os.path.dirname(mod_dir) != self._dir:
             return None
-        if not os.path.isdir(mod_dir) or not self._find_entry(mod_dir):
+        if not self._is_listed(name) or not os.path.isdir(mod_dir) or not self._find_entry(mod_dir):
             self._modules.pop(name, None)
             return None
 
@@ -294,7 +296,7 @@ class ModuleManager:
             return False
         if info.instance is not None:
             if _persist and not self.is_module_enabled_persist(name):
-                self.set_module_enabled_persist(name, True)
+                return self._persist_enabled(info)
             return True
         ctx = None
         try:
@@ -312,11 +314,9 @@ class ModuleManager:
                 raise
             info.instance = result if result is not None else True
             info.error = None
-            if _persist:
-                self.set_module_enabled_persist(name, True)
-            return True
         except BaseException as e:
-            # 失败或被取消的 setup 不能留下已注册的 hook 或半初始化模块，否则重试会叠加回调。
+            # 失败或被取消的 setup 注销本次 hook、移出半初始化模块，避免重试叠加回调；
+            # 例外：另一运行中模块同显示名时 hook 无法区分归属，见 _release_owner。
             if ctx is not None:
                 self._release_owner(info, ctx.name)
             info.ctx = info.module = None
@@ -326,6 +326,24 @@ class ModuleManager:
             info.error = str(e)
             report_error(EXTENSION, name, e)
             return False
+        return self._persist_enabled(info) if _persist else True
+
+    def _persist_enabled(self, info):
+        """setup 已成功后写启用标记；保存失败时模块保持完整运行（可禁用），内存标记回滚，重试启用会再次保存。"""
+        name = info.name
+        previous = self._enabled_map.get(name)
+        try:
+            self.set_module_enabled_persist(name, True)
+        except Exception as e:
+            if previous is None:
+                self._enabled_map.pop(name, None)
+            else:
+                self._enabled_map[name] = previous
+            info.error = f'模块已运行，但启用标记保存失败: {e}'
+            report_error(EXTENSION, name, e)
+            return False
+        info.error = None
+        return True
 
     async def disable(self, name, _persist=True):
         """禁用模块"""
@@ -427,6 +445,12 @@ class ModuleManager:
     def _is_module_name(name):
         """仅接受 modules/ 下的单级目录名，拒绝 ./.. 与路径分隔符。"""
         return isinstance(name, str) and bool(name) and not name.startswith('_') and name not in ('.', '..') and not any(c in name for c in ('/', '\\', '\0'))
+
+    def _is_listed(self, name):
+        try:
+            return name in os.listdir(self._dir)
+        except OSError:
+            return False
 
     @staticmethod
     def _find_entry(mod_dir):
