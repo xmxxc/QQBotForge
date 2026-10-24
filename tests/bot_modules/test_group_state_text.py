@@ -1,5 +1,6 @@
 """#62: owner QQ replies name the operation and explain facts in Chinese; groups only get a short status."""
 
+import asyncio
 import json
 import re
 from pathlib import Path
@@ -153,3 +154,141 @@ def test_unknown_fields_stay_unknown_and_recovery_names_the_next_step():
     # The module's own verdict wins over the phase (e.g. an HTTP callback was received).
     assert recovery_line({'ready': False, 'phase': 'processing', 'reason': ''}, 'recovery_required').startswith('恢复基线：未就绪（需重建')
     assert recovery_line({'ready': True}, 'persistence_pending') == '恢复基线：未就绪（处理中，请稍后再查看）'
+
+
+# #87: the page test reads the same cases; real snapshots below are checked against them.
+RECOVERY = json.loads((Path(__file__).with_name('group_state_recovery.json')).read_text(encoding='utf-8'))
+QQ_REBUILD = '请发“群状态 恢复”或在后台重建'
+
+
+def qq_line(case):
+    return RECOVERY[case][1].replace('{rebuild}', QQ_REBUILD)
+
+
+@pytest.mark.parametrize('case', RECOVERY)
+def test_recovery_line_follows_the_shared_cases(case):
+    from modules.group_state.text import recovery_line
+
+    assert recovery_line(RECOVERY[case][0]) == qq_line(case)
+
+
+@pytest.mark.parametrize(
+    'code', ['pending_processing', 'replay_processed', 'unverified_transport', 'dependency_not_ready', 'busy', 'unsubscribed', 'baseline_required']
+)
+def test_framework_recovery_reasons_have_chinese_text(code):
+    from modules.group_state.text import REASONS, reason_text
+
+    assert code in REASONS and reason_text(code) == REASONS[code]
+    assert '_' not in REASONS[code] and '其他原因' not in REASONS[code]
+
+
+def test_unknown_reason_falls_back_and_never_reads_as_ready():
+    from modules.group_state.text import reason_text, recovery_line
+
+    assert reason_text('future_code') == '其他原因（future_code）'
+    # Negative control: an unmapped code still names the next step and is never success.
+    line = recovery_line({'ready': False, 'phase': 'ready', 'reason': 'future_code', 'pause': 'recovery_required'})
+    assert line == f'恢复基线：未就绪（需重建，{QQ_REBUILD}；原因：其他原因（future_code））'
+    # A settled framework reason never explains a pause; only an empty pause is ready.
+    assert '已建立恢复基线' not in recovery_line({'ready': False, 'phase': 'ready', 'reason': 'baseline_established', 'pause': 'recovery_required'})
+    assert recovery_line({'ready': True, 'phase': 'ready', 'reason': 'baseline_established', 'pause': ''}) == '恢复基线：已就绪'
+
+
+def assert_recovery_contract(line):
+    # Stable under any legal framework code: not ready, a named next step, no raw code.
+    assert re.fullmatch(
+        r'恢复基线：未就绪（(处理中，请稍后再查看|正在重建，请稍后再查看|需重建，' + QQ_REBUILD + r')(；原因：[^（）_]+(（[^（）]+）)?)?）', line
+    ), line
+
+
+async def overview_recovery(host):
+    text = await reply(host, '群状态')
+    return text, text.splitlines()[1]
+
+
+async def test_busy_consumer_notification_reads_as_processing_in_qq_and_api(group_host):
+    host, state = group_host, group_host.state
+    await host.event('群状态 刷新 group-a')
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def consumer(change):
+        entered.set()
+        await release.wait()
+
+    subscription = state.subscribe(consumer, timeout=30)
+    refresh = asyncio.create_task(state.refresh('bot-a', 'group-a'))
+    try:
+        await entered.wait()
+        data = (await (await host.api()).json())['data']
+        assert data['recovery'] == RECOVERY['notification_busy'][0]
+        text, line = await overview_recovery(host)
+        assert line == qq_line('notification_busy')
+        assert_recovery_contract(line)
+        # The group fact stays paused while the notification is unconfirmed.
+        assert data['groups'][0]['reliable'] is False and data['groups'][0]['continuity_reason'] == 'recovery_pending'
+        assert 'group-a：暂停使用（恢复基线未完成）' in text and 'group-a：可靠' not in text
+        assert not (await state.fact('bot-a', 'group-a'))['usable']
+    finally:
+        release.set()
+        await refresh
+        subscription.cancel()
+    assert (await overview_recovery(host))[1] == '恢复基线：已就绪'
+
+
+async def test_unfinished_write_reads_as_processing_in_qq_and_api(group_host, monkeypatch):
+    host, state = group_host, group_host.state
+    await host.event('群状态 刷新 group-a')
+    entered, release = asyncio.Event(), asyncio.Event()
+    put = state.store.put
+
+    async def slow_put(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await put(*args, **kwargs)
+
+    monkeypatch.setattr(state.store, 'put', slow_put)
+    refresh = asyncio.create_task(state.refresh('bot-a', 'group-a'))
+    try:
+        await entered.wait()
+        data = (await (await host.api()).json())['data']
+        # recovery.ready keeps its framework meaning; pause carries the write.
+        assert data['recovery'] == RECOVERY['write_pending'][0]
+        text, line = await overview_recovery(host)
+        assert line == qq_line('write_pending')
+        assert 'group-a：处理中（正在保存）' in text and 'group-a：可靠' not in text
+        assert not (await state.fact('bot-a', 'group-a'))['usable']
+    finally:
+        release.set()
+        await refresh
+    assert (await overview_recovery(host))[1] == '恢复基线：已就绪'
+
+
+async def test_rebuild_progress_does_not_outlive_the_rebuild(group_host):
+    host, state = group_host, group_host.state
+    await host.event('群状态 刷新 group-a')
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def hold():
+        entered.set()
+        await release.wait()
+
+    host.sender.after_query = hold
+    rebuild = asyncio.create_task(state.rebuild('bot-a'))
+    try:
+        await entered.wait()
+        data = (await (await host.api()).json())['data']
+        assert data['recovery'] == RECOVERY['rebuilding'][0]
+        text, line = await overview_recovery(host)
+        assert line == qq_line('rebuilding') and 'group-a：可靠' not in text
+        host.sender.response = (None, {'code': '11253'})
+    finally:
+        release.set()
+        host.sender.after_query = None
+        assert await rebuild is False
+    # The framework keeps reason='rebuilding' after a failed rebuild; it reads as history, not progress.
+    data = (await (await host.api()).json())['data']
+    assert data['recovery'] == RECOVERY['rebuild_unfinished'][0]
+    assert (await overview_recovery(host))[1] == qq_line('rebuild_unfinished')
+    host.sender.response = ({'member_role': 'admin', 'recv_msg_setting': 'all', 'allow_proactive_msg': False}, None)
+    assert await reply(host, '群状态 恢复') == '恢复基线重建：已完成，事实恢复可用'
+    assert (await overview_recovery(host))[1] == '恢复基线：已就绪'

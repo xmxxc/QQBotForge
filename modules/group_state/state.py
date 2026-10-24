@@ -239,9 +239,22 @@ class GroupState:
                 'complete': False,
                 'groups': [self._public_group(bot, group) for group in state['groups'].values()],
                 'capabilities': self.capabilities(),
-                'recovery': {'ready': self._ready(bot), 'phase': self.recovery.get_status(bot).phase, 'reason': self.recovery.get_status(bot).reason},
+                'recovery': self._recovery_view(bot),
             }
         )
+
+    def _recovery_view(self, bot):
+        # ready/phase/reason keep their meaning; pause (the module's own verdict, see _pause_reason)
+        # and rebuilding are additive display hints so QQ and page name the same next step.
+        status = self.recovery.get_status(bot)
+        lock = self.rebuild_locks.get(bot)
+        return {
+            'ready': self._ready(bot),
+            'phase': status.phase,
+            'reason': status.reason,
+            'pause': self._pause_reason(bot),
+            'rebuilding': bool(lock and lock.locked()),
+        }
 
     async def observe(self, event):
         native = event.get('d/group_openid')

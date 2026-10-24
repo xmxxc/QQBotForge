@@ -1,0 +1,17 @@
+{
+  "ready": [{"ready": true, "phase": "ready", "reason": "baseline_established", "pause": "", "rebuilding": false}, "恢复基线：已就绪"],
+  "notification_busy": [{"ready": false, "phase": "ready", "reason": "baseline_established", "pause": "recovery_processing", "rebuilding": false}, "恢复基线：未就绪（处理中，请稍后再查看；原因：恢复处理中）"],
+  "write_pending": [{"ready": true, "phase": "ready", "reason": "baseline_established", "pause": "persistence_pending", "rebuilding": false}, "恢复基线：未就绪（处理中，请稍后再查看；原因：正在保存）"],
+  "rebuilding": [{"ready": false, "phase": "needs_baseline", "reason": "rebuilding", "pause": "recovery_required", "rebuilding": true}, "恢复基线：未就绪（正在重建，请稍后再查看）"],
+  "rebuild_unfinished": [{"ready": false, "phase": "needs_baseline", "reason": "rebuilding", "pause": "recovery_required", "rebuilding": false}, "恢复基线：未就绪（需重建，{rebuild}；原因：上次重建未完成）"],
+  "pending_processing": [{"ready": false, "phase": "processing", "reason": "pending_processing", "pause": "recovery_processing", "rebuilding": false}, "恢复基线：未就绪（处理中，请稍后再查看；原因：事件仍在处理）"],
+  "replay_processed_untrusted": [{"ready": false, "phase": "ready", "reason": "replay_processed", "pause": "recovery_required", "rebuilding": false}, "恢复基线：未就绪（需重建，{rebuild}；原因：需重建恢复基线）"],
+  "unverified_transport": [{"ready": false, "phase": "unsupported", "reason": "unverified_transport", "pause": "recovery_required", "rebuilding": false}, "恢复基线：未就绪（需重建，{rebuild}；原因：连接方式无法证明连续性）"],
+  "dependency_not_ready": [{"ready": false, "phase": "dependency_failed", "reason": "dependency_not_ready", "pause": "recovery_required", "rebuilding": false}, "恢复基线：未就绪（需重建，{rebuild}；原因：依赖模块未就绪）"],
+  "busy": [{"ready": false, "phase": "needs_baseline", "reason": "busy", "pause": "recovery_required", "rebuilding": false}, "恢复基线：未就绪（需重建，{rebuild}；原因：上一轮处理未结束，本次未处理）"],
+  "unsubscribed": [{"ready": false, "phase": "closed", "reason": "unsubscribed", "pause": "recovery_required", "rebuilding": false}, "恢复基线：未就绪（需重建，{rebuild}；原因：恢复订阅已取消）"],
+  "baseline_required": [{"ready": false, "phase": "needs_baseline", "reason": "baseline_required", "pause": "recovery_required", "rebuilding": false}, "恢复基线：未就绪（需重建，{rebuild}；原因：需建立恢复基线）"],
+  "future_reason": [{"ready": false, "phase": "needs_baseline", "reason": "future_reason", "pause": "recovery_required", "rebuilding": false}, "恢复基线：未就绪（需重建，{rebuild}；原因：其他原因（future_reason））"],
+  "legacy_processing": [{"ready": false, "phase": "processing", "reason": "unobserved_dispatch"}, "恢复基线：未就绪（处理中，请稍后再查看；原因：有未处理的事件）"],
+  "legacy_ready": [{"ready": true, "phase": "ready", "reason": "baseline_established"}, "恢复基线：已就绪"]
+}

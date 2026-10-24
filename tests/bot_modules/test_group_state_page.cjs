@@ -247,3 +247,29 @@ test('the status line labels the shared cases exactly like the QQ replies', asyn
     cases.forEach(([, expected], index) => assert.ok(status.includes('g' + index + ' ' + expected + '，名册'), expected));
     assert.match(host.nodes['gs-summary'].textContent, /恢复基线：未就绪（处理中，请稍后再查看）/);
 });
+
+// #87: the recovery line follows the same cases as recovery_line in text.py (test_group_state_text.py).
+const RECOVERY = JSON.parse(fs.readFileSync(path.join(__dirname, 'group_state_recovery.json'), 'utf8'));
+
+test('the recovery line names the same next step as the QQ reply', async () => {
+    for (const [name, [recovery, expected]] of Object.entries(RECOVERY)) {
+        const host = await page();
+        await host.reply(host.requests[0], {bot: 'bot-a', recovery, groups: []});
+        assert.equal(host.nodes['gs-summary'].textContent.split('\n')[0], expected.replace('{rebuild}', '请点击“重建恢复基线”'), name);
+    }
+});
+
+test('a busy notification or unfinished write never reads as ready or as a usable group', async () => {
+    const host = await page();
+    // Shapes of real snapshots (see the matching tests in test_group_state_text.py).
+    await host.reply(host.requests[0], {bot: 'bot-a', recovery: RECOVERY.notification_busy[0], groups: [
+        {group: 'g1', reliable: false, status: 'verified', reason: '', continuity_reason: 'recovery_pending', roster: {complete: false, reason: 'recovery_pending'}}]});
+    let text = host.nodes['gs-summary'].textContent;
+    assert.match(text, /^恢复基线：未就绪（处理中，请稍后再查看；原因：恢复处理中）\ng1：暂停使用（恢复基线未完成）/);
+    host.nodes['gs-load'].onclick();
+    await host.reply(host.requests.at(-1), {bot: 'bot-a', recovery: RECOVERY.write_pending[0], groups: [
+        {group: 'g1', reliable: false, status: 'pending', reason: 'persistence_pending', roster: {complete: false, reason: 'persistence_pending'}}]});
+    text = host.nodes['gs-summary'].textContent;
+    assert.match(text, /^恢复基线：未就绪（处理中，请稍后再查看；原因：正在保存）\ng1：处理中（正在保存）/);
+    assert.doesNotMatch(text, /已就绪|可靠/);
+});

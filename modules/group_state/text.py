@@ -68,8 +68,17 @@ REASONS = {
     'error': '事件处理出错',
     'cancelled': '事件处理已取消',
     'unloaded': '模块已卸载',
+    'baseline_required': '需建立恢复基线',
+    'pending_processing': '事件仍在处理',
+    'replay_processed': '补发事件已处理',
+    'unverified_transport': '连接方式无法证明连续性',
+    'dependency_not_ready': '依赖模块未就绪',
+    'busy': '上一轮处理未结束，本次未处理',
+    'unsubscribed': '恢复订阅已取消',
 }
 PROGRESS = {'refreshing', 'bot_state_refreshing', 'roster_refreshing', 'verifying', 'confirming', 'persistence_pending', 'recovery_processing', 'rebuilding'}
+# Framework reasons for a settled baseline; they never explain a pause.
+SETTLED = {'baseline_established', 'replay_processed'}
 UNKNOWN = {'', 'not_verified', 'unknown_group', 'response_unknown', 'unsupported'}
 ROLES = {'owner': '群主', 'admin': '管理员', 'member': '成员'}
 TITLES = {
@@ -116,13 +125,31 @@ def paused(fact):
     return '；恢复基线未完成，暂不可用' if fact.get('continuity_reason') == 'recovery_pending' and fact.get('reason') else ''
 
 
+def recovery_reason(recovery, pause):
+    """The framework's recorded reason, unless it contradicts the current next step."""
+    reason = recovery.get('reason') or ''
+    if reason == 'rebuilding' and not recovery.get('rebuilding'):
+        # The framework keeps the rebuild marker after a rebuild that did not establish a baseline.
+        return '上次重建未完成'
+    if reason in SETTLED:
+        # A settled framework reason never explains a pause; name the module's own one instead.
+        return reason_text(pause)
+    return reason_text(reason)
+
+
 def recovery_line(recovery, pause=''):
-    """Processing only needs a later retry; everything else needs a rebuild. `pause` is the module's own verdict when known."""
+    """Processing only needs a later retry; everything else needs a rebuild.
+
+    The module's own verdict (`recovery['pause']`, or `pause` from older snapshots) wins over the phase.
+    """
+    pause = recovery.get('pause', pause)
+    if recovery.get('rebuilding') is True:
+        return '恢复基线：未就绪（正在重建，请稍后再查看）'
     if recovery.get('ready') is True and not pause:
         return '恢复基线：已就绪'
     processing = pause in {'recovery_processing', 'persistence_pending'} if pause else recovery.get('phase') in {'processing', 'recovering'}
     state = '处理中，请稍后再查看' if processing else '需重建，请发“群状态 恢复”或在后台重建'
-    reason = reason_text(recovery.get('reason'))
+    reason = recovery_reason(recovery, pause)
     return f'恢复基线：未就绪（{state}' + (f'；原因：{reason}' if reason else '') + '）'
 
 
