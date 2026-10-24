@@ -1,10 +1,10 @@
 services:
-  elainabot:
+  qqbotforge:
     build:
       context: ..
       dockerfile: .ci/Dockerfile
-    image: elainabot/elainabot:local
-    container_name: elainabot_v2
+    image: qqbotforge:local
+    container_name: qqbotforge
     restart: unless-stopped
     ports:
       - "5200:5200"

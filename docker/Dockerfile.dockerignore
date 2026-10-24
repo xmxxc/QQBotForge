@@ -1,4 +1,4 @@
-# ElainaBot Docker 部署 - 忽略不需要打包进镜像的文件
+# QQBotForge Docker 部署 - 忽略不需要打包进镜像的文件
 
 # Python 缓存
 __pycache__/
