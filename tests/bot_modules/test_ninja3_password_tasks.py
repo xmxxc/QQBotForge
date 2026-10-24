@@ -893,3 +893,43 @@ async def test_held_result_background_flush_or_process_exit(changing, monkeypatc
     assert (result['state'], result['remote']) == ('paused', 'unknown')
     assert restarted.is_paused('bot-a', host.account['id']) and host.center.changes == 1
     assert (await restarted.store.get('bot-a', 'accounts', host.account['id']))['password'] == OLD
+
+
+async def test_settling_held_result_blocks_retry_release_and_recover(changing, monkeypatch):
+    host = changing
+    module = sys.modules[type(host.tasks).__module__]
+    monkeypatch.setattr(module, 'RESULT_WRITE_RETRIES', (0,))
+    monkeypatch.setattr(module, 'HELD_RESULT_RETRIES', (3600,))
+    real = host.tasks._mutate
+    locked = True
+
+    async def flaky(bot, key, **changes):
+        if locked and changes.get('runner'):
+            raise sqlite3.OperationalError('database is locked')
+        return await real(bot, key, **changes)
+
+    monkeypatch.setattr(host.tasks, '_mutate', flaky)
+    host.center.change_result = httpx.Response(200, json={'code': 1300})
+    task = await host.select()
+    await host.action(task)
+    await host.finished()
+    settle, entered, proceed = host.tasks._settle, asyncio.Event(), asyncio.Event()
+
+    async def slow_settle(*args):
+        entered.set()
+        await proceed.wait()
+        await settle(*args)
+
+    monkeypatch.setattr(host.tasks, '_settle', slow_settle)
+    locked = False
+    flushing = asyncio.create_task(host.action(task, 'recover'))
+    await entered.wait()
+    # The rejection is written but its receipt is pending: no new attempt or second settle may start.
+    assert (await raw_task(host, task))['remote'] == 'rejected'
+    for action in ('retry', 'release', 'recover'):
+        assert (await host.action(task, action))[0] == 422
+    proceed.set()
+    assert (await flushing)[0] == 200
+    assert (await host.action(task, 'retry'))[0] == 200
+    await host.finished()
+    assert host.center.changes == 2

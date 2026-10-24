@@ -111,6 +111,8 @@ class PasswordTasks:
         # Decided outcomes whose durable write failed; keyed by task, bound to the executor token.
         self.held: dict[tuple[str, str], tuple[str, Record]] = {}
         self.flushers: dict[tuple[str, str], asyncio.Task[None]] = {}
+        # Held outcomes being written and settled; like workers, they block retry/release/recover.
+        self.flushing: set[tuple[str, str]] = set()
         self.closed = False
 
     @staticmethod
@@ -458,16 +460,21 @@ class PasswordTasks:
         if held is None:
             return False
         runner, changes = held
+        self.flushing.add((bot, key))
         try:
-            await self._mutate(bot, key, runner=runner, **changes)
-        except SupersededError:
-            log.error('改密任务保留结果已被新的任务状态取代，未写入: %s', key)
-            return False
-        except BaseException:
-            self.held.setdefault((bot, key), held)
-            raise
-        await self._settle(bot, key)
-        return True
+            try:
+                await self._mutate(bot, key, runner=runner, **changes)
+            except SupersededError:
+                log.error('改密任务保留结果已被新的任务状态取代，未写入: %s', key)
+                return False
+            except BaseException:
+                # Not written (storage error or cancellation): hold it again unless re-held meanwhile.
+                self.held.setdefault((bot, key), held)
+                raise
+            await self._settle(bot, key)
+            return True
+        finally:
+            self.flushing.discard((bot, key))
 
     async def _commit_local(self, bot: str, key: str) -> None:
         def commit(conn: sqlite3.Connection) -> None:
@@ -493,6 +500,8 @@ class PasswordTasks:
         await self.store.atomic(commit)
 
     async def recover(self, bot: str, key: str) -> Record:
+        if (bot, key) in self.flushing:
+            raise TaskError('已确定结果正在写入，请稍后再恢复')
         try:
             if await self._flush(bot, key):
                 return await self.get(bot, key)
@@ -541,7 +550,8 @@ class PasswordTasks:
 
     def _settled(self, conn: sqlite3.Connection, bot: str, key: str) -> Record:
         task = self._read(conn, bot, key)
-        if (bot, key) in self.workers or (bot, key) in self.held or task['state'] != 'paused' or not task['active']:
+        busy = (bot, key) in self.workers or (bot, key) in self.held or (bot, key) in self.flushing
+        if busy or task['state'] != 'paused' or not task['active']:
             raise TaskError('任务尚未结束或已解决')
         if task['remote'] not in UNCHANGED_REMOTE:
             raise TaskError('仅尚未提交或远端明确拒绝的任务可以重试或放弃；未知结果保持暂停')
