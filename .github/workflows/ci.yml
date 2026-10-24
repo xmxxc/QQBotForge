@@ -10,14 +10,12 @@ permissions:
   contents: read
 
 env:
-  # Pinned test assets (ci-assets branch of this fork, same commit as
-  # ElainaCore/ElainaBot_v2 ci-assets). Bump the SHA to take new assets.
+  # Pinned test assets (ci-assets branch of this repository). Bump the SHA
+  # to take new assets.
   CI_ASSETS_REPOSITORY: xmxxc/QQBotForge
   CI_ASSETS_SHA: 04d901726cc6d94bae1b2b5524521f997a326e10
 
 jobs:
-  # Inlined from ElainaCore/ElainaBot_v2 .github/workflows/ci.yml@ci-assets
-  # (04d901726cc6d94bae1b2b5524521f997a326e10); the asset staging differs.
   check:
     runs-on: ubuntu-latest
     steps:
