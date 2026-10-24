@@ -205,16 +205,24 @@ class ModuleManager:
         log.info(f'发现 {len(self._modules)} 个模块: {", ".join(f"{n}@{m.version}" for n, m in self._modules.items())}')
 
     def discover_module(self, name):
-        """发现或刷新单个未运行模块，供安装后立即启用。"""
-        if not name or name.startswith('_'):
-            return None
-        mod_dir = os.path.join(self._dir, name)
-        if not os.path.isdir(mod_dir) or not self._find_entry(mod_dir):
-            return None
+        """发现或刷新单个未运行模块；运行中模块原样返回，目录失效时丢弃未运行的旧记录。
 
+        运行期请通过 enable/refresh_and_enable 调用，它们在锁内刷新，避免替换正在启用的记录。
+        """
+        if not self._is_module_name(name):
+            return None
         current = self._modules.get(name)
         if current and current.instance is not None:
             return current
+
+        mod_dir = os.path.join(self._dir, name)
+        # 按平台路径语义只接受单级组件（Windows 的 C:x、C: 带盘符），再要求名称是目录中的真实条目，
+        # 挡住大小写、末尾点号等指向同一目录的别名；symlink 条目照常可用。
+        if os.path.splitdrive(name)[0] or os.path.basename(name) != name or os.path.dirname(mod_dir) != self._dir:
+            return None
+        if not self._is_listed(name) or not os.path.isdir(mod_dir) or not self._find_entry(mod_dir):
+            self._modules.pop(name, None)
+            return None
 
         info = ModuleInfo(name, mod_dir)
         meta = self._read_manifest(mod_dir)
@@ -277,60 +285,98 @@ class ModuleManager:
     # ==================== 启用/禁用 ====================
 
     async def enable(self, name, _skip_deps=False, _persist=True):
-        """启用模块"""
+        """启用模块；未运行模块先按当前磁盘内容刷新，已运行模块不重载。"""
         async with self._lock:
-            info = self._modules.get(name)
-            if not info:
-                log.warning(f'模块不存在: {name}')
-                return False
-            if info.instance is not None:
-                return True
+            return await self._enable_locked(name, _skip_deps, _persist)
+
+    async def _enable_locked(self, name, _skip_deps, _persist):
+        info = self.discover_module(name)
+        if not info:
+            log.warning(f'模块不存在: {name!r}')
+            return False
+        if info.instance is not None:
+            if _persist and not self.is_module_enabled_persist(name):
+                return self._persist_enabled(info)
+            return True
+        ctx = None
+        try:
+            if not _skip_deps:
+                await _install_deps(name, info.module_dir, skip_if_met=True, no_cache=True)
+            ctx = ModuleContext(info.display_name or name, info.module_dir, self._hook_manager)
+            info.ctx = ctx
+            module = self._import_module(name, info.module_dir)
+            info.module = module
+            setup_fn = getattr(module, 'setup', None)
             try:
-                if not _skip_deps:
-                    await _install_deps(name, info.module_dir, skip_if_met=True, no_cache=True)
-                ctx = ModuleContext(info.display_name or name, info.module_dir, self._hook_manager)
-                info.ctx = ctx
-                module = self._import_module(name, info.module_dir)
-                info.module = module
-                setup_fn = getattr(module, 'setup', None)
-                try:
-                    result = await _await_if_coro(setup_fn(ctx)) if setup_fn else None
-                except BaseException:
-                    ctx._close_subscriptions()
-                    raise
-                info.instance = result if result is not None else True
-                info.error = None
-                if _persist:
-                    self.set_module_enabled_persist(name, True)
-                return True
-            except Exception as e:
-                info.error = str(e)
-                report_error(EXTENSION, name, e)
-                return False
+                result = await _await_if_coro(setup_fn(ctx)) if setup_fn else None
+            except BaseException:
+                ctx._close_subscriptions()
+                raise
+            info.instance = result if result is not None else True
+            info.error = None
+        except BaseException as e:
+            # 失败或被取消的 setup 注销本次 hook、移出半初始化模块，避免重试叠加回调；
+            # 例外：另一运行中模块同显示名时 hook 无法区分归属，见 _release_owner。
+            if ctx is not None:
+                self._release_owner(info, ctx.name)
+            info.ctx = info.module = None
+            sys.modules.pop(f'modules.{name}', None)
+            if not isinstance(e, Exception):
+                raise
+            info.error = str(e)
+            report_error(EXTENSION, name, e)
+            return False
+        return self._persist_enabled(info) if _persist else True
+
+    def _persist_enabled(self, info):
+        """setup 已成功后写启用标记；保存失败时模块保持完整运行（可禁用），内存标记回滚，重试启用会再次保存。"""
+        name = info.name
+        previous = self._enabled_map.get(name)
+        try:
+            self.set_module_enabled_persist(name, True)
+        except Exception as e:
+            if previous is None:
+                self._enabled_map.pop(name, None)
+            else:
+                self._enabled_map[name] = previous
+            info.error = f'模块已运行，但启用标记保存失败: {e}'
+            report_error(EXTENSION, name, e)
+            return False
+        info.error = None
+        return True
 
     async def disable(self, name, _persist=True):
         """禁用模块"""
         async with self._lock:
-            info = self._modules.get(name)
-            is_running = info and info.instance is not None
-            if not is_running:
-                if _persist:
-                    self.set_module_enabled_persist(name, False)
-                return False
-            info.ctx._close_subscriptions()
-            try:
-                teardown_fn = getattr(info.module, 'teardown', None)
-                if teardown_fn:
-                    await _await_if_coro(teardown_fn())
-            except Exception as e:
-                report_error(EXTENSION, name, e)
-            self._hook_manager.unregister_owner(info.display_name or name)
-            info.instance = info.ctx = None
-            sys.modules.pop(f'modules.{name}', None)
+            return await self._disable_locked(name, _persist)
+
+    async def _disable_locked(self, name, _persist):
+        info = self._modules.get(name)
+        is_running = info and info.instance is not None
+        if not is_running:
             if _persist:
                 self.set_module_enabled_persist(name, False)
-                log.info(f'模块 [{info.display_name or name}] 已禁用')
-            return True
+            return False
+        info.ctx._close_subscriptions()
+        try:
+            teardown_fn = getattr(info.module, 'teardown', None)
+            if teardown_fn:
+                await _await_if_coro(teardown_fn())
+        except Exception as e:
+            report_error(EXTENSION, name, e)
+        self._hook_manager.unregister_owner(info.display_name or name)
+        info.instance = info.ctx = None
+        sys.modules.pop(f'modules.{name}', None)
+        if _persist:
+            self.set_module_enabled_persist(name, False)
+            log.info(f'模块 [{info.display_name or name}] 已禁用')
+        return True
+
+    def _release_owner(self, info, owner):
+        """注销失败启用遗留的 hook；同名 owner 仍有运行中模块时保留，避免误删其回调。"""
+        if any(i is not info and i.instance is not None and (i.display_name or i.name) == owner for i in self._modules.values()):
+            return
+        self._hook_manager.unregister_owner(owner)
 
     async def reload(self, name):
         """重载模块 (teardown → 重新 import + setup), 不改变持久化状态"""
@@ -344,14 +390,15 @@ class ModuleManager:
 
     async def refresh_and_enable(self, name):
         """刷新已安装模块并启用，统一市场安装和更新的生命周期。"""
-        if self.is_enabled(name):
-            await self.disable(name, _persist=False)
-        if self.discover_module(name) is None:
-            return False
+        async with self._lock:
+            if self.is_enabled(name):
+                await self._disable_locked(name, _persist=False)
+            if self.discover_module(name) is None:
+                return False
 
-        # 启动失败时仍保留启用意图，环境修复后可在下次启动重试。
-        self.set_module_enabled_persist(name, True)
-        return await self.enable(name, _persist=False)
+            # 启动失败时仍保留启用意图，环境修复后可在下次启动重试。
+            self.set_module_enabled_persist(name, True)
+            return await self._enable_locked(name, False, _persist=False)
 
     # ==================== 查询 ====================
 
@@ -393,6 +440,17 @@ class ModuleManager:
         ]
 
     # ==================== 内部 ====================
+
+    @staticmethod
+    def _is_module_name(name):
+        """仅接受 modules/ 下的单级目录名，拒绝 ./.. 与路径分隔符。"""
+        return isinstance(name, str) and bool(name) and not name.startswith('_') and name not in ('.', '..') and not any(c in name for c in ('/', '\\', '\0'))
+
+    def _is_listed(self, name):
+        try:
+            return name in os.listdir(self._dir)
+        except OSError:
+            return False
 
     @staticmethod
     def _find_entry(mod_dir):
