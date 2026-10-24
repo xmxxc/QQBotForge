@@ -790,6 +790,24 @@ await event.recall(message_id='平台消息 ID')
 
 平台响应中的常用字段为 `data['id']` 和 `data['ext_info']['ref_idx']`。
 
+#### 发送前检查 `send_check`
+
+敏感内容（账号、密码、受限目录等）在等待期间可能已失效。`reply()`、`send_to_group()`、`send_to_user()`、`send_to_channel()` 和 `sender.post_json()` 接受 `send_check=<同步函数>`：
+
+~~~python
+data = await event.reply(credentials, send_check=lambda: still_allowed(event))
+if isinstance(data, dict) and data.get('send_check') == 'blocked':
+    # 未发出敏感内容; attempted 为 True 时此前已进入过一次业务请求, 结果未知
+    await event.reply('授权已变化，请重新查询')  # 通知不带检查
+~~~
+
+- 执行位置：`before_send` 全部钩子、HTTP 客户端准备、token 锁等待与刷新都完成后，紧挨每次消息业务 HTTP 请求之前执行；两者之间没有 `await`。取 token 的请求不算消息发送。
+- 绑定方式：检查只作为调用参数传递，不进入 `before_send` 数据、平台载荷或日志，钩子复制、移除 `event` 或改写数据不会丢失检查；嵌套发送、其他并发请求和其他 Bot 不继承它。
+- 失败关闭：返回假值、抛出异常、不可调用或返回可等待对象（异步函数）都会拦截。日志只记录异常类型，不记录异常内容。
+- 拦截结果：`reply()` 返回、`send_to_*()` / `post_json()` 的 `data` 为 `{'code': -1, 'message': ..., 'send_check': 'blocked', 'attempted': bool}`。`code` 为 `-1`（与网络异常相同，结果未知），不是平台明确拒绝，不应据此改发其他内容。拦截时不触发 `send_failed`、`after_send`、`api_error` 模板，也不写入错误日志。
+- 重试：token 失效重试和网络重试前都会再次检查；此时拦截返回 `attempted=True`，表示此前的请求已发出、结果未知。请求进入 HTTP 客户端后无法撤回。
+- 未传 `send_check` 时行为不变。媒体、Ark、卡片和流式消息暂不支持该参数，传入会抛出 `TypeError`。覆写了 `post_json(endpoint, payload)` 的旧子类只在传入检查时抛出 `TypeError`，不会发送。
+
 ### 5.8 订阅消息
 
 订阅按钮必须附加在 Markdown 消息上，并使用真实有效的模板 ID：

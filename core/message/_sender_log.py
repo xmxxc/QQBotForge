@@ -5,7 +5,7 @@ import contextvars
 import json
 
 from core.base.logger import FRAMEWORK, report_error_raw
-from core.message._http import _IGNORE_ERROR_CODES, MSG_TYPE_MEDIA, _is_rate_limited, _is_violation
+from core.message._http import _IGNORE_ERROR_CODES, MSG_TYPE_MEDIA, _is_rate_limited, _is_send_check_blocked, _is_violation
 from core.message.response import extract_message_id, extract_reference_id
 from core.message.template import tpl
 from core.module.hook import get_hook_manager as _get_hooks
@@ -131,7 +131,7 @@ class _SenderLogMixin:
                     },
                 )
 
-    async def _send_with_error_handling(self, endpoint, payload, event, content=None, *, media_label=''):
+    async def _send_with_error_handling(self, endpoint, payload, event, content=None, *, media_label='', send_check=None):
         # before_send hook (管道模式, 可修改/拦截)
         hooks = _get_hooks()
         if hooks.has('before_send'):
@@ -148,8 +148,10 @@ class _SenderLogMixin:
             payload = hook_data.get('payload', payload)
             content = hook_data.get('content', content)
 
-        success, data = await self.post_json(endpoint, payload)
+        success, data = await self._post_message(endpoint, payload, send_check)
         if not success:
+            if _is_send_check_blocked(data):
+                return False, data  # 调用方检查拦截: 不补救/不回发模板/不记录载荷
             code = data.get('code') if isinstance(data, dict) else None
             if code in _IGNORE_ERROR_CODES:
                 return False, None
