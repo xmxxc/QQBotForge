@@ -472,3 +472,27 @@ async def test_disable_and_reload_unchanged(api_client, auth_cookies, env):
     status, data = await toggle(api_client, auth_cookies, 'probe58_unknown', 'disable')
     assert data['success'] is True
     assert env.persisted()['probe58_unknown'] is False
+
+
+async def test_cancelled_setup_leaves_no_hooks_and_retry_is_clean(api_client, auth_cookies, env):
+    mm = await start(env)
+    env.write_module('probe58_cancel', delay=30)
+
+    task = asyncio.create_task(mm.enable('probe58_cancel'))
+    for _ in range(100):
+        if env.owners():
+            break
+        await asyncio.sleep(0.01)
+    assert env.owners() == ['probe58_cancel-display']
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert env.owners() == []
+    assert not mm.is_enabled('probe58_cancel')
+    assert 'modules.probe58_cancel' not in sys.modules
+    assert env.persisted() == {}
+
+    env.write_module('probe58_cancel')
+    status, data = await toggle(api_client, auth_cookies, 'probe58_cancel')
+    assert data['success'] is True, data
+    assert env.owners() == ['probe58_cancel-display']

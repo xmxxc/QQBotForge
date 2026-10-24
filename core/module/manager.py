@@ -216,6 +216,8 @@ class ModuleManager:
             return current
 
         mod_dir = os.path.join(self._dir, name)
+        if os.path.dirname(mod_dir) != self._dir:  # 如 Windows 盘符相对路径
+            return None
         if not os.path.isdir(mod_dir) or not self._find_entry(mod_dir):
             self._modules.pop(name, None)
             return None
@@ -313,12 +315,14 @@ class ModuleManager:
             if _persist:
                 self.set_module_enabled_persist(name, True)
             return True
-        except Exception as e:
-            # 失败的 setup 不能留下已注册的 hook 或半初始化模块，否则重试会叠加回调。
+        except BaseException as e:
+            # 失败或被取消的 setup 不能留下已注册的 hook 或半初始化模块，否则重试会叠加回调。
             if ctx is not None:
                 self._release_owner(info, ctx.name)
             info.ctx = info.module = None
             sys.modules.pop(f'modules.{name}', None)
+            if not isinstance(e, Exception):
+                raise
             info.error = str(e)
             report_error(EXTENSION, name, e)
             return False
