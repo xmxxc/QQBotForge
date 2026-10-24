@@ -95,7 +95,7 @@ async def handle_module_toggle(request: web.Request):
     body = await request.json()
     name = body.get('name', '')
     action = body.get('action', '')
-    if not name or action not in ('enable', 'disable'):
+    if not name or not isinstance(name, str) or action not in ('enable', 'disable'):
         return web.json_response({'success': False, 'message': '参数错误'}, status=400)
     if not bot_manager():
         return web.json_response({'success': False, 'message': '框架未启动'}, status=503)
@@ -104,18 +104,24 @@ async def handle_module_toggle(request: web.Request):
         return web.json_response({'success': False, 'message': '模块管理器未初始化'}, status=503)
     try:
         if action == 'enable':
-            ok = await mm.enable(name)
-        else:
-            ok = await mm.disable(name)
-            if not ok:
-                mm.set_module_enabled_persist(name, False)
-                return web.json_response({'success': True, 'message': f'模块 {name} 已关闭'})
-        if ok:
-            verb = '开启' if action == 'enable' else '关闭'
-            return web.json_response({'success': True, 'message': f'模块 {name} 已{verb}'})
-        return web.json_response({'success': False, 'message': '操作失败'})
+            # enable 在管理器锁内按当前磁盘刷新未运行模块，运行中新增的目录也能直接启用
+            if await mm.enable(name):
+                return web.json_response({'success': True, 'message': f'模块 {name} 已开启'})
+            return web.json_response({'success': False, 'message': _enable_failure(mm, name)})
+        if not await mm.disable(name):
+            mm.set_module_enabled_persist(name, False)
+        return web.json_response({'success': True, 'message': f'模块 {name} 已关闭'})
     except Exception as e:
         return web.json_response({'success': False, 'message': str(e)}, status=500)
+
+
+def _enable_failure(mm, name):
+    status = next((m for m in mm.list_modules() if m['name'] == name), None)
+    if status is None:
+        return f'模块不存在: {name}'
+    if status.get('error'):
+        return f'模块 {name} 启用失败: {status["error"]}'
+    return '操作失败'
 
 
 async def _stop_module_runtime(name):
