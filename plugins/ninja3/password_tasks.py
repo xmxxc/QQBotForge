@@ -601,6 +601,8 @@ class PasswordTasks:
             task = self._read(conn, bot, key)
             if task.get('runner') != runner:
                 return False
+            if task['notification'] == 'sent':
+                return True  # a concurrent receipt for this attempt already delivered; never downgrade
             task['notification'] = status
             self._save(conn, bot, task)
             return True

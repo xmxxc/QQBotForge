@@ -30,6 +30,7 @@
 ## 增量复核 F3 修复
 
 依据 `/tmp/qqbot-round-next/75-fix-cross-process-receipt.md`，修复独立增量复核（issue 评论 6381772426）的 F3/P2：本进程保留结果写入后等待旧回执时，另一进程合法重试，旧回执把 sent 写到新尝试，新尝试成功回执被跳过。修法：回执与 notification 记录按写结果时的 runner 条件化（见接线说明“回执按尝试绑定”），选择允许新尝试并隔离旧回执，而非跨进程串行等待。真实后台入口、真实子进程与第二连接、原协议假HTTP覆盖旧 sent／failed／异常 × 新尝试成功／拒绝，核对实际通知内容与次数、当前 runner／notification 及每次尝试一次远端提交；另测通知取消记 unknown 并释放管理、同一尝试重复回执只发一次、旧尝试迟到回执不发。
+- 审查 F3 原探针 `test_cross_process_retry_during_old_held_rejection_receipt` 原样重跑：f6859e7 失败（新尝试 notification 被写为 sent）；修复后其核心断言成立（新尝试保持 not_attempted，实际通知依次为旧 rejected、新 reported_success），但探针另断言他进程重试被拒绝（`answer=={'refused':True}`），对应“串行等待旧回执”方案；本修复选“允许新尝试并隔离旧回执”（两者均为本轮允许方案），故该断言按设计仍失败，需总控认可。
 
 ## 检查与审查记录
 

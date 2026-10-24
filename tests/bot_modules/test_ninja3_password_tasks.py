@@ -1034,6 +1034,8 @@ async def test_receipt_is_sent_once_per_attempt(changing, monkeypatch):
     old_runner = (await raw_task(host, task))['runner']
     await host.tasks._receipt('bot-a', task['id'], old_runner)  # repeated receipt for the same attempt
     assert len(notices) == 1
+    await host.tasks._record_notice('bot-a', task['id'], old_runner, 'unknown')  # a late cancelled receipt
+    assert (await task_info(host, task))['notification'] == 'sent'
     host.center.change_result = httpx.Response(200, json={'code': 100})
     assert (await host.action(task, 'retry'))[0] == 200
     await host.finished()
