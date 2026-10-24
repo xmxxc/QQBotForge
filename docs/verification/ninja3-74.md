@@ -54,3 +54,17 @@
 - 没有浏览器视觉核查（本票无页面变更），没有真实 QQ／游戏平台／Bot 订阅许可核查，没有运行 #70 `--check`，没有读取生产配置、数据或凭据。
 - 网络发送与撤权不是原子事务；插件保证最终同步门后立即进入发送调用，底层网络既有同载荷重试行为未改变。
 - 继承 fixture 假日志服务缺少方法产生的后台 AttributeError 仍可出现，不影响确切消息断言；没有以此声称修复框架日志。
+
+## 审查 F1/F2 修复（2026-10-24，作者自查，待原 #74 审查者复核）
+
+来源：独立审查 https://github.com/xmxxc/QQBotForge/issues/74#issuecomment-6368689971 （F1 P1 真实发送准备之后缺少最终复查；F2 P2 目录解码完整凭据）。审查原探针 `tests/bot_modules/test_independent74.py` 未改动，只在运行副本中加入执行。
+
+- **分层**：基础候选 `fix/72-send-boundary-base`（父 #72 `129df14`）闭环旧文字查询；本分支 merge 该候选（同时带入 #72 已独立复核的页面 F1 修复），再把菜单、目录分页、共享选择、明确拒绝后的纯文字降级与管理提示接入同一门。
+- **F1**：`offer()` 的按钮发送与降级发送、选择后的凭据发送、管理动作提示都经 `reply(..., gate=...)`；`current()`／`menu_current()` 在插件最后一次 await 后检查一次，并作为本实例最后一个 `before_send` 回调在框架准备之后、首次 `post_json` 之前再检查一次。变化时拦截并改发“账号或授权刚刚变化”；只有明确拒绝才降级，降级同样两次检查；未知结果不重发。
+- **F2**：目录（含分页）只读 SQLite JSON 投影 `id/name/enabled/open_groups`；按引用或名称选中后，查看决定通过才读取该账号完整记录。
+- **原测试适配**：`test_list_final_gate_after_titles_loaded` 原来通过包装 `store.all` 注入变化，目录现改读 `store.project`，只把包装点移到 `project`，断言不变。
+- **红绿**（真实 MessageSender／HookManager，仅替换平台 `post_json`；另一个 `before_send` 准备等待期间注入变化）：
+  - 审查原探针：`0ae3b29` 4 failed／3 passed（3 项时效 + 目录读取红）；本分支 7 passed。
+  - 新增 `test_ninja3_send_gate.py` + `test_ninja3_menus_send_gate.py` 放到 `0ae3b29`：55 failed／6 passed，通过的 6 项恰为无变化对照；本分支全部通过。覆盖文字查询、目录、按钮选择、文字编号选择、翻页、明确拒绝后降级、主人管理提示；变化为改密、停用、关群、授权管理收窄、撤权、拒绝、离群、授权模块重载、插件重载（旧实例）、菜单到期。
+  - 变异：门回调直接放行 → 56 failed；“门须为最后一项”检查恒真 → 门顺序用例失败。
+- **框架缺口（未修复）**：`_request` 在管道之后、首个请求之前仍可能 await 令牌刷新；反例与最小接口建议见 `docs/verification/ninja3-72.md` 同名小节与交付证据。#75 暂停、#78 紧急状态接入 `current()` 时必须保持同步。
