@@ -10,10 +10,13 @@ Group replies are public; the plugin never claims a complete roster.
 
 import asyncio
 import contextlib
+import contextvars
 import json
+import math
 import re
 import sqlite3
 import time
+from typing import Any
 from uuid import uuid4
 
 from aiohttp import web
@@ -56,6 +59,12 @@ REASONS = {
     'state_changed': '检查期间状态变化',
 }
 CHANGED = '账号或授权刚刚变化，请重新发送查询'
+GATE_UNAVAILABLE = '账号查询暂不可用，请联系主人'
+# Directory rows: SQLite projects these fields, so login/password never reach the plugin.
+DIRECTORY = ('id', 'name', 'enabled', 'open_groups')
+# The send gate must be the last before_send callback: after every other preparation.
+GATE_PRIORITY = math.inf
+_pending: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar('ninja3_send_gate', default=None)
 
 
 def unknown_code(code):
@@ -81,12 +90,15 @@ def text(value, label, *, required=False):
 
 
 class Ninja3:
-    def __init__(self, path, *, access_provider=None, sender_provider=None, clock=time.time):
+    def __init__(self, path, *, access_provider=None, sender_provider=None, hooks_provider=None, clock=time.time):
         self.store = ExtensionStore(path)
         self.lock = asyncio.Lock()
         self.active = True
         self.access_provider = access_provider or self._access_module
         self.sender_provider = sender_provider or self._bot_sender
+        self.hooks_provider = hooks_provider or self._hook_manager
+        self.hooks: Any = None  # the HookManager the send gate is registered on
+        self.hook_owner = f'{OWNER}:{uuid4().hex}'
         self.clock = clock
         self.revisions = {}
         self.writes = {}
@@ -108,11 +120,23 @@ class Ninja3:
         instance = app.get_bot(bot) if app else None
         return instance.sender if instance else None
 
+    @staticmethod
+    def _hook_manager():
+        from core.application import get_app
+
+        app = get_app()
+        return app.hook_manager if app else None
+
     async def initialize(self):
         await self.store.ready()
+        self.hooks = self.hooks_provider()
+        if self.hooks is not None:
+            self.hooks.register('before_send', self.before_send, owner=self.hook_owner, priority=GATE_PRIORITY)
 
     def close(self):
         self.active = False
+        if self.hooks is not None:
+            self.hooks.unregister_owner(self.hook_owner)
         self.store.close()
 
     def access(self):
@@ -309,12 +333,63 @@ class Ninja3:
             return 'sent'
         return 'unknown' if unknown_code(code) else 'failed'
 
-    async def reply(self, event, content, **kwargs):
+    async def reply(self, event, content, *, gate=None, **kwargs):
+        """``gate`` is a synchronous freshness check for sensitive content.
+
+        It runs here and again in this instance's ``before_send`` callback, which must be
+        the last one: Sender's asynchronous preparation (other hooks) has then finished and
+        the transport call follows. Stale content is blocked before any transport attempt
+        and replaced by a notice without it; an attempted send is never repeated.
+        """
         sender = self.sender_provider(event.appid)
+        if sender is None:
+            return 'unavailable'
+        if gate is None:
+            return await self._send(sender, event, content, **kwargs)
+        if not self.gate_installed():
+            log.error(f'[{event.appid}] 发送前最终检查未就绪，拒绝发送敏感内容')
+            await self.reply(event, GATE_UNAVAILABLE)
+            return 'unguarded'
+        pending = {'event': event, 'check': gate, 'blocked': False}
+        token = _pending.set(pending)
         try:
-            return self.outcome(await sender.reply(event, content, **kwargs)) if sender else 'unavailable'
+            state = await self._send(sender, event, content, **kwargs) if self.fresh(pending) else 'stale'
+        finally:
+            _pending.reset(token)
+        if state != 'sent' and pending['blocked']:
+            await self.reply(event, CHANGED)
+            return 'stale'
+        return state
+
+    async def _send(self, sender, event, content, **kwargs):
+        try:
+            return self.outcome(await sender.reply(event, content, **kwargs))
         except Exception:  # noqa: BLE001 - transport failures leave the result unknown
             return 'unknown'
+
+    def gate_installed(self):
+        hooks = self.hooks_provider()
+        entries = hooks.list_hooks().get('before_send', []) if hooks is not None and hooks is self.hooks else []
+        # Sender's pipeline iterates the list it sorts synchronously on entry, so a hook
+        # registered later during this send cannot run after the gate.
+        return bool(entries) and entries[-1]['owner'] == self.hook_owner
+
+    @staticmethod
+    def fresh(pending):
+        try:
+            current = bool(pending['check']())
+        except Exception:  # noqa: BLE001 - a failing check is stale, never a pass
+            current = False
+        pending['blocked'] = pending['blocked'] or not current
+        return current
+
+    async def before_send(self, packet):
+        # Every send of this event inside a gated reply is checked (fail closed); a
+        # raising callback would be skipped by the pipeline, so ``fresh`` never raises.
+        pending = _pending.get()
+        if pending is None or packet.get('event') is not pending['event']:
+            return packet
+        return packet if self.fresh(pending) else None
 
     @staticmethod
     def credentials(account):
@@ -428,8 +503,8 @@ class Ninja3:
                 await self.refuse(event, invoke, 'list' if name is None and resource is None else 'query')
                 return
             decisions = [invoke]
-            # Account rows (with credentials) are read only for a currently granted caller.
-            accounts = [a for a in await self.store.all(bot, 'accounts') if a['enabled'] and group in a['open_groups']]
+            # Directory metadata only; credentials are read for one selected, allowed account.
+            accounts = [a for a in await self.store.project(bot, 'accounts', DIRECTORY) if a['enabled'] and group in (a['open_groups'] or [])]
             if name is None and resource is None:
                 available = []
                 for account in accounts:
@@ -465,26 +540,31 @@ class Ninja3:
                 await self.refuse(event, view, 'query')
                 return
             decisions.append(view)
-            content = self.credentials(account)
+            record = await self.store.get(bot, 'accounts', account['id'])
+            # Any write since the directory read bumps the revision; this only rejects a vanished row.
+            if record is None:
+                await self.reply(event, CHANGED)
+                return
+            content = self.credentials(record)
         except BusinessError as error:
             await self.reply(event, str(error) if error.status != 503 else '账号查询暂不可用，请联系主人')
             return
         except (RuntimeError, ValueError, sqlite3.Error, OSError) as error:
+            if not self.active:  # unloaded or reloaded mid-query: its store is closed
+                await self.reply(event, CHANGED)
+                return
             log.error(f'[{bot}] 账号查询暂不可用: {type(error).__name__}')
             await self.reply(event, '账号查询暂不可用，请联系主人')
             return
-        # Final synchronous gate after the last preparatory await: unchanged accounts,
-        # open groups and module instances, and current decisions (sources, denial,
-        # resource enablement, policy scope, group facts, reloads). Send immediately.
-        if not self.current(event, revision, acl, decisions, menu):
-            await self.reply(event, CHANGED)
-            return
-        state = await self.reply(event, content)
+        # Final gate: after this plugin's last await and again after Sender's preparation.
+        state = await self.reply(event, content, gate=lambda: self.current(event, revision, acl, decisions, menu))
         log.info(f'[{bot}] 账号{"列表" if name is None and resource is None else "查询"} group={group} member={member} result={state}')
 
     def current(self, event, revision, acl, decisions, menu=None):
-        # #75 account pause and #78 persistent emergency checks must join this gate,
-        # after all preparation and immediately before every sensitive send.
+        # Unchanged accounts, open groups and module instances, and current decisions
+        # (sources, denial, resource enablement, policy scope, group facts, reloads).
+        # #75 account pause and #78 persistent emergency checks must join this gate; it
+        # also runs in the before_send gate, so it must stay synchronous.
         return (
             self.unchanged(event.appid, revision)
             and self.plugin_available(event.appid)
@@ -536,18 +616,12 @@ class Ninja3:
         content += f'\n五分钟内发送“忍3选择 {token} <编号>”'
         buttons = [{'text': label[:20], 'type': 1, 'data': f'n3:{token}:{i}', 'tips': f'发送：忍3选择 {token} {i}'} for i, (label, _) in enumerate(items, 1)]
         rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
-        if not check():
-            await self.reply(event, CHANGED)
-            return
         if cfg.get_bot_setting(event.appid, 'message.use_markdown', True):
-            state = await self.reply(event, content, buttons=rows)
-            if state != 'failed':  # sent, unavailable or unknown: never duplicate.
+            state = await self.reply(event, content, buttons=rows, gate=check)
+            if state != 'failed':  # sent, stale, unguarded, unavailable or unknown: never duplicate.
                 return
-        # Rejection was an await; the same final gate applies to the fallback.
-        if check():
-            await self.reply(event, content + '\n按钮暂不可用，请使用以上文字编号。', msg_type=0)
-        else:
-            await self.reply(event, CHANGED)
+        # Only an explicit rejection falls back; it rechecks before and after Sender's preparation.
+        await self.reply(event, content + '\n按钮暂不可用，请使用以上文字编号。', msg_type=0, gate=check)
 
     async def menu(self, event):
         bot, group = event.appid, event.group_id
@@ -597,8 +671,7 @@ class Ninja3:
             if not await self.scope_open(event):
                 await self.reply(event, '本群未开放账号查询')
                 return
-            if self.menu_current(event, menu) and self.is_owner(event):
-                await self.reply(event, action['manage'] + '尚未交付，当前不可用')
+            await self.reply(event, action['manage'] + '尚未交付，当前不可用', gate=lambda: self.menu_current(event, menu) and self.is_owner(event))
         else:
             # Resolve eligibility and credentials anew using the actual sender/clicker.
             await self.query(event, resource=action.get('resource'), page=action.get('page', 0), menu=menu)

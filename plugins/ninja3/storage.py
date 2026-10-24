@@ -53,6 +53,16 @@ class ExtensionStore:
     async def all(self, bot, collection):
         return await self._execute('SELECT payload FROM extension_records WHERE bot=? AND collection=? ORDER BY rowid', (bot, collection), True)
 
+    async def project(self, bot, collection, fields):
+        """Only ``fields`` of each record: SQLite extracts them, other values never reach Python.
+
+        Same rows as ``all`` (no second copy to keep in sync); a missing field reads as None.
+        """
+        if not fields or not all(isinstance(f, str) and f.isidentifier() for f in fields):
+            raise ValueError('投影字段无效')
+        columns = ', '.join(f"'{f}', payload -> '$.{f}'" for f in fields)
+        return await self._execute(f'SELECT json_object({columns}) FROM extension_records WHERE bot=? AND collection=? ORDER BY rowid', (bot, collection), True)
+
     async def get(self, bot, collection, key):
         rows = await self._execute('SELECT payload FROM extension_records WHERE bot=? AND collection=? AND id=?', (bot, collection, key), True)
         return rows[0] if rows else None

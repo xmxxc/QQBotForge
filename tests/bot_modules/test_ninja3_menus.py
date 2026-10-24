@@ -335,16 +335,17 @@ async def test_list_final_gate_after_titles_loaded(ninja, monkeypatch):
     a = await h.setup()
     await grant(h)
     store = h.ninja().store
-    original = store.all
+    # The directory reads its titles through the metadata projection.
+    original = store.project
 
-    async def changed(bot, collection):
-        result = await original(bot, collection)
+    async def changed(bot, collection, fields):
+        result = await original(bot, collection, fields)
         if collection == 'accounts':
-            monkeypatch.setattr(store, 'all', original)
+            monkeypatch.setattr(store, 'project', original)
             await h.ninja_api('PATCH', 'accounts/' + a['id'], {'name': 'fake-new'})
         return result
 
-    monkeypatch.setattr(store, 'all', changed)
+    monkeypatch.setattr(store, 'project', changed)
     assert await h.say('账号列表', user='MEMBERA') == ['账号或授权刚刚变化，请重新发送查询']
 
 

@@ -84,3 +84,40 @@ sed -n '/<script>/,/<\/script>/p' plugins/ninja3/page.html | sed '1s/.*<script>/
 - 假日志服务的 AttributeError 发生在框架用户追踪和日志副任务（`_track_worker`、`db_fetch_one`）中，不在被测入口内。每个入口用例都断言了插件的确切群回复或私聊推送（例如 `忍3` 的“已记录本私聊为主人通知地址”），所以入口没执行就会失败。框架黑名单用例断言回复只有框架模板（内容为 None），插件没有执行。
 
 最终：test_ninja3 21 passed；tests/bot_modules 423 passed（基线 402 + 新增 21）。
+
+## 独立审查 F1 修复（基于 bcf2657）
+
+- **根因**：`plugins/ninja3/page.html` 的“新增”按钮 `id="reset"` 位于 `<form id="account">` 内。表单的具名控件会覆盖 `HTMLFormElement` 的同名成员（[LegacyOverrideBuiltIns]），于是 `$('account').reset` 返回这个按钮，`reset()` 抛出 TypeError。后果：
+  - 保存、删除在服务端已完成，页面却报错、不刷新。
+  - 编辑 A 后点“新增”清不掉隐藏 id，保存 B 时会以 PATCH 覆盖 A。
+- **修法**：只把按钮改名为 `id="account-new"`，并修改唯一的引用 `$('account-new').onclick`。其余按钮按文字或表单提交定位，群表单内没有同类冲突。后端和其他行为不变。
+- **仓库回归** `tests/bot_modules/test_ninja3_page.py`：
+  - `test_no_form_control_shadows_a_form_method`：静态解析页面，表单内控件的 id／name 不得为 `reset`、`submit`、`requestSubmit`、`checkValidity`、`reportValidity`。不依赖浏览器，CI 中也会运行。
+  - `test_account_form_new_edit_delete_and_rejection_in_a_real_browser`：真实 Chrome（playwright）驱动随附页面，`/api/ext/*` 走真实 `handle_ext_route`、真实插件、临时 SQLite，全部是假账密。覆盖以下流程：
+    - 新建 A，列表刷新，状态显示本次 `acl_sync`。
+    - 编辑 A → 新增 → 填 B → 保存：生成第二个 ID，A 的名称、登录名、密码都不变。
+    - 编辑只改指定记录，新增不遗留旧 ID。
+    - 删除后表单与列表一致，之后还能正常新增。
+    - 后端以重名拒绝时，页面显示错误，服务端数据和表单都保持原样。
+    - 全程没有页面异常。
+  - 作者增量自查补强：每次保存先清空测试页的旧状态，再等待本次 POST／PATCH 响应与页面完成刷新，逐次比对响应中的 `acl_sync` 和页面提示；新增与删除后显式断言隐藏 id 为空，删除前先进入该记录的编辑状态。
+  - 没有 playwright 或 Chrome 时，该用例以中文原因跳过。当前 CI 镜像没有 playwright，所以 CI 不运行浏览器流程，须在有浏览器的环境复核。
+- **红绿**：
+  - bcf2657 的页面：两项都失败，浏览器用例停在“页面未显示‘账号已保存’：状态='$(...).reset is not a function'”。
+  - 修复后：两项都通过。
+  - 审查者的覆盖探针：旧页面最终只有 1 个账号（A 被改名为 B），新页面有 2 个账号、无页面错误。审查者的整页探针按旧 id `#reset` 点击，在新页面上找不到该元素，这是探针写死了旧 id，不是产品回归。
+- **检查**：
+  - ruff check／format 通过。
+  - mypy（显式三个插件模块，配置同审查者）通过，0 问题。
+  - 平铺 ci-assets `04d901726cc6d94bae1b2b5524521f997a326e10` 的完整测试，在带 playwright 的环境中 866 passed，0 skipped。
+- **保留**：F2–F7（P3）未在本轮处理。
+
+## 发送准备边界与目录读取（#74 审查 F1/F2 基础层，2026-10-24）
+
+来源：#74 独立审查 F1（真实 `before_send` 准备之后缺少最终复查）、F2（目录解码完整凭据）。旧文字查询 `账号列表`／`账号 名称` 在本层闭环；菜单、共享选择和降级在 #74 分支合入本层后处理。作者自查，未独立复核。
+
+- **基线**：#72 `129df14178d1f551b06bc131a73aacde74c30255`（tree `10a5d691f06e396c78e833bc3f889fb120897709`）。
+- **F1**：插件实例加载时经公开 `app.hook_manager` 以 `math.inf` 优先级注册 `before_send` 回调；敏感回复经 contextvar 携带同步检查，在框架管道末尾、首次 `post_json` 前再执行，变化即拦截并改发不含账号内容的提示。发送前用公开 `list_hooks()` 确认本实例回调是最后一项，否则拒发。检查出错按变化处理，结果未知不重发。
+- **F2**：`ExtensionStore.project` 用 SQLite JSON 投影只返回 `id/name/enabled/open_groups`；`账号 名称` 在调用和查看决定都通过后，才 `get` 该一个账号的完整记录。
+- **红绿**：`tests/bot_modules/test_ninja3_send_gate.py` 用真实 MessageSender 与 HookManager，仅替换平台 `post_json`，在另一个 `before_send` 准备等待期间注入改密、停用、关群、授权管理收窄、撤权、拒绝、离群、授权模块重载、插件重载。放在 `129df14` 上：21 failed／2 passed（仅两项无变化对照通过）；本层：23 passed。
+- **框架缺口（未修复，须独立 main 修复与审查）**：`_HttpMixin._request` 在管道之后仍可能 await `get_token()` 刷新令牌，再发出首个请求；这段窗口内的撤权，任何 `before_send` 回调都看不到。可执行反例在交付证据 `test_gap_token_refresh.py`（缺口存在时通过）。最小接口建议：`_send_with_error_handling` 在 `before_send` 管道之前先完成 `_ensure_client()` 与 `get_token()`，或在 `_request` 首次 `client.request` 前同步调用一个 `before_transport` 检查（仅首发，不含重试）。
