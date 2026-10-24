@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+      # Merge commits on personal get their own result; the auto-deploy waits for it.
+      - personal
   pull_request:
 
 permissions:
