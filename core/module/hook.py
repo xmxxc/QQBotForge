@@ -29,12 +29,13 @@ class HookManager:
         self.group_lifecycle = GroupLifecycleManager()
         self.connection_status = ConnectionStatusManager()
         self.recovery = RecoveryManager(self.connection_status, self.group_lifecycle)
-        self._hooks = defaultdict(list)  # {name: [(pri, owner, cb, is_coro)]}
+        # {name: [(pri, owner, cb, is_coro, token)]}; owner 仅用于展示/日志，token 标识注册它的模块实例
+        self._hooks = defaultdict(list)
         self._sorted = {}
 
-    def register(self, hook_name, callback, *, owner='unknown', priority=100):
+    def register(self, hook_name, callback, *, owner='unknown', priority=100, _token=None):
         """注册 hook 回调 (priority 越小越先执行)"""
-        self._hooks[hook_name].append((priority, owner, callback, asyncio.iscoroutinefunction(callback)))
+        self._hooks[hook_name].append((priority, owner, callback, asyncio.iscoroutinefunction(callback), _token))
         self._sorted.pop(hook_name, None)
 
     def unregister(self, hook_name, callback):
@@ -46,10 +47,17 @@ class HookManager:
         self._sorted.pop(hook_name, None)
 
     def unregister_owner(self, owner):
-        """注销某个 owner 的所有 hook"""
+        """注销某个 owner 的所有 hook（按展示名匹配，同名的所有注册者都会被移除）"""
+        self._unregister_where(lambda e: e[1] == owner)
+
+    def _unregister_token(self, token):
+        """注销某个模块实例注册的全部 hook，不影响同展示名的其他实例"""
+        self._unregister_where(lambda e: e[4] is token)
+
+    def _unregister_where(self, match):
         for name in list(self._hooks):
             orig = self._hooks[name]
-            filtered = [e for e in orig if e[1] != owner]
+            filtered = [e for e in orig if not match(e)]
             if len(filtered) == len(orig):
                 continue
             self._sorted.pop(name, None)
@@ -69,7 +77,7 @@ class HookManager:
     async def emit(self, hook_name, *args, **kwargs):
         """广播执行 — 依次调用所有回调, 异常不中断"""
         loop = asyncio.get_running_loop()
-        for _, owner, cb, is_coro in self._get_sorted(hook_name):
+        for _, owner, cb, is_coro, _token in self._get_sorted(hook_name):
             try:
                 if is_coro:
                     await cb(*args, **kwargs)
@@ -83,7 +91,7 @@ class HookManager:
         if data is None:
             return None
         loop = asyncio.get_running_loop()
-        for _, owner, cb, is_coro in self._get_sorted(hook_name):
+        for _, owner, cb, is_coro, _token in self._get_sorted(hook_name):
             try:
                 data = await cb(data) if is_coro else await loop.run_in_executor(None, cb, data)
                 if data is None:
