@@ -1,6 +1,7 @@
 """HTTP 请求层 — Token 自动重试、API 基础方法"""
 
 import asyncio
+import inspect
 import random
 
 from core.base.logger import FRAMEWORK, get_logger
@@ -82,6 +83,20 @@ def _describe_exception(e, method, endpoint):
     return {'message': msg, 'code': -1}
 
 
+def _send_check_blocked(attempted, method, endpoint):
+    """send_check 拦截结果: code=-1 (结果未知, 不按平台拒绝处理); attempted=此前是否已进入过业务请求"""
+    return {
+        'message': f'发送前检查未通过, 已拦截 {method} {endpoint}',
+        'code': -1,
+        'send_check': 'blocked',
+        'attempted': attempted,
+    }
+
+
+def _is_send_check_blocked(data):
+    return isinstance(data, dict) and data.get('send_check') == 'blocked'
+
+
 class _HttpMixin:
     """HTTP 请求层 Mixin"""
 
@@ -95,7 +110,22 @@ class _HttpMixin:
         # 客户端由 TokenManager 统一管理生命周期
         self._client = None
 
-    async def _request(self, method, endpoint, **kwargs):
+    def _send_check_passes(self, check):
+        """同步执行发送前检查: 仅真值放行; 异常/可等待对象/假值一律拦截 (不记录异常内容, 防止泄露凭据)"""
+        try:
+            result = check()
+            if inspect.isawaitable(result):
+                if inspect.iscoroutine(result):
+                    result.close()
+                log.warning(f'[{self._appid}] 发送前检查必须为同步函数, 已拦截')
+                return False
+            return bool(result)
+        except Exception as e:
+            log.warning(f'[{self._appid}] 发送前检查异常 ({type(e).__name__}), 已拦截')
+            return False
+
+    async def _request(self, method, endpoint, *, send_check=None, **kwargs):
+        """send_check: 同步检查, 在 client/token 准备 (含锁等待与刷新) 之后、每次业务 client.request 之前执行"""
         try:
             client = await self._ensure_client()
         except Exception as e:
@@ -103,12 +133,18 @@ class _HttpMixin:
         extra_headers = kwargs.pop('headers', None)
         token_retried = False
         net_retries = 0
+        attempted = False
         while True:
             token = await self._token_mgr.get_token()
             headers = dict(extra_headers) if extra_headers else {}
             headers['Authorization'] = f'QQBot {token}'
             if 'json' in kwargs:
                 headers.setdefault('Content-Type', 'application/json')
+            # 检查与 client.request 之间不得再有 await
+            if send_check is not None and not self._send_check_passes(send_check):
+                log.warning(f'[{self._appid}] 发送前检查未通过, 已拦截{"重试" if attempted else ""} {method} {endpoint}')
+                return False, _send_check_blocked(attempted, method, endpoint)
+            attempted = True
             try:
                 resp = await client.request(method, endpoint, headers=headers, **kwargs)
                 body = resp.content
@@ -148,8 +184,14 @@ class _HttpMixin:
     async def get_json(self, endpoint, **kwargs):
         return await self._request('GET', endpoint, **kwargs)
 
-    async def post_json(self, endpoint, payload):
-        return await self._request('POST', endpoint, json=payload)
+    async def post_json(self, endpoint, payload, *, send_check=None):
+        return await self._request('POST', endpoint, json=payload, send_check=send_check)
+
+    async def _post_message(self, endpoint, payload, send_check):
+        # 仅在有检查时传参: 覆写了 post_json(endpoint, payload) 的旧子类/替身保持兼容
+        if send_check is None:
+            return await self.post_json(endpoint, payload)
+        return await self.post_json(endpoint, payload, send_check=send_check)
 
     async def put(self, endpoint, **kwargs):
         return await self._request('PUT', endpoint, **kwargs)
