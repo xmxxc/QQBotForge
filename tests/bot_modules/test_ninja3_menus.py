@@ -290,7 +290,7 @@ async def test_real_message_sender_payload_and_return_shape(ninja, monkeypatch, 
     sender = MessageSender(SimpleNamespace(appid='bot-a'))
     sent = []
 
-    async def platform_send(self, endpoint, payload, event, content):
+    async def platform_send(self, endpoint, payload, event, content, **kwargs):
         sent.append((endpoint, payload))
         return (False, response) if len(sent) == 1 else (True, {'id': 'fake-text'})
 

@@ -1,4 +1,4 @@
-"""#74 menus through the real MessageSender and before_send pipeline; fake platform transport only."""
+"""#74 menus through the real MessageSender, before_send pipeline, TokenManager and _request; fake external HTTP client only."""
 
 import asyncio
 import re
@@ -85,21 +85,15 @@ async def test_page_navigation_rechecks_after_sender_preparation(ninja, wire, ch
 
 
 @pytest.mark.parametrize('change', MENU_CHANGES)
-async def test_rejected_buttons_fallback_rechecks_after_sender_preparation(ninja, wire, change, monkeypatch):
-    from core.message.sender import MessageSender
-
+async def test_rejected_buttons_fallback_rechecks_after_sender_preparation(ninja, wire, change):
     host = ninja
     account = await host.setup()
     await grant(host)
     clock = [1000]
     host.ninja().clock = lambda: clock[0]
 
-    async def transport(self, endpoint, payload):
-        wire.sent.append(payload)
-        # The platform definitively rejects the keyboard; the text fallback is a new send.
-        return (False, {'code': 400, 'message': 'fake keyboard rejected'}) if 'keyboard' in payload else (True, {'id': 'fake-text'})
-
-    monkeypatch.setattr(MessageSender, 'post_json', transport)
+    # The platform definitively rejects the keyboard; the text fallback is a new send.
+    wire.result = lambda payload: (False, {'code': 400, 'message': 'fake keyboard rejected'}) if 'keyboard' in payload else (True, {'id': 'fake-text'})
     wire.sent.clear()
     wire.marker = '按钮暂不可用'
     await run(host, wire, change, account, clock, lambda: host.say('账号列表', user='MEMBERA'))

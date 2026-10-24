@@ -1,6 +1,8 @@
-"""忍者必须死3 final send gate: real MessageSender and before_send pipeline, fake platform transport only."""
+"""忍者必须死3 final send gate: real MessageSender, before_send pipeline, TokenManager and _request; fake external HTTP client only."""
 
 import asyncio
+import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -16,16 +18,40 @@ CHANGES = ['control', 'password', 'disable', 'close_group', 'narrow_acl', 'revok
 
 @pytest.fixture
 async def wire(ninja, monkeypatch):
-    """Real Sender for bot-a; ``hold(marker)`` parks the first matching send inside an earlier before_send hook."""
+    """Real Sender for bot-a; ``marker`` parks the first matching send inside an earlier before_send hook.
+
+    ``result`` is ``(ok, data)`` or a callable of the payload returning it; ``code -1`` raises in the client.
+    """
     from core.message.sender import MessageSender
+    from core.network.access import TokenManager
 
     host = ninja
     sent = []
     wire = SimpleNamespace(sent=sent, entered=asyncio.Event(), release=asyncio.Event(), marker=None, result=(True, {'id': 'fake-message'}))
 
-    async def transport(self, endpoint, payload):
-        sent.append(payload)
-        return wire.result
+    class Client:
+        is_closed = False
+
+        async def post(self, url, **kwargs):
+            return SimpleNamespace(status_code=200, json=lambda: {'access_token': 'fake-token', 'expires_in': 7200})
+
+        async def request(self, method, url, **kwargs):
+            payload = kwargs.get('json')
+            sent.append(payload)
+            ok, data = wire.result(payload) if callable(wire.result) else wire.result
+            if ok:
+                return SimpleNamespace(status_code=200, content=json.dumps(data).encode())
+            if str(data.get('code')) == '-1':
+                raise RuntimeError(data.get('message', 'fake'))
+            return SimpleNamespace(status_code=400, content=json.dumps(data).encode())
+
+        async def aclose(self):
+            self.is_closed = True
+
+    tokens = TokenManager('bot-a', 'fake-local-secret')
+    tokens._client = Client()
+    tokens._token, tokens._expires_at = 'fake-token', time.time() + 7200
+    wire.tokens = tokens
 
     async def preparation(packet):
         # Stands for any asynchronous preparation (another hook, an upload) after the plugin's own checks.
@@ -35,13 +61,13 @@ async def wire(ninja, monkeypatch):
             await wire.release.wait()
         return packet
 
-    monkeypatch.setattr(MessageSender, 'post_json', transport)
-    host.application.get_bot('bot-a').sender = MessageSender(SimpleNamespace(appid='bot-a'))
+    host.application.get_bot('bot-a').sender = MessageSender(tokens)
     host.application.hook_manager.register('before_send', preparation, owner='test-preparation')
     wire.texts = lambda: [str(p) for p in sent]
     yield wire
     wire.release.set()
     host.application.hook_manager.unregister_owner('test-preparation')
+    await tokens.close()
 
 
 async def change_during(host, wire, change, account, send):
@@ -104,24 +130,34 @@ async def test_directory_rechecks_after_sender_preparation(ninja, wire, change):
         assert CHANGED in wire.texts()[0] and '账号A' not in wire.texts()[0], wire.texts()
 
 
-async def test_gate_not_last_fails_closed(ninja, wire):
+async def test_latest_before_send_callback_cannot_outrun_check(ninja, wire):
     host = ninja
     await host.setup()
     await grant(host)
     wire.sent.clear()
+    entered, release, hold = asyncio.Event(), asyncio.Event(), []
 
     async def later(packet):
-        return packet
+        if hold and SECRET in str(packet.get('payload')):
+            entered.set()
+            await release.wait()
+        return {'payload': packet['payload']}  # also drops event and content
 
-    # A callback ordered after the gate could still await; sensitive content is then refused.
+    # The check is a Sender argument, not a hook: a callback ordered last does not displace it.
     host.application.hook_manager.register('before_send', later, owner='test-later', priority=float('inf'))
     try:
         await host.say('账号 账号A', user='MEMBERA')
+        assert SECRET in wire.texts()[-1]
+        hold.append(1)
+        task = asyncio.create_task(host.say('账号 账号A', user='MEMBERA'))
+        await asyncio.wait_for(entered.wait(), 5)
+        await host.access.manage_access('bot-a', 'ninja3', 'revoke', function='query', group='group-a', member='MEMBERA')
+        release.set()
+        await task
     finally:
+        release.set()
         host.application.hook_manager.unregister_owner('test-later')
-    assert wire.texts() == [str(wire.sent[0])] and '账号查询暂不可用' in wire.texts()[0] and SECRET not in str(wire.sent)
-    await host.say('账号 账号A', user='MEMBERA')
-    assert SECRET in wire.texts()[-1]
+    assert len(wire.sent) == 2 and CHANGED in wire.texts()[1] and SECRET not in wire.texts()[1]
 
 
 async def test_failing_check_blocks_and_unknown_result_is_not_resent(ninja, wire, monkeypatch):
