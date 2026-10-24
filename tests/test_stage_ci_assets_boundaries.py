@@ -176,6 +176,19 @@ def test_asset_file_does_not_replace_same_content_source_symlink(layout):
     assert (snapshot(source), snapshot(outside)) == before
 
 
+def test_symlink_targets_differing_by_trailing_newline_conflict(layout):
+    source, assets, _ = layout
+    (assets / 'tests/link.txt').symlink_to('data.txt')
+    (source / 'tests').mkdir()
+    (source / 'tests/link.txt').symlink_to('data.txt\n')
+
+    result = stage(source, assets)
+
+    assert result.returncode != 0
+    assert 'would overwrite source test: tests/link.txt' in result.stdout
+    assert os.readlink(source / 'tests/link.txt') == 'data.txt\n'
+
+
 def test_asset_directory_does_not_replace_source_file(layout):
     source, assets, _ = layout
     write(assets / 'tests/core/test_a.py')
@@ -217,6 +230,22 @@ def test_tests_root_relative_symlink_escaping_workspace_is_rejected(layout):
     assert result.returncode != 0
     assert 'outside source workspace' in result.stdout
     assert snapshot(outside) == before
+
+
+def test_workspace_trailing_newline_does_not_widen_boundary(tmp_path):
+    source = tmp_path / 'source\n'
+    outside = tmp_path / 'source' / 'outside'
+    assets = tmp_path / 'assets'
+    source.mkdir()
+    outside.mkdir(parents=True)
+    write(assets / 'tests/new.txt')
+    (source / 'tests').symlink_to(outside)
+
+    result = stage(source, assets)
+
+    assert result.returncode != 0
+    assert 'outside source workspace' in result.stdout
+    assert not (outside / 'new.txt').exists()
 
 
 def test_dangling_tests_root_symlink_is_rejected(layout):

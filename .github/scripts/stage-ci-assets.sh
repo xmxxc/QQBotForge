@@ -22,7 +22,10 @@ if [ ! -d "$1" ]; then
   echo "::error::source-dir is not a directory: $1" >&2
   exit 2
 fi
-workspace=$(cd -- "$1" && pwd -P)
+# Path-valued command substitutions end with a sentinel so trailing newlines
+# that belong to the path are kept.
+workspace=$(cd -- "$1" && pwd -P && echo x)
+workspace=${workspace%$'\nx'}
 src="$1/tests"
 assets="$2/tests"
 
@@ -38,7 +41,8 @@ fi
 # The test root may only resolve to a directory strictly inside the source
 # workspace; check before anything is created or copied.
 if [ -L "$src" ]; then
-  target=$(realpath -m -- "$src")
+  target=$(realpath -m -- "$src" && echo x)
+  target=${target%$'\nx'}
   case "$target/" in
     "$workspace"/*/) ;;
     *)
@@ -80,7 +84,7 @@ same_entry() {
   case "$3" in
     directory) return 0 ;;
     file) cmp -s -- "$1" "$2" ;;
-    symlink) [ "$(readlink -- "$1")" = "$(readlink -- "$2")" ] ;;
+    symlink) [ "$(readlink -- "$1" && echo x)" = "$(readlink -- "$2" && echo x)" ] ;;
     *) return 1 ;;
   esac
 }
