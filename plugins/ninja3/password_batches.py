@@ -7,7 +7,6 @@ confirmed scope, the order and the link from each item to its task.
 
 import asyncio
 import builtins
-import contextlib
 import json
 import sqlite3
 import time
@@ -248,9 +247,7 @@ class PasswordBatches:
         """Compare-and-set on the batch runner: a cancelled, interrupted or stale runner stops."""
 
         def update(conn: sqlite3.Connection) -> Record:
-            batch = self._read(conn, bot, key)
-            if batch.get('runner') != runner or batch['state'] != 'running' or batch['cancel_requested']:
-                raise GuardRefusedError('批次已取消或中断')
+            batch = self._running(conn, bot, key, runner)
             if index is None:
                 batch.update(changes)
             else:
@@ -259,6 +256,13 @@ class PasswordBatches:
             return batch
 
         return dict(await self.store.atomic(update))
+
+    def _running(self, conn: sqlite3.Connection, bot: str, key: str, runner: str) -> Record:
+        """The batch as this runner still owns it; otherwise it was cancelled, interrupted or taken over."""
+        batch = self._read(conn, bot, key)
+        if batch.get('runner') != runner or batch['state'] != 'running' or batch['cancel_requested']:
+            raise GuardRefusedError('批次已取消或中断')
+        return batch
 
     async def _run(self, bot: str, key: str, runner: str) -> None:
         try:
@@ -278,12 +282,7 @@ class PasswordBatches:
                 if item['status'] != 'pending':
                     continue
                 await self._update(bot, key, runner)  # cancel/interrupt checkpoint before each account
-                try:
-                    await self._dispatch(bot, key, runner, index, item, batch['actor'], new_password)
-                except (sqlite3.Error, OSError):
-                    # One account's storage failure: record it and continue with the others.
-                    log.error(f'[{bot}] 批量改密单项未能开始: {key}#{index}')
-                    await self._update(bot, key, runner, index, status='failed')
+                await self._dispatch(bot, key, runner, index, item, batch['actor'], new_password)
             await self._stop(bot, key, runner, 'finished')
         except TaskError:
             pass
@@ -291,16 +290,18 @@ class PasswordBatches:
             # Storage failed for the batch itself: no raw exception or password. Stop it if the
             # store allows (otherwise restart does), and still try to tell the owner.
             log.error(f'[{bot}] 批量改密批次中断: {key}')
-            with contextlib.suppress(Exception):
+            try:
                 await self._stop(bot, key, runner, 'interrupted')
-        with contextlib.suppress(Exception):
+            except Exception:
+                log.error(f'[{bot}] 批量改密批次暂无法记录中断，重启后转为中断: {key}')
+        try:
             await self._summary(bot, key, runner)
+        except Exception:
+            log.error(f'[{bot}] 批量改密汇总通知未能记录: {key}')
 
     async def _stop(self, bot: str, key: str, runner: str, state: str) -> None:
         def stop(conn: sqlite3.Connection) -> None:
-            batch = self._read(conn, bot, key)
-            if batch.get('runner') != runner or batch['state'] != 'running':
-                raise GuardRefusedError('批次已取消或中断')
+            batch = self._running(conn, bot, key, runner)
             self._unstarted(batch).update(state=state, sealed_password=None)
             self._save(conn, bot, batch)
 
@@ -312,6 +313,11 @@ class PasswordBatches:
         except TaskError:
             await self._update(bot, key, runner, index, status='changed')
             return
+        except (sqlite3.Error, OSError):
+            # This account's storage failed before anything started: record it and go on.
+            log.error(f'[{bot}] 批量改密单项未能开始: {key}#{index}')
+            await self._update(bot, key, runner, index, status='failed')
+            return
         if child['state'] != 'selected':
             # Same account already has an intent (single task, another batch, future emergency).
             await self._update(bot, key, runner, index, status='existing', task=child['id'])
@@ -320,9 +326,7 @@ class PasswordBatches:
 
         def still_running(conn: sqlite3.Connection) -> None:
             # Same transaction as the task claim: a cancelled, interrupted or stale batch starts nothing.
-            batch = self._read(conn, bot, key)
-            if batch.get('runner') != runner or batch['state'] != 'running' or batch['cancel_requested']:
-                raise GuardRefusedError('批次已取消或中断')
+            self._running(conn, bot, key, runner)
 
         try:
             started = await self.tasks.confirm(bot, child['id'], actor, new_password=new_password, expect_digest=item['digest'], guard=still_running)
@@ -332,14 +336,22 @@ class PasswordBatches:
             status = 'changed' if isinstance(error, AccountChangedError) else 'input_rejected' if isinstance(error, SamePasswordError) else 'failed'
             await self._update(bot, key, runner, index, status=status)
             return
+        except (sqlite3.Error, OSError):
+            # The claim transaction rolled back: nothing started for this account.
+            log.error(f'[{bot}] 批量改密单项未能开始: {key}#{index}')
+            await self._update(bot, key, runner, index, status='failed')
+            return
         if started['id'] != child['id']:
             await self._update(bot, key, runner, index, status='existing', task=started['id'])
             return
-        await self._update(bot, key, runner, index, status='dispatched')
         worker = self.tasks.workers.get((bot, child['id']))
-        if worker is not None:
-            # Wait without propagating our own cancellation into the task's worker.
-            await asyncio.wait({worker})
+        try:
+            await self._update(bot, key, runner, index, status='dispatched')
+        finally:
+            # Started: always wait for it before anything else (even if recording failed), and
+            # without propagating our own cancellation into the task's worker.
+            if worker is not None:
+                await asyncio.wait({worker})
 
     async def _summary(self, bot: str, key: str, runner: str) -> None:
         batch = await self.store.atomic(lambda conn: self._read(conn, bot, key))

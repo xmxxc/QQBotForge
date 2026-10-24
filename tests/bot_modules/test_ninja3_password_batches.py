@@ -46,6 +46,15 @@ async def settle(host):
     await host.finished()
 
 
+async def reached(host, key, index, outcome):
+    """Wait until the sequential runner has handled one item (it runs after confirm returns)."""
+    for _ in range(200):
+        if (await batch_api(host, 'GET', '/' + key))[1]['data']['items'][index]['outcome'] == outcome:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f'item {index} never reached {outcome}')
+
+
 async def accounts(host, *names, password=OLD):
     made = [host.account]
     for name in names:
@@ -235,6 +244,7 @@ async def test_actor_bot_and_existing_intent_rules(changing):
     await host.center.entered.wait()
     batch = (await batch_api(host, 'POST', body={'accounts': [a['id'], b['id']]}))[1]['data']
     await batch_api(host, 'POST', f'/{batch["id"]}/confirm', {})
+    await reached(host, batch['id'], 0, 'existing')
     host.center.release.set()
     await settle(host)
     result = (await batch_api(host, 'GET', f'/{batch["id"]}'))[1]['data']
@@ -373,6 +383,7 @@ async def test_concurrent_confirm_and_overlapping_batch_submit_once_per_account(
     second = (await batch_api(host, 'POST', body={'accounts': [a['id'], b['id']]}))[1]['data']
     assert second['id'] != first['id']
     await batch_api(host, 'POST', f'/{second["id"]}/confirm', {})
+    await reached(host, second['id'], 0, 'existing')
     host.center.release.set()
     await settle(host)
     first_task = (await batch_api(host, 'GET', f'/{first["id"]}'))[1]['data']['items'][0]['task']
@@ -442,3 +453,30 @@ async def test_live_view_shows_an_account_in_flight_as_running(changing):
     host.center.release.set()
     await settle(host)
     assert (await batch_api(host, 'GET', f'/{batch["id"]}'))[1]['data']['items'][0]['outcome'] == 'success'
+
+
+async def test_storage_error_after_an_account_started_still_waits_and_starts_no_next_account(changing, monkeypatch):
+    host = changing
+    a, b = await accounts(host, '账号B')
+    batches = host.ninja().password_batches
+    real = batches._update
+
+    async def update(*args, **changes):
+        if changes.get('status') == 'dispatched':
+            raise sqlite3.OperationalError('fake disk error')
+        return await real(*args, **changes)
+
+    monkeypatch.setattr(batches, '_update', update)
+    batch = (await batch_api(host, 'POST', body={'accounts': [a['id'], b['id']]}))[1]['data']
+    host.center.block_path = CHANGE
+    await batch_api(host, 'POST', f'/{batch["id"]}/confirm', {})
+    await host.center.entered.wait()
+    await asyncio.sleep(0.05)
+    # Account A is in flight: the runner is still waiting for it and account B has not started.
+    assert batches.runners and not host.tasks.is_paused('bot-a', b['id'])
+    status, response = await batch_api(host, 'POST', f'/{batch["id"]}/cancel', {})
+    assert status == 200  # the linked, started account is still reached by a batch cancel
+    host.center.release.set()
+    await settle(host)
+    result = (await batch_api(host, 'GET', f'/{batch["id"]}'))[1]['data']
+    assert [i['outcome'] for i in result['items']] == ['unknown', 'not_started'] and host.center.changes == 1

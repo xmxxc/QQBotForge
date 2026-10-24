@@ -50,7 +50,8 @@ class SamePasswordError(TaskError):
 
 
 class GuardRefusedError(TaskError):
-    """A caller's ``confirm(guard=...)`` precondition refused the claim (e.g. its batch stopped)."""
+    """A caller's own precondition failed: raised by a ``confirm(guard=...)`` guard, and by a batch
+    whose runner no longer owns it (cancelled, interrupted or taken over)."""
 
 
 class IntentCipher:
