@@ -168,7 +168,7 @@ async def test_specified_password_only_from_owner_private_chat_or_backend(changi
     assert [i['outcome'] for i in result['items']] == ['success', 'input_rejected'] and host.center.changes == 1
     assert (await host.tasks.store.get('bot-a', 'accounts', a['id']))['password'] == 'Fake-new1'
     raw = await host.tasks.store.atomic(lambda conn: json.loads(conn.execute('SELECT payload FROM ninja3_password_batches').fetchone()[0]))
-    assert raw['specified'] is None  # dropped once every item was handed over
+    assert raw['sealed_password'] is None  # dropped once every item was handed over
     everything = ' '.join([confirmed, *pushes(host), *(r.getMessage() for r in caplog.records)])
     assert 'Fake-new1' not in everything
     # Authenticated, same-origin backend accepts it; cross-site or unauthenticated never does.
@@ -357,7 +357,7 @@ async def test_missing_key_starts_nothing_for_a_specified_batch(changing):
     assert result['state'] == 'interrupted' and result['items'][0]['outcome'] == 'not_started'
     assert not host.center.requests and not host.tasks.is_paused('bot-a', a['id'])
     with sqlite3.connect(host.tasks.store.path) as conn:
-        assert json.loads(conn.execute('SELECT payload FROM ninja3_password_batches').fetchone()[0])['specified'] is None
+        assert json.loads(conn.execute('SELECT payload FROM ninja3_password_batches').fetchone()[0])['sealed_password'] is None
 
 
 async def test_concurrent_confirm_and_overlapping_batch_submit_once_per_account(changing):
@@ -379,3 +379,66 @@ async def test_concurrent_confirm_and_overlapping_batch_submit_once_per_account(
     items = (await batch_api(host, 'GET', f'/{second["id"]}'))[1]['data']['items']
     assert (items[0]['outcome'], items[0]['task']) == ('existing', first_task)
     assert items[1]['outcome'] == 'success' and host.center.changes == 2
+
+
+async def interrupt_in_other_process(host, key):
+    child = await asyncio.create_subprocess_exec(
+        sys.executable, '-c', OTHER_PROCESS, host.tasks.store.path, str(host.key_file), key, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    out, err = await asyncio.wait_for(child.communicate(), 20)
+    assert child.returncode == 0, err.decode()
+    return json.loads(out)
+
+
+async def test_stale_runner_cannot_claim_an_account_after_another_process_interrupts(changing, monkeypatch):
+    host = changing
+    a, b = await accounts(host, '账号B')
+    batch = (await batch_api(host, 'POST', body={'accounts': [a['id'], b['id']]}))[1]['data']
+    real = host.tasks.confirm
+    interrupted = []
+
+    async def confirm(*args, **kwargs):
+        # Between linking the account and claiming its task, another process restarts.
+        if not interrupted:
+            interrupted.append(await interrupt_in_other_process(host, batch['id']))
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(host.tasks, 'confirm', confirm)
+    await batch_api(host, 'POST', f'/{batch["id"]}/confirm', {})
+    await settle(host)
+    result = (await batch_api(host, 'GET', f'/{batch["id"]}'))[1]['data']
+    assert interrupted == ['interrupted'] and result['state'] == 'interrupted'
+    assert [i['outcome'] for i in result['items']] == ['not_started', 'not_started']
+    assert not host.center.requests and not host.tasks.is_paused('bot-a', a['id'])
+
+
+async def test_one_account_storage_error_continues_with_the_others(changing, monkeypatch):
+    host = changing
+    a, b = await accounts(host, '账号B')
+    real = host.tasks.confirm
+
+    async def confirm(bot, key, *args, **kwargs):
+        if (await host.tasks.get(bot, key))['account'] == a['id']:
+            raise sqlite3.OperationalError('fake disk error')
+        return await real(bot, key, *args, **kwargs)
+
+    monkeypatch.setattr(host.tasks, 'confirm', confirm)
+    batch = (await batch_api(host, 'POST', body={'accounts': [a['id'], b['id']]}))[1]['data']
+    await batch_api(host, 'POST', f'/{batch["id"]}/confirm', {})
+    await settle(host)
+    result = (await batch_api(host, 'GET', f'/{batch["id"]}'))[1]['data']
+    assert result['state'] == 'finished' and result['notification'] == 'sent'
+    assert [i['outcome'] for i in result['items']] == ['failed', 'success'] and host.center.changes == 1
+
+
+async def test_live_view_shows_an_account_in_flight_as_running(changing):
+    host = changing
+    (a,) = await accounts(host)
+    batch = (await batch_api(host, 'POST', body={'accounts': [a['id']]}))[1]['data']
+    host.center.block_path = CHANGE
+    await batch_api(host, 'POST', f'/{batch["id"]}/confirm', {})
+    await host.center.entered.wait()  # submitted: the remote marker is already unknown
+    assert (await batch_api(host, 'GET', f'/{batch["id"]}'))[1]['data']['items'][0]['outcome'] == 'running'
+    host.center.release.set()
+    await settle(host)
+    assert (await batch_api(host, 'GET', f'/{batch["id"]}'))[1]['data']['items'][0]['outcome'] == 'success'

@@ -7,6 +7,7 @@ confirmed scope, the order and the link from each item to its task.
 
 import asyncio
 import builtins
+import contextlib
 import json
 import sqlite3
 import time
@@ -17,14 +18,23 @@ from uuid import uuid4
 from core.base.logger import PLUGIN, get_logger
 
 from .password_protocol import RemoteStatus
-from .password_tasks import PasswordTasks, TaskError, account_digest, password_format_error
+from .password_tasks import (
+    AccountChangedError,
+    GuardRefusedError,
+    PasswordTasks,
+    SamePasswordError,
+    TaskError,
+    account_digest,
+    password_format_error,
+)
 from .storage import ExtensionStore
 
 log = get_logger(PLUGIN, '忍者必须死3')  # type: ignore[no-untyped-call]  # project logger is untyped
 Record = dict[str, Any]
-PUBLIC_FIELDS = ('id', 'state', 'mode', 'everything', 'notification', 'created_at', 'cancel_requested')
-# Child task states in which a batch cancel still has something to stop.
-CANCELLABLE = {'selected', 'prepared', 'preparing', 'submitting'}
+PUBLIC_FIELDS = ('id', 'state', 'mode', 'all_accounts', 'notification', 'created_at', 'cancel_requested')
+# Child task states still in flight, and those in which a batch cancel has something to stop.
+RUNNING = {'prepared', 'preparing', 'submitting'}
+CANCELLABLE = {'selected'} | RUNNING
 OUTCOMES = {
     'success': '成功',
     'local_pending': '远端成功、本地待完成',
@@ -82,14 +92,18 @@ class PasswordBatches:
             for bot, raw in conn.execute("SELECT bot,payload FROM ninja3_password_batches WHERE json_extract(payload,'$.state')='running'").fetchall():
                 # A restart never continues a batch: items not yet handed to a task stay unstarted.
                 # Tasks already confirmed follow their own durable rules.
-                batch = json.loads(raw)
-                for item in batch['items']:
-                    if item['status'] == 'pending':
-                        item['status'] = 'not_started'
-                batch.update(state='interrupted', runner=None, specified=None)
+                batch = self._unstarted(json.loads(raw))
+                batch.update(state='interrupted', runner=None, sealed_password=None)
                 self._save(conn, bot, batch)
 
         await self.store.atomic(setup)
+
+    @staticmethod
+    def _unstarted(batch: Record) -> Record:
+        for item in batch['items']:
+            if item['status'] == 'pending':
+                item['status'] = 'not_started'
+        return batch
 
     # ---------- views ----------
 
@@ -104,13 +118,15 @@ class PasswordBatches:
             return 'success'
         if task['state'] == 'released':
             return 'released'
+        if task['state'] in RUNNING:
+            return 'running'
         if remote == RemoteStatus.REPORTED_SUCCESS:
             return 'local_pending' if local != 'committed' else 'success'
         if remote == RemoteStatus.REJECTED:
             return 'rejected'
         if remote == RemoteStatus.UNKNOWN:
             return 'unknown'
-        return 'running' if task['state'] in {'prepared', 'preparing', 'submitting'} else 'not_submitted'
+        return 'not_submitted'
 
     async def view(self, bot: str, batch: Record) -> Record:
         result = {key: batch[key] for key in PUBLIC_FIELDS}
@@ -147,7 +163,7 @@ class PasswordBatches:
             raise TaskError(problem)
         key = uuid4().hex
         # Sealed with the task key before the transaction; the value is never stored in clear.
-        specified = None if new_password is None else self.tasks.cipher.seal({'bot': bot, 'batch': key, 'new_password': new_password})
+        sealed = None if new_password is None else self.tasks.cipher.seal({'bot': bot, 'batch': key, 'new_password': new_password})
 
         def choose(conn: sqlite3.Connection) -> Record:
             current = self._accounts(conn, bot)
@@ -172,7 +188,7 @@ class PasswordBatches:
                     }
                 )
             scope = [[item['account'], item['digest']] for item in items]
-            if specified is None:
+            if sealed is None:
                 # Repeating the same random selection of unchanged accounts shows the same batch.
                 for (raw,) in conn.execute(
                     "SELECT payload FROM ninja3_password_batches WHERE bot=? AND json_extract(payload,'$.state')='selected' "
@@ -180,14 +196,14 @@ class PasswordBatches:
                     (bot, actor),
                 ):
                     existing = json.loads(raw)
-                    if existing['everything'] == (accounts is None) and [[i['account'], i['digest']] for i in existing['items']] == scope:
+                    if existing['all_accounts'] == (accounts is None) and [[i['account'], i['digest']] for i in existing['items']] == scope:
                         return dict(existing)
             batch = dict(
                 id=key,
                 actor=actor,
-                mode='random' if specified is None else 'specified',
-                everything=accounts is None,
-                specified=specified,
+                mode='random' if sealed is None else 'specified',
+                all_accounts=accounts is None,
+                sealed_password=sealed,
                 items=items,
                 state='selected',
                 runner=None,
@@ -212,7 +228,7 @@ class PasswordBatches:
             if batch['state'] != 'selected':
                 return batch, False  # repeated confirmation: the same batch and its tasks
             current = self._accounts(conn, bot)
-            if batch['everything'] and set(current) != {item['account'] for item in batch['items']}:
+            if batch['all_accounts'] and set(current) != {item['account'] for item in batch['items']}:
                 raise TaskError('账号范围在选择后变化，请重新选择并确认')
             for item in batch['items']:
                 if item['account'] not in current or account_digest(current[item['account']]) != item['digest']:
@@ -234,7 +250,7 @@ class PasswordBatches:
         def update(conn: sqlite3.Connection) -> Record:
             batch = self._read(conn, bot, key)
             if batch.get('runner') != runner or batch['state'] != 'running' or batch['cancel_requested']:
-                raise TaskError('批次已取消或中断')
+                raise GuardRefusedError('批次已取消或中断')
             if index is None:
                 batch.update(changes)
             else:
@@ -248,9 +264,9 @@ class PasswordBatches:
         try:
             batch = await self.store.atomic(lambda conn: self._read(conn, bot, key))
             new_password = None
-            if batch['specified']:
+            if batch['sealed_password']:
                 try:
-                    sealed = self.tasks.cipher.open(batch['specified'])
+                    sealed = self.tasks.cipher.open(batch['sealed_password'])
                     if sealed.get('bot') != bot or sealed.get('batch') != key:
                         raise TaskError('指定密码关联不符')
                 except TaskError:
@@ -262,25 +278,30 @@ class PasswordBatches:
                 if item['status'] != 'pending':
                     continue
                 await self._update(bot, key, runner)  # cancel/interrupt checkpoint before each account
-                await self._dispatch(bot, key, runner, index, item, batch['actor'], new_password)
+                try:
+                    await self._dispatch(bot, key, runner, index, item, batch['actor'], new_password)
+                except (sqlite3.Error, OSError):
+                    # One account's storage failure: record it and continue with the others.
+                    log.error(f'[{bot}] 批量改密单项未能开始: {key}#{index}')
+                    await self._update(bot, key, runner, index, status='failed')
             await self._stop(bot, key, runner, 'finished')
         except TaskError:
             pass
         except Exception:
-            # No raw exception or password; unstarted items stay pending until restart marks them.
+            # Storage failed for the batch itself: no raw exception or password. Stop it if the
+            # store allows (otherwise restart does), and still try to tell the owner.
             log.error(f'[{bot}] 批量改密批次中断: {key}')
-            return
-        await self._summary(bot, key, runner)
+            with contextlib.suppress(Exception):
+                await self._stop(bot, key, runner, 'interrupted')
+        with contextlib.suppress(Exception):
+            await self._summary(bot, key, runner)
 
     async def _stop(self, bot: str, key: str, runner: str, state: str) -> None:
         def stop(conn: sqlite3.Connection) -> None:
             batch = self._read(conn, bot, key)
             if batch.get('runner') != runner or batch['state'] != 'running':
-                raise TaskError('批次已取消或中断')
-            for item in batch['items']:
-                if item['status'] == 'pending':
-                    item['status'] = 'not_started'
-            batch.update(state=state, specified=None)
+                raise GuardRefusedError('批次已取消或中断')
+            self._unstarted(batch).update(state=state, sealed_password=None)
             self._save(conn, bot, batch)
 
         await self.store.atomic(stop)
@@ -296,11 +317,19 @@ class PasswordBatches:
             await self._update(bot, key, runner, index, status='existing', task=child['id'])
             return
         await self._update(bot, key, runner, index, status='linked', task=child['id'])
+
+        def still_running(conn: sqlite3.Connection) -> None:
+            # Same transaction as the task claim: a cancelled, interrupted or stale batch starts nothing.
+            batch = self._read(conn, bot, key)
+            if batch.get('runner') != runner or batch['state'] != 'running' or batch['cancel_requested']:
+                raise GuardRefusedError('批次已取消或中断')
+
         try:
-            started = await self.tasks.confirm(bot, child['id'], actor, new_password=new_password, expect_digest=item['digest'])
+            started = await self.tasks.confirm(bot, child['id'], actor, new_password=new_password, expect_digest=item['digest'], guard=still_running)
+        except GuardRefusedError:
+            raise
         except TaskError as error:
-            message = str(error)
-            status = 'changed' if '变化' in message else 'input_rejected' if '旧密码相同' in message else 'failed'
+            status = 'changed' if isinstance(error, AccountChangedError) else 'input_rejected' if isinstance(error, SamePasswordError) else 'failed'
             await self._update(bot, key, runner, index, status=status)
             return
         if started['id'] != child['id']:
@@ -320,9 +349,15 @@ class PasswordBatches:
             status = await asyncio.wait_for(self.notify(bot, await self.view(bot, batch)), timeout=10)
             if status not in {'sent', 'failed', 'unknown', 'unavailable'}:
                 status = 'unknown'
+        except asyncio.CancelledError:
+            # The message may already have reached the platform: unknown, never "not sent".
+            await asyncio.shield(self._record_notice(bot, key, runner, 'unknown'))
+            raise
         except Exception:
             status = 'unknown'
+        await self._record_notice(bot, key, runner, status)
 
+    async def _record_notice(self, bot: str, key: str, runner: str, status: str) -> None:
         def record(conn: sqlite3.Connection) -> None:
             current = self._read(conn, bot, key)
             if current.get('runner') == runner:
@@ -337,10 +372,7 @@ class PasswordBatches:
         def mark(conn: sqlite3.Connection) -> Record:
             batch = self._read(conn, bot, key)
             if batch['state'] in {'selected', 'running'}:
-                for item in batch['items']:
-                    if item['status'] == 'pending':
-                        item['status'] = 'not_started'
-                batch.update(state='cancelled', cancel_requested=True, specified=None)
+                self._unstarted(batch).update(state='cancelled', cancel_requested=True, sealed_password=None)
                 self._save(conn, bot, batch)
             return batch
 

@@ -494,7 +494,7 @@ class Ninja3:
         else:
             batch = await self.password_batches.get(bot, argument)
         # Accepted is not success: the summary reports each account separately.
-        await self.reply(event, self.batch_summary(batch, detailed=bool(event.is_direct)))
+        await self.reply(event, self.batch_summary(batch, detailed=private))
 
     async def password_command(self, event):
         if not self.is_owner(event):
