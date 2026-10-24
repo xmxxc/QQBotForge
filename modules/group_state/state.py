@@ -21,6 +21,7 @@ from .notifications import Notifications
 from .reader import ROLES, MembershipReader
 from .reader import native as valid_native
 from .storage import ExtensionStore
+from .text import owner_reply, short_reply
 
 PREFIX = '/api/ext/group-state/'
 MESSAGE_TYPES = {'GROUP_AT_MESSAGE_CREATE', 'GROUP_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE'}
@@ -950,27 +951,26 @@ class GroupState:
                 raise observation_error
             words = text.split()
             if words == ['群状态', '恢复']:
-                result = {'ready': await self.rebuild(event.appid)}
+                operation, result = 'rebuild', {'ready': await self.rebuild(event.appid)}
             elif len(words) == 3 and words[1] == '刷新':
-                result = await self.refresh(event.appid, words[2])
+                operation, result = 'refresh', await self.refresh(event.appid, words[2])
             elif len(words) == 3 and words[1] == '名册':
-                result = await self.sync_roster(event.appid, words[2])
+                operation, result = 'roster', await self.sync_roster(event.appid, words[2])
             elif len(words) == 4 and words[1] == '核验':
-                result = await self.verify_member(event.appid, words[2], words[3])
+                operation, result = 'member', await self.verify_member(event.appid, words[2], words[3])
             elif text.startswith('群状态 确认 '):
                 data = json.loads(text.split(maxsplit=2)[2])
                 if not isinstance(data, dict) or set(data) - {'group', 'member', 'evidence', 'member_role'}:
                     raise ValueError('人工确认须为成员事实对象')
+                operation = 'confirm'
                 result = await self.confirm_member(
                     event.appid, data.get('group'), data.get('member'), evidence=data.get('evidence'), member_role=data.get('member_role')
                 )
             elif len(words) == 1:
-                result = await self.snapshot(event.appid)
+                operation, result = 'overview', await self.snapshot(event.appid)
             else:
                 raise ValueError('群状态 / 群状态 刷新或名册 <群ID> / 群状态 核验 <群ID> <成员ID> / 群状态 确认 <JSON>')
-            content = (
-                '已知群状态已处理，详情请在主人私聊或已登录后台查看' if event.is_group else '已知群（不代表全部群）\n' + json.dumps(result, ensure_ascii=False)
-            )
+            content = short_reply(operation) if event.is_group else owner_reply(operation, result, pause=self._pause_reason(event.appid))
         except ValueError as error:
             content = str(error)
         except (RuntimeError, sqlite3.Error, OSError):

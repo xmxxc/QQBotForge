@@ -361,7 +361,9 @@ async def test_malformed_platform_role_is_a_historical_error(group_host, role, e
         host.sender.messages.clear()
         await host.event('群状态 刷新 group-a')
         assert len(host.sender.messages) == 1
-        result = json.loads(host.sender.messages[-1][2].split('\n', 1)[1])
+        # The owner reply is a Chinese summary (#62); the facts it summarises come from the module.
+        assert host.sender.messages[-1][2].startswith('群刷新结果\n群 group-a：未知（平台返回无法识别）\n历史记录：Bot 在群（管理员）')
+        result = (await host.state.snapshot('bot-a'))['groups'][0]
     assert not result['reliable'] and result['status'] == 'historical'
     assert result['reason'] == 'response_unknown' and result['bot_state'] == previous['bot_state']
     assert (await host.state.snapshot('bot-a'))['groups'][0] == result

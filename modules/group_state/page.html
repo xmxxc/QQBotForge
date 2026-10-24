@@ -11,32 +11,74 @@
 <p><label>成员原生标识 <input id="gs-member" maxlength="256"></label> <button id="gs-verify">自动核验单人</button></p>
 <p><label>主人核验依据 <input id="gs-evidence" maxlength="1000"></label> <label>已核实角色 <select id="gs-role"><option value="">角色未知</option><option value="member">普通成员</option><option value="admin">管理员</option><option value="owner">群主</option></select></label> <button id="gs-confirm">记录单人事实</button></p>
 <p>以上仅记录群事实，不授予功能资格。错误结果保留历史，不能直接认定成员离群。普通成员无此页面管理权限。</p>
-<p id="gs-status" role="status"></p><pre id="gs-output" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
+<p id="gs-status" role="status"></p><div id="gs-summary" style="white-space:pre-wrap;overflow-wrap:anywhere"></div>
+<details><summary>原始字段（主人详情，含原生 ID）</summary><pre id="gs-output" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre></details>
 <script>
 (()=>{
- const bot=document.getElementById('gs-bot'), status=document.getElementById('gs-status'), output=document.getElementById('gs-output');
+ const bot=document.getElementById('gs-bot'), status=document.getElementById('gs-status'), output=document.getElementById('gs-output'), summaryBox=document.getElementById('gs-summary');
  const groupInput=document.getElementById('gs-group'), next=document.getElementById('gs-next');
  let latestRequest=0, memberPage=null;
  // Pagination belongs to one Bot and group; any newer selection or request retires it.
  function clearPage(){memberPage=null;next.disabled=true;}
- // A plain label per fact, so history, unknown, in-progress and complete are not read from raw JSON alone.
+ // Same table and rules as modules/group_state/text.py, so the page and QQ replies agree; raw fields stay below.
+ const REASONS={"not_verified":"尚未核验","unknown_group":"未知群","refreshing":"正在刷新","bot_state_refreshing":"正在刷新 Bot 状态","bot_state_refreshed":"Bot 状态已刷新","roster_refreshing":"正在核验名册","roster_refreshed":"名册已核验","verifying":"正在核验","confirming":"正在记录确认","individual_verification":"单人核验后需重核名册","observed_event":"收到新群事件","observed_event_requires_refresh":"收到新群事件，需刷新","requires_verification":"需核验","join_requires_verification":"新入群，需核验","process_restart":"重启或重载后需重新核验","state_changed":"核验期间状态有变化","persistence_pending":"正在保存","persistence_failed":"保存失败","recovery_pending":"恢复基线未完成","recovery_processing":"恢复处理中","recovery_required":"需重建恢复基线","rebuilding":"正在重建恢复基线","consumer_failed":"消费通知失败","permission_denied":"平台无权限","query_failed":"查询失败","timeout":"超时","response_unknown":"平台返回无法识别","unsupported":"当前 Bot 不支持查询","refresh_failed":"刷新失败","roster_failed":"名册核验失败","verification_failed":"核验失败","confirmation_failed":"确认失败","refresh_cancelled":"刷新已取消","roster_cancelled":"名册核验已取消","verification_cancelled":"核验已取消","confirmation_cancelled":"确认已取消","empty_roster":"平台返回空名册","role_missing":"缺少角色","stale_membership":"部分成员角色未知","known_member_missing":"已知成员不在名册中","pagination_conflict":"分页数据冲突","pagination_limit":"分页超出上限","bot_identity_unknown":"无法确认本 Bot 群内身份","bot_identity_conflict":"本 Bot 身份与名册矛盾","lifecycle_changed":"群成员变化","bot_added_requires_baseline":"Bot 入群，需重建恢复基线","bot_removed":"Bot 已被移出","missing_native_group":"事件缺少群标识","late_event":"事件迟到","same_time_conflict":"同一时刻事件冲突","conflicting_duplicate":"重复事件内容冲突","incomplete_event":"事件字段不完整","baseline_established":"已建立恢复基线","missing_sequence":"事件序号缺失","overflow":"待补发事件过多","unobserved_dispatch":"有未处理的事件","unproven_event_source":"事件来源无法证明","old_callback_running":"旧回调仍在运行","consumer_invalidated":"消费方要求重建","dependency_invalidated":"依赖模块要求重建","unconfirmed":"事件处理未确认完成","error":"事件处理出错","cancelled":"事件处理已取消","unloaded":"模块已卸载"};
+ const PROGRESS=new Set(['refreshing','bot_state_refreshing','roster_refreshing','verifying','confirming','persistence_pending','recovery_processing','rebuilding']);
+ const UNKNOWN=new Set(['','not_verified','unknown_group','response_unknown','unsupported']);
+ const ROLES={owner:'群主',admin:'管理员',member:'成员'};
+ const reasonText=code=>code?(REASONS[code]||'其他原因（'+code+'）'):'';
  function label(fact){
-  const reason=fact?.reason||'';
+  const reason=fact?.reason||fact?.continuity_reason||'';
   if(fact?.complete===true)return '完整';
-  if(fact?.reliable===true)return '已核验';
-  if(/refreshing|verifying|confirming/.test(reason))return '进行中';
-  if(!fact||fact.state==='unknown'||!reason||reason==='not_verified'||reason==='unknown_group')return '未知'+(reason?'（'+reason+'）':'');
-  return (fact.status==='pending'?'待核验':'历史')+'（'+reason+'）';
+  if(fact?.reliable===true)return '可靠（已核验）';
+  if(reason==='recovery_pending')return '暂停使用（恢复基线未完成）';
+  if(PROGRESS.has(reason))return '处理中（'+reasonText(reason)+'）';
+  if(reason==='permission_denied')return '无权限（平台无权限）';
+  if(reason.endsWith('_failed')||reason==='timeout')return '失败（'+reasonText(reason)+'）';
+  if(fact?.state==='unknown'||UNKNOWN.has(reason))return '未知'+(reason?'（'+reasonText(reason)+'）':'');
+  if(fact?.status==='pending'||fact?.status==='observed')return '待核验（'+reasonText(reason)+'）';
+  return '历史（'+reasonText(reason)+'）';
  }
- function summary(data){
-  if(Array.isArray(data?.groups))return '已知群（非全部）：'+(data.groups.map(g=>g.group+' '+label(g)+'，名册'+label(g.roster)).join('；')||'暂无');
-  if(data?.roster)return '名册'+label(data.roster)+'，本页成员见下方';
-  return ('complete' in (data||{})?'名册本次结果':'结果')+label(data);
+ const paused=fact=>fact?.continuity_reason==='recovery_pending'&&fact.reason?'；恢复基线未完成，暂不可用':'';
+ const when=value=>typeof value==='number'?new Date(value*1000).toLocaleString('zh-CN',{hour12:false}):'未查询';
+ const role=value=>ROLES[value]||'角色未知';
+ const botMark=(value,own)=>own?'，本 Bot':value===true?'，Bot':value===false?'':'，是否 Bot 未知';
+ function botState(group){
+  const state=group?.bot_state;
+  if(!state||typeof state!=='object')return 'Bot 在群状态未知';
+  const proactive=state.allow_proactive_msg===true?'允许主动消息':state.allow_proactive_msg===false?'不允许主动消息':'主动消息未知';
+  return (group.reliable===true?'':'历史记录：')+'Bot 在群（'+role(state.member_role)+'），'+proactive;
+ }
+ // Only the phase is public here; processing needs a later retry, anything else a rebuild.
+ function recoveryLine(recovery){
+  if(recovery.ready===true)return '恢复基线：已就绪';
+  const state=['processing','recovering'].includes(recovery.phase)?'处理中，请稍后再查看':'需重建，请点击“重建恢复基线”';
+  const reason=reasonText(recovery.reason);
+  return '恢复基线：未就绪（'+state+(reason?'；原因：'+reason:'')+'）';
+ }
+ const memberLine=(m,own)=>m.member+'：'+label(m)+paused(m)+'，'+role(m.member_role)+botMark(m.bot,own)+(m.status==='left'?'，已离群':'');
+ // Headline for the status line and readable lines for the summary block.
+ function summary(data,action){
+  if(action==='rebuild')return [data?.ready===true?'恢复基线重建：已完成，事实恢复可用':'恢复基线重建：未完成，事实仍暂停使用，请查看未就绪或待核验的群／成员后重试',[]];
+  if(Array.isArray(data?.groups)){
+   const recovery=data.recovery||{};
+   return ['已知群（非全部）：'+(data.groups.map(g=>g.group+' '+label(g)+'，名册'+label(g.roster)).join('；')||'暂无'),
+    [recoveryLine(recovery),
+     ...data.groups.map(g=>g.group+'：'+label(g)+paused(g)+'；'+botState(g)+'；最近查询 '+when(g.checked_at)+'；名册'+label(g.roster))]];
+  }
+  if(action==='members')return ['已知成员：名册'+label(data?.roster)+'，本页 '+(data?.members||[]).length+' 人',(data?.members||[]).map(m=>memberLine(m))];
+  if(action==='roster'){
+   const complete=data?.complete===true, members=data?.members||[];
+   return ['名册核验：'+(complete?'完整':'不完整，原因：'+(reasonText(data?.reason||data?.continuity_reason)||'未知')),
+    ['本轮读到 '+members.length+' 人（'+(complete?'可作全群名单':'仅本轮观察，不能作全群名单')+'）',...members.map(m=>m.member+'：'+role(m.member_role)+botMark(m.bot,m.member===data.self_member)),
+     ...(data?.missing_known_members?.length?['名册缺少的已知成员：'+data.missing_known_members.join('、')]:[])]];
+  }
+  if(action==='refresh')return ['刷新结果：'+data?.group+' '+label(data)+paused(data),[botState(data),'最近查询 '+when(data?.checked_at)]];
+  return [(action==='confirm-member'?'人工确认：':'单人核验：')+memberLine(data||{}),['最近查询 '+when(data?.checked_at)]];
  }
  async function run(action='', nextPage=false){
   const request=++latestRequest, appid=bot.value, group=groupInput.value.trim(), page=nextPage?memberPage:null;
   const isCurrent=()=>request===latestRequest&&appid===bot.value&&(!action||group===groupInput.value.trim());
-  clearPage();output.textContent='';status.textContent='正在读取…';
+  clearPage();output.textContent='';summaryBox.textContent='';status.textContent='正在读取…';
   try {
    const query=new URLSearchParams({bot:appid});
    if(action==='members'){
@@ -54,14 +96,15 @@
    if(!isCurrent())return;
    if(!response.ok||!data.success)throw Error(data.error||data.message||'读取失败');
    if(action==='members'&&data.data?.group===group){memberPage=data.data;next.disabled=!memberPage.next_cursor;}
-   output.textContent=JSON.stringify(data.data,null,2);status.textContent='已更新：'+summary(data.data);
-  }catch(error){if(isCurrent()){status.textContent=error.message;output.textContent='';}}
+   const [headline,lines]=summary(data.data,action);
+   output.textContent=JSON.stringify(data.data,null,2);summaryBox.textContent=lines.join('\n');status.textContent='已更新：'+headline;
+  }catch(error){if(isCurrent()){status.textContent=error.message;output.textContent='';summaryBox.textContent='';}}
  }
  document.getElementById('gs-rebuild').onclick=()=>run('rebuild');document.getElementById('gs-load').onclick=()=>run();document.getElementById('gs-refresh').onclick=()=>run('refresh');
  document.getElementById('gs-roster').onclick=()=>run('roster');document.getElementById('gs-members').onclick=()=>run('members');
  next.onclick=()=>run('members',true);document.getElementById('gs-verify').onclick=()=>run('member');
  document.getElementById('gs-confirm').onclick=()=>run('confirm-member');
- groupInput.oninput=()=>{++latestRequest;clearPage();output.textContent='';status.textContent='请选择操作读取当前群';};
+ groupInput.oninput=()=>{++latestRequest;clearPage();output.textContent='';summaryBox.textContent='';status.textContent='请选择操作读取当前群';};
  bot.onchange=()=>run();
  fetch('/api/bots',{credentials:'same-origin'}).then(r=>r.json()).then(data=>{
   const rows=data.data?.bots||data.bots||[];
