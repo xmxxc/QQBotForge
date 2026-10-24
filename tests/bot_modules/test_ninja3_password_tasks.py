@@ -933,3 +933,110 @@ async def test_settling_held_result_blocks_retry_release_and_recover(changing, m
     assert (await host.action(task, 'retry'))[0] == 200
     await host.finished()
     assert host.center.changes == 2
+
+
+async def held_rejection_receipt(host, monkeypatch, old_status):
+    """A held rejection whose recover is waiting inside the real notify call; later notices return sent."""
+    module = sys.modules[type(host.tasks).__module__]
+    monkeypatch.setattr(module, 'RESULT_WRITE_RETRIES', (0,))
+    monkeypatch.setattr(module, 'HELD_RESULT_RETRIES', (3600,))
+    real = host.tasks._mutate
+    locked = [True]
+
+    async def flaky(bot, key, **changes):
+        if locked[0] and changes.get('runner'):
+            raise sqlite3.OperationalError('database is locked')
+        return await real(bot, key, **changes)
+
+    monkeypatch.setattr(host.tasks, '_mutate', flaky)
+    host.center.change_result = httpx.Response(200, json={'code': 1300})
+    task = await host.select()
+    await host.action(task)
+    await host.finished()
+    entered, proceed, notices = asyncio.Event(), asyncio.Event(), []
+
+    async def notify(bot, view):
+        notices.append(view)
+        if len(notices) > 1:
+            return 'sent'
+        entered.set()
+        await proceed.wait()
+        if old_status == 'raises':
+            raise RuntimeError('fake notice transport failure')
+        return old_status
+
+    monkeypatch.setattr(host.tasks, 'notify', notify)
+    locked[0] = False
+    recovery = asyncio.create_task(host.tasks.recover('bot-a', task['id']))
+    await asyncio.wait_for(entered.wait(), 5)
+    return task, recovery, proceed, notices
+
+
+@pytest.mark.parametrize('where', ['subprocess', 'connection'])
+@pytest.mark.parametrize('new_outcome', ['reported_success', 'rejected'])
+@pytest.mark.parametrize('old_status', ['sent', 'failed', 'raises'])
+async def test_old_receipt_never_marks_a_retried_attempt(changing, monkeypatch, where, new_outcome, old_status):
+    host = changing
+    task, recovery, proceed, notices = await held_rejection_receipt(host, monkeypatch, old_status)
+    for action in ('retry', 'release', 'recover'):
+        assert (await host.action(task, action))[0] == 422  # this instance still settles the old attempt
+    if where == 'subprocess':
+        (retried,) = await other_process(host, ['retry', task['id'], 'backend'])
+    else:
+        other_store = ExtensionStore(host.tasks.store.path)
+        other = PasswordTasks(other_store, cipher=IntentCipher(str(host.key_file)), notify=host.tasks.notify)
+        other._start = lambda *args: None
+        retried = await other.retry('bot-a', task['id'], 'backend')
+        other_store.close()
+    assert retried['state'] == 'prepared'  # a legitimate new attempt is not blocked by the old receipt
+    during = await raw_task(host, task)
+    proceed.set()
+    await asyncio.wait_for(recovery, 5)
+    after = await raw_task(host, task)
+    assert during == after and (after['state'], after['notification'], after.get('runner')) == ('prepared', 'not_attempted', None)
+    assert [view['remote'] for view in notices] == ['rejected']  # delivered externally, recorded on the old attempt only
+    if new_outcome == 'reported_success':
+        host.center.change_result = httpx.Response(200, json={'code': 100})
+    host.tasks._start('bot-a', task['id'])
+    await host.finished()
+    final = await task_info(host, task)
+    assert (final['remote'], final['notification']) == (new_outcome, 'sent')
+    assert [view['remote'] for view in notices] == ['rejected', new_outcome] and host.center.changes == 2
+    assert host.tasks.is_paused('bot-a', host.account['id']) == (new_outcome == 'rejected')
+
+
+async def test_cancelled_receipt_records_unknown_and_frees_management(changing, monkeypatch):
+    host = changing
+    task, recovery, proceed, notices = await held_rejection_receipt(host, monkeypatch, 'sent')
+    recovery.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await recovery
+    raw = await raw_task(host, task)
+    # The request may already have reached the platform: unknown, not "not sent".
+    assert (raw['remote'], raw['notification']) == ('rejected', 'unknown') and not host.tasks.flushing
+    assert (await host.action(task, 'release'))[0] == 200
+    assert not host.tasks.is_paused('bot-a', host.account['id']) and host.center.changes == 1
+
+
+async def test_receipt_is_sent_once_per_attempt(changing, monkeypatch):
+    host = changing
+    notices = []
+
+    async def notify(bot, view):
+        notices.append(view)
+        return 'sent'
+
+    monkeypatch.setattr(host.tasks, 'notify', notify)
+    host.center.change_result = httpx.Response(200, json={'code': 1300})
+    task = await host.select()
+    await host.action(task)
+    await host.finished()
+    old_runner = (await raw_task(host, task))['runner']
+    await host.tasks._receipt('bot-a', task['id'], old_runner)  # repeated receipt for the same attempt
+    assert len(notices) == 1
+    host.center.change_result = httpx.Response(200, json={'code': 100})
+    assert (await host.action(task, 'retry'))[0] == 200
+    await host.finished()
+    await host.tasks._receipt('bot-a', task['id'], old_runner)  # stale receipt for the previous attempt
+    assert [view['remote'] for view in notices] == ['rejected', 'reported_success']
+    assert (await task_info(host, task))['notification'] == 'sent'

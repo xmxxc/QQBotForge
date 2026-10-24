@@ -420,17 +420,20 @@ class PasswordTasks:
         except Exception:
             # No raw exceptions or intent; active=1 and the durable marker keep it paused.
             return
-        await self._settle(bot, key)
+        await self._settle(bot, key, runner)
 
-    async def _settle(self, bot: str, key: str) -> None:
+    async def _settle(self, bot: str, key: str, runner: str | None) -> None:
+        """Local commit and receipt for the attempt that wrote the result; a retried task is a new attempt."""
         try:
             task = await self.store.atomic(lambda conn: self._read(conn, bot, key))
+            if task.get('runner') != runner:
+                return
             if task['remote'] == RemoteStatus.REPORTED_SUCCESS:
                 try:
                     await self._commit_local(bot, key)
                 except Exception:
-                    await self._mutate(bot, key, error='local_commit_failed')
-            await self._receipt(bot, key)
+                    await self._mutate(bot, key, runner=runner, error='local_commit_failed')
+            await self._receipt(bot, key, runner)
         except Exception:
             # No raw exceptions or intent; active=1 keeps the account paused for recovery.
             return
@@ -471,7 +474,7 @@ class PasswordTasks:
                 # Not written (storage error or cancellation): hold it again unless re-held meanwhile.
                 self.held.setdefault((bot, key), held)
                 raise
-            await self._settle(bot, key)
+            await self._settle(bot, key, runner)
             return True
         finally:
             self.flushing.discard((bot, key))
@@ -515,7 +518,7 @@ class PasswordTasks:
         except Exception:
             # The known remote success is already durable, even with a lost key/disk.
             return await self.get(bot, key)
-        await self._receipt(bot, key)
+        await self._receipt(bot, key, task.get('runner'))
         return await self.get(bot, key)
 
     async def retry(self, bot: str, key: str, actor: str) -> Record:
@@ -576,17 +579,35 @@ class PasswordTasks:
             worker.cancel()
         return self.public(task)
 
-    async def _receipt(self, bot: str, key: str) -> None:
-        task = await self.get(bot, key)
-        if task['notification'] == 'sent':
+    async def _receipt(self, bot: str, key: str, runner: str | None) -> None:
+        """Notify about one attempt (identified by its runner) and record the outcome only on that attempt."""
+        task = await self.store.atomic(lambda conn: self._read(conn, bot, key))
+        if task.get('runner') != runner or task['notification'] == 'sent':
             return
         try:
-            status = await asyncio.wait_for(self.notify(bot, task), timeout=10)
+            status = await asyncio.wait_for(self.notify(bot, self._view(bot, task)), timeout=10)
             if status not in {'sent', 'failed', 'unknown', 'unavailable'}:
                 status = 'unknown'
+        except asyncio.CancelledError:
+            # The request may already have reached the platform: record unknown, never "not sent".
+            await asyncio.shield(self._record_notice(bot, key, runner, 'unknown'))
+            raise
         except Exception:
             status = 'unknown'
-        await self._mutate(bot, key, notification=status)
+        await self._record_notice(bot, key, runner, status)
+
+    async def _record_notice(self, bot: str, key: str, runner: str | None, status: str) -> None:
+        def record(conn: sqlite3.Connection) -> bool:
+            task = self._read(conn, bot, key)
+            if task.get('runner') != runner:
+                return False
+            task['notification'] = status
+            self._save(conn, bot, task)
+            return True
+
+        # Completed tasks are no longer active, so this compares the attempt only.
+        if not await self.store.atomic(record):
+            log.warning('改密任务旧尝试回执已%s，任务已重试，未记入当前尝试: %s', status, key)
 
     async def shutdown(self) -> None:
         self.closed = True
