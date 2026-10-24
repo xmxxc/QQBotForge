@@ -111,3 +111,13 @@ sed -n '/<script>/,/<\/script>/p' plugins/ninja3/page.html | sed '1s/.*<script>/
   - mypy（显式三个插件模块，配置同审查者）通过，0 问题。
   - 平铺 ci-assets `04d901726cc6d94bae1b2b5524521f997a326e10` 的完整测试，在带 playwright 的环境中 866 passed，0 skipped。
 - **保留**：F2–F7（P3）未在本轮处理。
+
+## 发送准备边界与目录读取（#74 审查 F1/F2 基础层，2026-10-24）
+
+来源：#74 独立审查 F1（真实 `before_send` 准备之后缺少最终复查）、F2（目录解码完整凭据）。旧文字查询 `账号列表`／`账号 名称` 在本层闭环；菜单、共享选择和降级在 #74 分支合入本层后处理。作者自查，未独立复核。
+
+- **基线**：#72 `129df14178d1f551b06bc131a73aacde74c30255`（tree `10a5d691f06e396c78e833bc3f889fb120897709`）。
+- **F1**：插件实例加载时经公开 `app.hook_manager` 以 `math.inf` 优先级注册 `before_send` 回调；敏感回复经 contextvar 携带同步检查，在框架管道末尾、首次 `post_json` 前再执行，变化即拦截并改发不含账号内容的提示。发送前用公开 `list_hooks()` 确认本实例回调是最后一项，否则拒发。检查出错按变化处理，结果未知不重发。
+- **F2**：`ExtensionStore.project` 用 SQLite JSON 投影只返回 `id/name/enabled/open_groups`；`账号 名称` 在调用和查看决定都通过后，才 `get` 该一个账号的完整记录。
+- **红绿**：`tests/bot_modules/test_ninja3_send_gate.py` 用真实 MessageSender 与 HookManager，仅替换平台 `post_json`，在另一个 `before_send` 准备等待期间注入改密、停用、关群、授权管理收窄、撤权、拒绝、离群、授权模块重载、插件重载。放在 `129df14` 上：21 failed／2 passed（仅两项无变化对照通过）；本层：23 passed。
+- **框架缺口（未修复，须独立 main 修复与审查）**：`_HttpMixin._request` 在管道之后仍可能 await `get_token()` 刷新令牌，再发出首个请求；这段窗口内的撤权，任何 `before_send` 回调都看不到。可执行反例在交付证据 `test_gap_token_refresh.py`（缺口存在时通过）。最小接口建议：`_send_with_error_handling` 在 `before_send` 管道之前先完成 `_ensure_client()` 与 `get_token()`，或在 `_request` 首次 `client.request` 前同步调用一个 `before_transport` 检查（仅首发，不含重试）。
