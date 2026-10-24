@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import functools
+import json
 import re
 import socket
 import sqlite3
@@ -705,8 +706,6 @@ asyncio.run(run())
 
 async def other_process(host, *steps):
     """A second real process on the same DB: initialize, then legitimate task operations."""
-    import json
-
     child = await asyncio.create_subprocess_exec(
         sys.executable,
         '-c',
@@ -847,7 +846,7 @@ async def test_decided_success_held_through_real_write_lock_then_local_only(chan
     assert account['password'] == host.tasks._intent('bot-a', raw)['new_password'] and host.center.changes == 1
 
 
-@pytest.mark.parametrize('ending', ['background', 'exit'])
+@pytest.mark.parametrize('ending', ['background', 'rejected', 'exit'])
 async def test_held_result_background_flush_or_process_exit(changing, monkeypatch, ending):
     host = changing
     module = sys.modules[type(host.tasks).__module__]
@@ -862,6 +861,8 @@ async def test_held_result_background_flush_or_process_exit(changing, monkeypatc
         return await real(bot, key, **changes)
 
     monkeypatch.setattr(host.tasks, '_mutate', flaky)
+    if ending == 'rejected':
+        host.center.change_result = httpx.Response(200, json={'code': 1300})
     task = await host.select()
     await host.action(task)
     await host.finished()
@@ -873,6 +874,17 @@ async def test_held_result_background_flush_or_process_exit(changing, monkeypatc
         await asyncio.wait_for(asyncio.gather(*host.tasks.flushers.values()), 5)
         assert ((await task_info(host, task))['local'], host.center.changes) == ('committed', 1)
         assert not host.tasks.held and not host.tasks.is_paused('bot-a', host.account['id'])
+        return
+    if ending == 'rejected':
+        # Explicit recover and the background flush race; the held rejection is written and notified once.
+        locked = False
+        sent = len(host.sender.messages)
+        status, response = await host.action(task, 'recover')
+        await asyncio.gather(*host.tasks.flushers.values())
+        assert status == 200 and response['data']['remote'] == (await task_info(host, task))['remote'] == 'rejected'
+        assert len(host.sender.messages) - sent == 1 and host.tasks.is_paused('bot-a', host.account['id'])
+        assert (await host.action(task, 'release'))[0] == 200 and host.center.changes == 1
+        assert (await host.tasks.store.get('bot-a', 'accounts', host.account['id']))['password'] == OLD
         return
     # Process exit loses only the result the store never accepted: restart is conservative unknown.
     await host.plugins.reload('ninja3')

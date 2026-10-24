@@ -3,7 +3,6 @@
 import asyncio
 import hashlib
 import json
-import logging
 import os
 import secrets
 import sqlite3
@@ -17,12 +16,14 @@ from uuid import uuid4
 
 from cryptography.fernet import Fernet
 
+from core.base.logger import PLUGIN, get_logger
+
 from .password_protocol import ChangeInput, ChangeResult, RemoteStatus, change_password
 from .storage import ExtensionStore
 
 Record = dict[str, Any]
-log = logging.getLogger(__name__)
-# Seconds between attempts to persist a decided remote result (about half a minute in total).
+log = get_logger(PLUGIN, '忍者必须死3')  # type: ignore[no-untyped-call]  # project logger is untyped
+# Seconds between attempts to persist a decided remote result (seven writes over about 20 seconds).
 RESULT_WRITE_RETRIES = (0.2, 0.5, 1, 2, 5, 10)
 # After that, a decided result stays in this process; background flushes back off, then
 # only an explicit recover retries (no busy loop, no unbounded blocking of entry points).
@@ -415,6 +416,7 @@ class PasswordTasks:
             self._hold(bot, key, runner, changes)
             return
         except Exception:
+            # No raw exceptions or intent; active=1 and the durable marker keep it paused.
             return
         await self._settle(bot, key)
 
@@ -451,17 +453,19 @@ class PasswordTasks:
 
     async def _flush(self, bot: str, key: str) -> bool:
         """Write a held outcome under the same executor token; True if one was written."""
-        held = self.held.get((bot, key))
+        # Taken before awaiting: a concurrent recover and background flush write and notify once.
+        held = self.held.pop((bot, key), None)
         if held is None:
             return False
         runner, changes = held
         try:
             await self._mutate(bot, key, runner=runner, **changes)
         except SupersededError:
-            self.held.pop((bot, key), None)
             log.error('改密任务保留结果已被新的任务状态取代，未写入: %s', key)
             return False
-        self.held.pop((bot, key), None)
+        except BaseException:
+            self.held.setdefault((bot, key), held)
+            raise
         await self._settle(bot, key)
         return True
 
@@ -578,12 +582,12 @@ class PasswordTasks:
         self.closed = True
         for flusher in list(self.flushers.values()):
             flusher.cancel()
-        if self.held:
-            # Process exit loses only results the store never accepted; restart treats them as unknown.
-            log.error('改密执行器停止时仍有 %d 个结果未落盘，重启后按未知暂停', len(self.held))
         workers = list(self.workers.values())
         for worker in workers:
             if worker.cancelling() == 0:
                 worker.cancel()
         if workers:
             await asyncio.gather(*workers, return_exceptions=True)
+        if self.held:
+            # Process exit loses only results the store never accepted; restart treats them as unknown.
+            log.error('改密执行器停止时仍有 %d 个结果未落盘，重启后按未知暂停', len(self.held))
