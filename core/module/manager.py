@@ -314,6 +314,7 @@ class ModuleManager:
                 raise
             info.instance = result if result is not None else True
             info.error = None
+            log.info(f'{self._label(info)} 已启用')
         except BaseException as e:
             # 失败或被取消的 setup 注销本次 hook、移出半初始化模块，避免重试叠加回调；
             # 例外：另一运行中模块同显示名时 hook 无法区分归属，见 _release_owner。
@@ -322,9 +323,11 @@ class ModuleManager:
             info.ctx = info.module = None
             sys.modules.pop(f'modules.{name}', None)
             if not isinstance(e, Exception):
+                log.warning(f'{self._label(info)} 启用中断: {type(e).__name__}')
                 raise
             info.error = str(e)
-            report_error(EXTENSION, name, e)
+            log.warning(f'{self._label(info)} 启用失败: {e}')
+            report_error(EXTENSION, name, e, context={'module': name, 'version': info.version})
             return False
         return self._persist_enabled(info) if _persist else True
 
@@ -371,6 +374,12 @@ class ModuleManager:
             self.set_module_enabled_persist(name, False)
             log.info(f'模块 [{info.display_name or name}] 已禁用')
         return True
+
+    @staticmethod
+    def _label(info):
+        display = info.display_name or info.name
+        name = display if display == info.name else f'{display}({info.name})'
+        return f'模块 [{name}] v{info.version}'
 
     def _release_owner(self, info, owner):
         """注销失败启用遗留的 hook；同名 owner 仍有运行中模块时保留，避免误删其回调。"""
