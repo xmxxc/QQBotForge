@@ -88,6 +88,7 @@ def validate_account(data, *, create=False):
 class AccountSharing:
     CONSUMER = CONSUMER
     FUNCTION = FUNCTION
+    record_drain_timeout = 10  # Seconds per wait while finishing a cancelled migration's record.
 
     def __init__(self, path, *, access_provider=None, sender_provider=None, qa_provider=None, clock=time.time):
         self.store = ExtensionStore(path)
@@ -457,20 +458,109 @@ class AccountSharing:
     async def migrate(self, bot):
         """Owner-run migration of legacy authorization and plugin bindings; never widens access."""
         acl = await self.ensure(bot)
-        report = {'authorization': await acl.import_legacy(bot, CONSUMER, FUNCTION)}
-        bundle = {name: await self.store.all(bot, name) for name in ('private_identities', 'bindings', 'binding_requests')}
+        report = {}
+
+        async def stage(name, run, storage_error):
+            # Each stage reports what actually happened; a failed one keeps its own boundary.
+            try:
+                report[name] = await run()
+            except asyncio.CancelledError:
+                report[name] = {'status': 'cancelled', 'error': '操作已取消，本阶段是否已写入未知，可重新迁移'}
+                raise
+            except (AttributeError, LookupError, TypeError, json.JSONDecodeError):
+                # Before ValueError: a JSONDecodeError is one, but its text is not a reason.
+                log.warning(f'[{bot}] migration {name}: malformed legacy data', exc_info=True)
+                report[name] = {'status': 'failed', 'error': '旧资料结构无效'}
+            except (ValueError, RuntimeError) as error:
+                report[name] = {'status': 'failed', 'error': str(error)}
+            except (sqlite3.Error, OSError):
+                report[name] = {'status': 'failed', 'error': storage_error}
+
+        async def authorization():
+            result = await acl.import_legacy(bot, CONSUMER, FUNCTION)
+            changed = any(result[k] for k in ('grants', 'denies', 'revocations', 'policy_groups'))
+            return {'status': 'imported' if changed else 'unchanged', **result}
+
+        async def bindings():
+            bundle = {name: await self.store.all(bot, name) for name in ('private_identities', 'bindings', 'binding_requests')}
+            if not any(bundle.values()):
+                return {'status': 'not_run', 'reason': 'no_legacy_records', 'bindings': 0, 'requests': 0}
+            return await acl.bindings.import_history(bot, bundle)
+
+        async def rules():
+            listed = await self.qa().manage(bot, FUNCTION, 'list')
+            accounts = {a['id'] for a in await self.accounts(bot)}
+            return {'status': 'checked', 'total': len(listed), 'dangling': [r['id'] for r in listed if r['kind'] == 'resource' and r['target'] not in accounts]}
+
+        async def record(operation_id):
+            return await self.operation(
+                bot,
+                'migration',
+                id=operation_id,
+                authorization=report['authorization']['status'],
+                binding=report['bindings']['status'],
+                rules=report['rules']['status'],
+                migration=report['status'],
+                notification='pending',
+                delivery='not_requested',
+                report=report,
+            )
+
+        stages = (('authorization', authorization, '授权资料写入失败'), ('bindings', bindings, '身份资料写入失败'), ('rules', rules, '规则读取失败'))
+        operation_id = uuid4().hex
         try:
-            report['bindings'] = await acl.bindings.import_history(bot, bundle) if any(bundle.values()) else {'bindings': 0, 'requests': 0}
-        except ValueError as error:
-            report['bindings'] = {'error': str(error)}
-        rules = await self.qa().manage(bot, FUNCTION, 'list')
-        accounts = {a['id'] for a in await self.accounts(bot)}
-        report['rules'] = {'total': len(rules), 'dangling': [r['id'] for r in rules if r['kind'] == 'resource' and r['target'] not in accounts]}
-        result = await self.operation(
-            bot, 'migration', authorization='imported', binding='imported', notification='pending', delivery='not_requested', report=report
-        )
+            for name, run, storage_error in stages:
+                await stage(name, run, storage_error)
+        except asyncio.CancelledError as cancel:
+            # Earlier stages may have committed: keep a record (retry notification from 待办).
+            for name, _, _ in stages:
+                report.setdefault(name, {'status': 'not_run', 'reason': 'cancelled'})
+            report['status'] = 'cancelled'
+            await self.drain_record(bot, operation_id, report, record(operation_id))
+            raise cancel
+        import_statuses = [report[name]['status'] for name in ('authorization', 'bindings')]
+        if 'failed' in [*import_statuses, report['rules']['status']]:
+            # The rules stage only checks; success there alone is not a partial import.
+            report['status'] = 'partial' if any(s in {'imported', 'unchanged'} for s in import_statuses) else 'failed'
+        else:
+            report['status'] = 'imported' if 'imported' in import_statuses else 'unchanged'
+        write = asyncio.ensure_future(record(operation_id))
+        try:
+            result = await asyncio.shield(write)
+        except asyncio.CancelledError as cancel:
+            # Committed stages still get their record before the cancel propagates.
+            await self.drain_record(bot, operation_id, report, write)
+            raise cancel
         await self.notify_result(bot, result)
         return report
+
+    async def drain_record(self, bot, operation_id, report, write):
+        """Finish a migration's record after a cancel without letting it replace the cancel.
+
+        The write runs in its own task; later cancels only interrupt the waits, and
+        both waits are bounded. Never raises: the caller re-raises the original cancel.
+        """
+        task = asyncio.ensure_future(write)  # A task already running is drained as is.
+        await self.wait_through_cancel(task, self.record_drain_timeout)
+        if not task.done():
+            task.cancel()
+            await self.wait_through_cancel(task, self.record_drain_timeout)
+        if task.done() and not task.cancelled() and task.exception() is None:
+            return
+        # SQL already handed to the store thread may still commit after an abandoned wait.
+        outcome = 'outcome unknown' if not task.done() or task.cancelled() else f'not saved ({type(task.exception()).__name__})'
+        statuses = {name: report[name]['status'] for name in ('authorization', 'bindings', 'rules')}
+        log.error(f'[{bot}] migration operation={operation_id} interrupted by cancel, record {outcome}; stages={statuses}')
+
+    @staticmethod
+    async def wait_through_cancel(task, timeout):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while not task.done() and deadline > loop.time():
+            try:
+                await asyncio.wait({task}, timeout=deadline - loop.time())
+            except asyncio.CancelledError:
+                continue
 
     # ---------- owner results ----------
 
@@ -1146,7 +1236,10 @@ class AccountSharing:
                     raise BusinessError('方法不适用', 405)
                 return web.json_response({'success': True, 'data': result})
             if parts == ['migration'] and request.method == 'POST':
-                return web.json_response({'success': True, 'data': await self.migrate(bot)})
+                report = await self.migrate(bot)
+                if report['status'] == 'failed':
+                    return web.json_response({'success': False, 'error': '迁移未完成，各阶段原因见 data', 'data': report}, status=422)
+                return web.json_response({'success': True, 'data': report})
             if parts == ['group-delivery']:
                 if request.method == 'GET':
                     result = await self.group_delivery.list(bot)
