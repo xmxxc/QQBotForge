@@ -537,8 +537,8 @@ async def test_cancel_during_submit_marker_write_never_reaches_http(changing):
     real = host.tasks._before_submit
     entered = asyncio.Event()
 
-    async def before(bot, key):
-        await real(bot, key)
+    async def before(*args):
+        await real(*args)
         entered.set()
         await asyncio.Event().wait()
 
@@ -676,3 +676,208 @@ async def test_transient_result_write_failure_keeps_decisive_success(changing, m
     result = await task_info(host, task)
     assert failures == 0 and (result['remote'], result['local'], result['state']) == ('reported_success', 'committed', 'completed')
     assert host.center.changes == 1
+
+
+OTHER_PROCESS = r"""
+import asyncio,json,socket,sys
+from plugins.ninja3.password_tasks import IntentCipher,PasswordTasks
+from plugins.ninja3.storage import ExtensionStore
+def blocked(*args,**kwargs): raise AssertionError('no network in child')
+for name in ('connect','connect_ex'): setattr(socket.socket,name,blocked)
+socket.getaddrinfo=blocked
+async def notify(*args): return 'unavailable'
+async def forbidden(*args,**kwargs): raise AssertionError('child must not run the protocol')
+async def run():
+    store=ExtensionStore(sys.argv[1])
+    tasks=PasswordTasks(store,cipher=IntentCipher(sys.argv[2]),notify=notify,protocol=forbidden)
+    tasks._start=lambda *args: None  # leave confirmed/retried intents for the parent to start
+    await tasks.initialize()
+    out=[]
+    for step in json.loads(sys.argv[3]):
+        name,*args=step
+        out.append(await getattr(tasks,name)('bot-a',*args))
+    print(json.dumps(out))
+    await tasks.shutdown()
+    store.close()
+asyncio.run(run())
+"""
+
+
+async def other_process(host, *steps):
+    """A second real process on the same DB: initialize, then legitimate task operations."""
+    import json
+
+    child = await asyncio.create_subprocess_exec(
+        sys.executable,
+        '-c',
+        OTHER_PROCESS,
+        host.tasks.store.path,
+        str(host.key_file),
+        json.dumps(steps),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await asyncio.wait_for(child.communicate(), 20)
+    assert child.returncode == 0, err.decode()
+    return json.loads(out)
+
+
+async def test_late_start_after_other_process_release_never_submits(changing, monkeypatch):
+    host = changing
+    task = await host.select()
+    delayed = []
+    start = host.tasks._start
+    monkeypatch.setattr(host.tasks, '_start', lambda bot, key: delayed.append((bot, key)))
+    assert (await host.action(task))[0] == 200 and delayed
+    (released,) = await other_process(host, ['release', task['id']])
+    assert released['state'] == 'released' and not host.tasks.is_paused('bot-a', host.account['id'])
+    for bot, key in delayed:
+        start(bot, key)
+    await host.finished()
+    raw = await raw_task(host, task)
+    assert (raw['state'], raw['active'], raw.get('runner')) == ('released', False, None)
+    assert not host.center.requests  # never even logged in
+    assert (await host.tasks.store.get('bot-a', 'accounts', host.account['id']))['password'] == OLD
+    assert OLD in str(await host.say('账号 账号A', user='MEMBERA'))  # released: the old password is valid
+
+
+async def test_late_start_cannot_take_account_back_from_new_task(changing, monkeypatch):
+    host = changing
+    old = await host.select()
+    delayed = []
+    start = host.tasks._start
+    monkeypatch.setattr(host.tasks, '_start', lambda bot, key: delayed.append((bot, key)))
+    await host.action(old)
+    _, new, confirmed = await _release_then_new(host, old)
+    assert new['id'] != old['id'] and confirmed['state'] == 'prepared'
+    for bot, key in delayed:
+        start(bot, key)
+    await host.finished()
+    assert (await raw_task(host, old))['state'] == 'released' and not host.center.requests
+    assert (await raw_task(host, new))['state'] == 'prepared'
+    assert host.tasks.is_paused('bot-a', host.account['id'])  # the new intent's pause is untouched
+    start('bot-a', new['id'])
+    await host.finished()
+    raw = await raw_task(host, new)
+    assert (raw['state'], host.center.changes) == ('completed', 1)
+    account = await host.tasks.store.get('bot-a', 'accounts', host.account['id'])
+    assert account['password'] == host.tasks._intent('bot-a', raw)['new_password']
+
+
+async def _release_then_new(host, old):
+    released, new = await other_process(host, ['release', old['id']], ['select', host.account['id'], 'backend'])
+    (confirmed,) = await other_process(host, ['confirm', new['id'], 'backend'])
+    return released, new, confirmed
+
+
+@pytest.mark.parametrize('operation', ['release', 'retry'])
+async def test_superseded_worker_mid_flight_cannot_submit_or_overwrite(changing, operation):
+    host = changing
+    host.center.block_path = '/api/web/user_center/userinfo'
+    task = await host.select()
+    await host.action(task)
+    await host.center.entered.wait()  # this worker owns the claim and is preparing
+    args = [task['id'], 'backend'] if operation == 'retry' else [task['id']]
+    (result,) = await other_process(host, [operation, *args])  # initialize turned it paused first
+    host.center.release.set()
+    await host.finished()
+    raw = await raw_task(host, task)
+    assert host.center.changes == 0
+    if operation == 'release':
+        assert (result['state'], raw['state'], raw['active']) == ('released', 'released', False)
+        assert not host.tasks.is_paused('bot-a', host.account['id'])
+        assert (await host.tasks.store.get('bot-a', 'accounts', host.account['id']))['password'] == OLD
+        return
+    # The stale result did not overwrite the retried attempt; a fresh worker submits exactly once.
+    assert (raw['state'], raw['active'], raw.get('runner')) == ('prepared', True, None)
+    host.center.block_path = None
+    host.tasks._start('bot-a', task['id'])
+    await host.finished()
+    assert ((await raw_task(host, task))['state'], host.center.changes) == ('completed', 1)
+
+
+async def test_duplicate_start_of_one_claim_submits_once(changing):
+    host = changing
+    host.center.block_path = CHANGE
+    task = await host.select()
+    await host.action(task)
+    first = host.tasks.workers[('bot-a', task['id'])]
+    host.tasks._start('bot-a', task['id'])
+    second = host.tasks.workers[('bot-a', task['id'])]
+    await host.center.entered.wait()
+    host.center.release.set()
+    await asyncio.gather(first, second)
+    assert ((await task_info(host, task))['state'], host.center.changes) == ('completed', 1)
+
+
+async def test_decided_success_held_through_real_write_lock_then_local_only(changing):
+    """Product retry timings (about 20 s) against a real second SQLite writer."""
+    host = changing
+    await host.tasks.store.atomic(lambda conn: conn.execute('PRAGMA busy_timeout=0').fetchall())
+    blocker = sqlite3.connect(host.tasks.store.path)
+    original = host.center.handle
+
+    async def handle(request):
+        result = await original(request)
+        if request.url.path == CHANGE:
+            blocker.execute('BEGIN IMMEDIATE')
+        return result
+
+    host.tasks.protocol = functools.partial(change_password, transport=httpx.MockTransport(handle))
+    task = await host.select()
+    await host.action(task)
+    try:
+        await host.finished()
+        assert ('bot-a', task['id']) in host.tasks.held
+        # Every store transaction is IMMEDIATE, so even reads are refused while the writer holds the lock.
+        assert (await host.ninja_api('GET', 'password-tasks/' + task['id']))[0] == 503
+        status, response = await host.action(task, 'recover')
+        assert status == 422 and '保留在本进程' in response['error']
+        for action in ('retry', 'release'):
+            assert (await host.action(task, action))[0] != 200
+        assert host.tasks.is_paused('bot-a', host.account['id'])
+    finally:
+        blocker.rollback()
+        blocker.close()
+    status, response = await host.action(task, 'recover')
+    assert status == 200 and (response['data']['remote'], response['data']['local']) == ('reported_success', 'committed')
+    assert not host.tasks.held and not host.tasks.is_paused('bot-a', host.account['id'])
+    raw = await raw_task(host, task)
+    account = await host.tasks.store.get('bot-a', 'accounts', host.account['id'])
+    assert account['password'] == host.tasks._intent('bot-a', raw)['new_password'] and host.center.changes == 1
+
+
+@pytest.mark.parametrize('ending', ['background', 'exit'])
+async def test_held_result_background_flush_or_process_exit(changing, monkeypatch, ending):
+    host = changing
+    module = sys.modules[type(host.tasks).__module__]
+    monkeypatch.setattr(module, 'RESULT_WRITE_RETRIES', (0,))
+    monkeypatch.setattr(module, 'HELD_RESULT_RETRIES', (0.05, 0.05, 0.05))
+    real = host.tasks._mutate
+    locked = True
+
+    async def flaky(bot, key, **changes):
+        if locked and changes.get('runner'):
+            raise sqlite3.OperationalError('database is locked')
+        return await real(bot, key, **changes)
+
+    monkeypatch.setattr(host.tasks, '_mutate', flaky)
+    task = await host.select()
+    await host.action(task)
+    await host.finished()
+    assert ('bot-a', task['id']) in host.tasks.held
+    info = await task_info(host, task)
+    assert (info['state'], info['remote'], info['error']) == ('submitting', 'unknown', 'result_not_persisted')
+    if ending == 'background':
+        locked = False
+        await asyncio.wait_for(asyncio.gather(*host.tasks.flushers.values()), 5)
+        assert ((await task_info(host, task))['local'], host.center.changes) == ('committed', 1)
+        assert not host.tasks.held and not host.tasks.is_paused('bot-a', host.account['id'])
+        return
+    # Process exit loses only the result the store never accepted: restart is conservative unknown.
+    await host.plugins.reload('ninja3')
+    restarted = host.ninja().password_tasks
+    result = await restarted.get('bot-a', task['id'])
+    assert (result['state'], result['remote']) == ('paused', 'unknown')
+    assert restarted.is_paused('bot-a', host.account['id']) and host.center.changes == 1
+    assert (await restarted.store.get('bot-a', 'accounts', host.account['id']))['password'] == OLD
