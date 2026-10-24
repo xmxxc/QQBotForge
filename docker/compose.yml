@@ -1,7 +1,7 @@
 services:
-  elainabot:
-    image: elainabot/elainabot:latest
-    container_name: elainabot_v2
+  qqbotforge:
+    image: ghcr.io/xmxxc/qqbotforge:latest
+    container_name: qqbotforge
     restart: unless-stopped
     ports:
       - "5200:5200"

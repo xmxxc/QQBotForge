@@ -22,5 +22,5 @@ if [ -z "$(ls -A /app/modules 2>/dev/null)" ]; then
     cp -r /app/modules.defaults/* /app/modules/ 2>/dev/null || true
 fi
 
-echo ">>> 启动 ElainaBot..."
+echo ">>> 启动 QQBotForge..."
 exec python main.py "$@"

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-# ElainaBot v2 - Docker image assembled from a main source checkout.
+# QQBotForge - Docker image assembled from a main source checkout.
 FROM python:3.11-slim
 
 # 设置工作目录
@@ -26,12 +26,12 @@ RUN cp -r /app/config /app/config.defaults && \
     cp -r /app/plugins /app/plugins.defaults && \
     cp -r /app/modules /app/modules.defaults
 
-# The reusable workflow stages this file under .ci before starting the build.
-RUN install -m 0755 /app/.ci/entrypoint.sh /usr/local/bin/elainabot-entrypoint \
+# docker-publish.yml stages this file under .ci before starting the build.
+RUN install -m 0755 /app/.ci/entrypoint.sh /usr/local/bin/qqbotforge-entrypoint \
     && rm -rf /app/.ci
 
 # 暴露 Web 面板端口（与 settings.yaml 中 server.port 一致）
 EXPOSE 5200
 
 # 入口脚本：首次启动自动复制默认配置
-ENTRYPOINT ["/usr/local/bin/elainabot-entrypoint"]
+ENTRYPOINT ["/usr/local/bin/qqbotforge-entrypoint"]
