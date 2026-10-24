@@ -25,7 +25,7 @@
   - 群状态处理中或写入中（可重试）只回复“暂时无法确认查询资格，请稍后重试”，不记录。
 主人须先私聊 Bot 发送 `忍3` 登记通知地址；未登记、平台拒绝或结果未知时通知保留在后台“未授权查询通知”，可重试，重试不授权也不发账密。
 - 管理：后台接口 `GET/POST/PATCH/DELETE /api/ext/ninja3/accounts[/ID]`、`GET/POST /api/ext/ninja3/groups`、`DELETE /api/ext/ninja3/groups/<群ID>`、`GET/POST /api/ext/ninja3/notices`、`GET /api/ext/ninja3/status`、`GET /api/ext/ninja3/operations`，均需框架后台会话，返回 no-store。接口不返回密码；同 Bot 账号名称不可重复，开放群须先添加。删除群同时从所有账号移除。撤权、拒绝、到期调整使用“授权管理”的 `ninja3` 消费方。
-- 改密任务：单账号随机改密、暂停与恢复见 [改密任务接线](ninja3-password-tasks.md)；有未解决任务的账号不能改登录凭据或删除（409）。
+- 改密任务：单账号随机改密、暂停与恢复见 [改密任务接线](ninja3-password-tasks.md)，批量选择与指定密码见 [批量改密](ninja3-password-batches.md)；有未解决任务的账号不能改登录凭据或删除（409）。
 - 日志：新操作日志只记录 Bot、群、成员、账号 ID 与结果，不含密码。框架消息正文日志是否记录回复正文沿用现有约定，本插件不改变。
 
 ## 验证
