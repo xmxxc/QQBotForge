@@ -21,6 +21,7 @@ from core.message._http import (
     _is_send_check_blocked,
     _is_violation,
     _msg_seq,
+    _reject_rich_send_check,
     log,
 )
 from core.message._material import _MaterialMixin
@@ -152,6 +153,12 @@ class MessageSender(_HttpMixin, _MediaSendMixin, _MaterialMixin, _SenderLogMixin
         **kwargs,
     ):
         """回复事件消息; send_check 见 _HttpMixin._request"""
+        if send_check is not None and (
+            media is not None
+            or msg_type in (MSG_TYPE_MEDIA, MSG_TYPE_ARK, MSG_TYPE_CARD)
+            or any(key in kwargs for key in ('media', 'ark', 'card'))
+        ):
+            raise TypeError('send_check 不支持媒体、Ark、卡片和流式消息')
         if template_name:
             use_md = cfg.get_bot_setting(self._appid, 'message.use_markdown', True)
             vars_ = {'user_id': event.user_id or '', 'group_id': event.group_id or ''}
@@ -488,6 +495,12 @@ class MessageSender(_HttpMixin, _MediaSendMixin, _MaterialMixin, _SenderLogMixin
         )
 
     async def _send_push(self, endpoint, content, buttons, media, msg_type, *, send_check=None, **kwargs):
+        if send_check is not None and (
+            media is not None
+            or msg_type in (MSG_TYPE_MEDIA, MSG_TYPE_ARK, MSG_TYPE_CARD)
+            or any(key in kwargs for key in ('media', 'ark', 'card'))
+        ):
+            raise TypeError('send_check 不支持媒体、Ark、卡片和流式消息')
         skip_suffix = kwargs.pop('skip_suffix', False)
         payload = self._build_core_payload(
             content,
@@ -523,6 +536,7 @@ class MessageSender(_HttpMixin, _MediaSendMixin, _MaterialMixin, _SenderLogMixin
         if buttons:
             payload['keyboard'] = build_keyboard(buttons, self._appid)
         payload.update(kwargs)
+        _reject_rich_send_check(payload, send_check)
         return await self._post_message(endpoint, payload, send_check)
 
     async def send_image(self, target_type, target_id, image_data, content='', *, msg_id=None):

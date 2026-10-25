@@ -21,6 +21,20 @@ from core.network.access import TokenManager
 SECRET = 'fake-password-7f3a'
 
 
+@pytest.fixture
+def sample_config_dir(tmp_path):
+    """Provide the minimal config tree without relying on staged CI fixtures."""
+    (tmp_path / 'settings.yaml').write_text(
+        """server:\n  host: 0.0.0.0\n  port: 15200\nweb:\n  admin_password: test_pass\nlogging:\n  dir: log\n  insert_interval: 2\n  batch_size: 0\n  retention_days: 5\n  wal_mode: true\npip:\n  auto_install: false\n  mirror: ''\n""",
+        encoding='utf-8',
+    )
+    (tmp_path / 'bot.yaml').write_text(
+        """bots:\n  - appid: '123456'\n    secret: test_secret_123\n    robot_qq: '987654321'\n    owner_ids: ['']\n    websocket:\n      enabled: false\n    message:\n      use_markdown: true\n    identity:\n      use_union_id_for_group: false\n      use_union_id_for_channel: false\n    welcome:\n      group_welcome: false\n      new_user_welcome: false\n      friend_add_message: false\n    maintenance:\n      enabled: false\n    dedup:\n      enabled: false\n    blacklist:\n      user_list: []\n      group_list: []\n    non_at_message:\n      enabled: false\n      group_whitelist: []\n      ignore_at_other_bot: false\n""",
+        encoding='utf-8',
+    )
+    return str(tmp_path)
+
+
 class Wire:
     """外部 HTTP 传输替身: post=取 token, request=消息业务请求"""
 
@@ -368,6 +382,42 @@ async def test_unsupported_entry_rejects_check(hooks):
         with pytest.raises(TypeError):
             await call()
     assert wire.requests == []
+
+
+async def test_rich_generic_entries_reject_check_without_business_request(hooks):
+    """send_check 不得绕过通用入口发送媒体或平台专用载荷。"""
+    wire = Wire()
+    sender, _ = make_sender(wire)
+
+    def check():
+        return True
+
+    calls = (
+        lambda: sender.reply(make_event(), 'image', media={'file_info': 'f'}, send_check=check),
+        lambda: sender.reply(make_event(), 'ark', msg_type=3, send_check=check),
+        lambda: sender.reply(make_event(), 'card', msg_type=8, card={'type': 'tuwen'}, send_check=check),
+        lambda: sender.send_to_group('G1', 'image', media={'file_info': 'f'}, send_check=check),
+        lambda: sender.send_to_user('U1', 'image', media={'file_info': 'f'}, send_check=check),
+        lambda: sender.send_to_channel('C1', 'image', msg_type=7, media={'file_info': 'f'}, send_check=check),
+        lambda: sender.post_json('/v2/users/U1/messages', {'msg_type': 3, 'ark': {}}, send_check=check),
+        lambda: sender.post_json('/v2/users/U1/stream_messages', {'content_raw': 'x'}, send_check=check),
+    )
+    for call in calls:
+        with pytest.raises(TypeError):
+            await call()
+    assert wire.requests == []
+
+
+async def test_rich_generic_entries_without_check_remain_compatible(hooks):
+    wire = Wire()
+    sender, _ = make_sender(wire)
+    ok, data, payload = await sender.send_to_group(
+        'G1', 'image', media={'file_info': 'f'},
+    )
+    assert ok and data == {'id': 'msg-1'}
+    assert payload['msg_type'] == http_mod.MSG_TYPE_MEDIA
+    assert payload['media'] == {'file_info': 'f'}
+    assert len(wire.requests) == 1
 
 
 # ==================== 隔离 ====================

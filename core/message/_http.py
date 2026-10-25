@@ -18,6 +18,33 @@ MSG_TYPE_ARK = 3
 MSG_TYPE_MEDIA = 7
 MSG_TYPE_CARD = 8
 
+# Rich message payloads may involve media uploads or platform-specific
+# structures whose complete send operation is not covered by the generic
+# send_check contract.  Keep this check at the common HTTP boundary so all
+# generic MessageSender entry points fail closed before a business request.
+_RICH_MSG_TYPES = frozenset({MSG_TYPE_MEDIA, MSG_TYPE_ARK, MSG_TYPE_CARD})
+_RICH_PAYLOAD_KEYS = frozenset({'media', 'ark', 'card'})
+_SEND_CHECK_RICH_ERROR = 'send_check 不支持媒体、Ark、卡片和流式消息'
+
+
+def _has_rich_payload(payload):
+    """Return whether *payload* is a media/Ark/card message payload."""
+    if not isinstance(payload, dict):
+        return False
+    return (
+        payload.get('msg_type') in _RICH_MSG_TYPES
+        or any(key in payload for key in _RICH_PAYLOAD_KEYS)
+    )
+
+
+def _reject_rich_send_check(payload, send_check, endpoint=''):
+    """Reject send_check for rich message payloads before any HTTP request."""
+    if send_check is not None and (
+        _has_rich_payload(payload)
+        or str(endpoint).rstrip('/').endswith('/stream_messages')
+    ):
+        raise TypeError(_SEND_CHECK_RICH_ERROR)
+
 
 class MessageType:
     """消息类型枚举 (别名, 兼容 Enum 用法)"""
@@ -185,9 +212,11 @@ class _HttpMixin:
         return await self._request('GET', endpoint, **kwargs)
 
     async def post_json(self, endpoint, payload, *, send_check=None):
+        _reject_rich_send_check(payload, send_check, endpoint)
         return await self._request('POST', endpoint, json=payload, send_check=send_check)
 
     async def _post_message(self, endpoint, payload, send_check):
+        _reject_rich_send_check(payload, send_check, endpoint)
         # 仅在有检查时传参: 覆写了 post_json(endpoint, payload) 的旧子类/替身保持兼容
         if send_check is None:
             return await self.post_json(endpoint, payload)
