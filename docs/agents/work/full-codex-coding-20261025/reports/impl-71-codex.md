@@ -70,6 +70,17 @@ The emergency gate now runs before group validity and direct-message checks. Non
 
 Final red/green evidence: the prior candidate could publicly reply before reaching the emergency gate; the final focused suite is **264 passed in 53.95s**. Ruff check/format, explicit mypy, and diff checks pass. No real QQ, game, password, merge, deploy, or production operation was performed.
 
+## Final exit-CAS and authorization-silence repair
+
+The latest review found a P1 exit TOCTOU and a P2 non-owner C2C authorization leak. The repair base was `16710a031d1606327319370fddc1ecbb5f377d79` (tree `34ed8821160db092def8759ded8f9187619737f3`), and the final source repair is:
+
+- Final repair commit: `27523bb31f83a19491d5d8382e28e5b87306bdee`
+- Final repair tree: `9ee870236433702e2d46b9b96a7bb852602d44d3`
+
+Emergency exit now re-reads phase, runner handoff, account items, and child task rows inside the same SQLite transaction that writes `state=exited`, so a peer claim between a prior check and the transition cannot reopen queries. Authorization now applies the emergency owner/private/silent gate before all event-context responses, including non-owner C2C. A deterministic persisted peer-runner CAS regression and C2C privacy regression were added.
+
+Final red/green evidence: the prior candidate had a check-then-write exit window and could publicly answer non-owner C2C authorization during emergency; the final focused suite is **265 passed in 54.85s**. Ruff check/format, explicit mypy, and diff checks pass. No real QQ, game, password, merge, deploy, or production operation was performed.
+
 ## Fixed candidate
 
 - Worker: `/opt/qqbot/QQBotForge-codex-71-worker`
