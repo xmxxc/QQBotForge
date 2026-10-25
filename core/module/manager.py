@@ -128,16 +128,14 @@ class ModuleContext(BaseContext):
         """装饰器注册 hook: @ctx.hook('before_send')"""
 
         def decorator(func):
-            self.register_hook(hook_name, func, priority=priority)
+            self._hooks.register(hook_name, func, owner=self.name, priority=priority)
             return func
 
         return decorator
 
     def register_hook(self, hook_name, callback, *, priority=100):
-        """直接注册 hook 回调 (非装饰器方式)；归属本上下文实例，模块卸载或启用失败时只注销本实例的回调"""
-        if self._subscriptions_closed:
-            raise RuntimeError('module context is unloaded')
-        self._hooks.register(hook_name, callback, owner=self.name, priority=priority, _token=self)
+        """直接注册 hook 回调 (非装饰器方式)"""
+        self._hooks.register(hook_name, callback, owner=self.name, priority=priority)
 
     async def emit(self, hook_name, *args, **kwargs):
         """触发一个 hook (广播模式)"""
@@ -316,18 +314,20 @@ class ModuleManager:
                 raise
             info.instance = result if result is not None else True
             info.error = None
+            log.info(f'{self._label(info)} 已启用')
         except BaseException as e:
-            # 失败或被取消的 setup 只注销本次上下文注册的 hook、移出半初始化模块，避免重试叠加回调；
-            # 同显示名的其他运行中模块不受影响。
+            # 失败或被取消的 setup 注销本次 hook、移出半初始化模块，避免重试叠加回调；
+            # 例外：另一运行中模块同显示名时 hook 无法区分归属，见 _release_owner。
             if ctx is not None:
-                ctx._close_subscriptions()
-                self._hook_manager._unregister_token(ctx)
+                self._release_owner(info, ctx.name)
             info.ctx = info.module = None
             sys.modules.pop(f'modules.{name}', None)
             if not isinstance(e, Exception):
+                log.warning(f'{self._label(info)} 启用中断: {type(e).__name__}')
                 raise
             info.error = str(e)
-            report_error(EXTENSION, name, e)
+            log.warning(f'{self._label(info)} 启用失败: {e}')
+            report_error(EXTENSION, name, e, context={'module': name, 'version': info.version})
             return False
         return self._persist_enabled(info) if _persist else True
 
@@ -367,13 +367,25 @@ class ModuleManager:
                 await _await_if_coro(teardown_fn())
         except Exception as e:
             report_error(EXTENSION, name, e)
-        self._hook_manager._unregister_token(info.ctx)
+        self._hook_manager.unregister_owner(info.display_name or name)
         info.instance = info.ctx = None
         sys.modules.pop(f'modules.{name}', None)
         if _persist:
             self.set_module_enabled_persist(name, False)
             log.info(f'模块 [{info.display_name or name}] 已禁用')
         return True
+
+    @staticmethod
+    def _label(info):
+        display = info.display_name or info.name
+        name = display if display == info.name else f'{display}({info.name})'
+        return f'模块 [{name}] v{info.version}'
+
+    def _release_owner(self, info, owner):
+        """注销失败启用遗留的 hook；同名 owner 仍有运行中模块时保留，避免误删其回调。"""
+        if any(i is not info and i.instance is not None and (i.display_name or i.name) == owner for i in self._modules.values()):
+            return
+        self._hook_manager.unregister_owner(owner)
 
     async def reload(self, name):
         """重载模块 (teardown → 重新 import + setup), 不改变持久化状态"""

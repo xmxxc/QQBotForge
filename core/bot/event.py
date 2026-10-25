@@ -280,6 +280,47 @@ class EventHandlerMixin:
             },
         )
 
+    def _record_consumed_event(self, bot, event, appid, owner):
+        """before_event 接管的事件只记元信息 (类型/来源/接管模块)，不落正文与原始报文。"""
+        et = event.event_type
+        consumed = {'event_type': et, 'consumed_by': owner or ''}
+        if et in MESSAGE_TYPES or et == INTERACTION_CREATE:
+            at_bot = event.is_at_self if et == GROUP_MESSAGE_CREATE else True
+            bot.log_service.add_sync(
+                'message',
+                {
+                    'message_id': event.message_id or '',
+                    'user_id': event.user_id or '',
+                    'group_id': event.group_id or '',
+                    'content': '',
+                    'raw_message': '',
+                    'direction': 'receive',
+                    'at_bot': at_bot,
+                    'context': {'consumed': consumed},
+                },
+            )
+        else:
+            bot.log_service.add_sync(
+                'lifecycle',
+                {
+                    'type': et,
+                    'user_id': event.user_id or '',
+                    'group_id': event.group_id or '',
+                    'extra': json.dumps({'consumed': consumed}, ensure_ascii=False),
+                },
+            )
+        self._push_web_log(
+            'event',
+            {
+                'appid': appid,
+                'event_type': et,
+                'content': f'[模块接管] {owner or "?"}',
+                'user_id': event.user_id or '',
+                'group_id': event.group_id or '',
+                'bot_name': bot.name,
+            },
+        )
+
     # ==================== 事件入口 ====================
 
     def _prepare_event(self, event, *, transport='internal', session_id=None):
@@ -318,8 +359,10 @@ class EventHandlerMixin:
 
         # 模块可接管或转换事件；返回 None 表示已经处理，不再进入内置分发。
         if self._hook_manager.has('before_event'):
-            event = await self._hook_manager.pipeline('before_event', event)
+            original = event
+            event, owner = await self._hook_manager.pipeline_with_owner('before_event', event)
             if event is None:
+                self._record_consumed_event(bot, original, appid, owner)
                 return
             if event.appid != appid:
                 raise ValueError('before_event hook must preserve appid')
