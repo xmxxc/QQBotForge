@@ -384,6 +384,42 @@ async def test_unsupported_entry_rejects_check(hooks):
     assert wire.requests == []
 
 
+async def test_rich_generic_entries_reject_check_without_business_request(hooks):
+    """send_check 不得绕过通用入口发送媒体或平台专用载荷。"""
+    wire = Wire()
+    sender, _ = make_sender(wire)
+
+    def check():
+        return True
+
+    calls = (
+        lambda: sender.reply(make_event(), 'image', media={'file_info': 'f'}, send_check=check),
+        lambda: sender.reply(make_event(), 'ark', msg_type=3, send_check=check),
+        lambda: sender.reply(make_event(), 'card', msg_type=8, card={'type': 'tuwen'}, send_check=check),
+        lambda: sender.send_to_group('G1', 'image', media={'file_info': 'f'}, send_check=check),
+        lambda: sender.send_to_user('U1', 'image', media={'file_info': 'f'}, send_check=check),
+        lambda: sender.send_to_channel('C1', 'image', msg_type=7, media={'file_info': 'f'}, send_check=check),
+        lambda: sender.post_json('/v2/users/U1/messages', {'msg_type': 3, 'ark': {}}, send_check=check),
+        lambda: sender.post_json('/v2/users/U1/stream_messages', {'content_raw': 'x'}, send_check=check),
+    )
+    for call in calls:
+        with pytest.raises(TypeError):
+            await call()
+    assert wire.requests == []
+
+
+async def test_rich_generic_entries_without_check_remain_compatible(hooks):
+    wire = Wire()
+    sender, _ = make_sender(wire)
+    ok, data, payload = await sender.send_to_group(
+        'G1', 'image', media={'file_info': 'f'},
+    )
+    assert ok and data == {'id': 'msg-1'}
+    assert payload['msg_type'] == http_mod.MSG_TYPE_MEDIA
+    assert payload['media'] == {'file_info': 'f'}
+    assert len(wire.requests) == 1
+
+
 # ==================== 隔离 ====================
 
 
