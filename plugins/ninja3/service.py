@@ -22,6 +22,7 @@ from core.base.config import cfg
 from core.base.logger import PLUGIN, get_logger
 from core.plugin._blacklist import get_blacklist_map
 
+from .password_batches import OUTCOMES, PasswordBatches
 from .password_tasks import PasswordTasks, TaskError
 from .storage import AccountLockedError, ExtensionStore
 
@@ -96,6 +97,7 @@ class Ninja3:
         self.notice_locks = {}
         self.menus = {}  # Process-local references: reload invalidates every old menu.
         self.password_tasks = PasswordTasks(self.store, notify=self.password_receipt, clock=clock)
+        self.password_batches = PasswordBatches(self.store, self.password_tasks, notify=self.password_batch_receipt, clock=clock)
 
     @staticmethod
     def _access_module():
@@ -115,10 +117,12 @@ class Ninja3:
     async def initialize(self):
         await self.store.ready()
         await self.password_tasks.initialize()
+        await self.password_batches.initialize()
 
     def close(self):
         self.active = False
         self.password_tasks.closed = True
+        self.password_batches.closed = True
         self.store.close()
 
     def access(self):
@@ -464,6 +468,12 @@ class Ninja3:
         return self.password_tasks.is_paused(bot, account)
 
     async def password_receipt(self, bot, task):
+        return await self.owner_private(bot, self.password_summary(task))
+
+    async def password_batch_receipt(self, bot, batch):
+        return await self.owner_private(bot, self.batch_summary(batch, detailed=True))
+
+    async def owner_private(self, bot, content):
         owner = await self.store.get(bot, 'owners', 'observed_c2c')
         sender = self.sender_provider(bot)
         if (
@@ -473,13 +483,69 @@ class Ninja3:
             or owner['private_id'] in get_blacklist_map(bot, 'user')
         ):
             return 'unavailable'
-        content = self.password_summary(task)
         return self.outcome(await sender.send_to_user(owner['private_id'], content))
 
     @staticmethod
     def password_summary(task):
         labels = {'not_submitted': '尚未提交', 'reported_success': '远端报告成功', 'rejected': '远端明确拒绝', 'unknown': '远端结果未知'}
         return f'忍3改密任务 {task["id"]}：{labels[task["remote"]]}；本地 {task["local"]}；状态 {task["state"]}。详细记录可在已登录后台查看。'
+
+    @staticmethod
+    def batch_summary(batch, *, detailed):
+        """Per-item outcomes; account names only in private chat or the backend."""
+        counts = '，'.join(f'{OUTCOMES[k]} {v}' for k, v in batch['counts'].items())
+        head = f'忍3批量改密批次 {batch["id"]}（{"指定密码" if batch["mode"] == "specified" else "每账号随机"}）：{batch["state"]}；{counts}。'
+        if not detailed:
+            return head + '逐项结果请在主人私聊或后台查看。'
+        lines = [f'{item["name"]}：{OUTCOMES[item["outcome"]]}' for item in batch['items']]
+        return head + '\n' + '\n'.join(lines) + '\n通知结果可在已登录后台查看。'
+
+    async def batch_command(self, event, command, argument, actor):
+        bot = event.appid
+        # A specified password is accepted only from the owner's real C2C chat (never group,
+        # channel or channel DM). Refusals never echo the input.
+        private = event.event_type == 'C2C_MESSAGE_CREATE'
+        if command == '忍3批量改密':
+            names, specified = argument, None
+            if '指定' in argument:
+                if not private:
+                    await self.reply(event, '指定密码只接受主人私聊或已登录后台，本条未使用')
+                    return
+                match = re.fullmatch(r'(.*?)\s*(?<!\S)指定\s+(\S+)\s*', argument)
+                if not match:
+                    raise TaskError('请按“忍3批量改密 名称… 指定 新密码”发送，“指定”前后留空格')
+                names, specified = match.group(1), match.group(2)
+            tokens = [t for t in names.replace('，', ' ').replace(',', ' ').replace('、', ' ').split() if t]
+            if not tokens:
+                raise TaskError('尚未选择账号。发送“忍3批量改密 名称1 名称2”或“忍3批量改密 全部”；默认不选择')
+            accounts = await self.store.all(bot, 'accounts')
+            if tokens == ['全部']:
+                chosen = None
+            else:
+                by_name = {a['name']: a['id'] for a in accounts}
+                if any(t not in by_name for t in tokens):
+                    raise TaskError(
+                        '有账号名称不存在：' + '、'.join(t for t in tokens if t not in by_name) if private else '有账号名称不存在，请在私聊或后台核对'
+                    )
+                chosen = [by_name[t] for t in tokens]
+            batch = await self.password_batches.select(bot, actor, chosen, new_password=specified)
+            confirm = f'发送“忍3批量确认 {batch["id"]}”确认；未确认不会开始。'
+            if private:
+                scope = '\n'.join(f'{i["name"]}{"（指定密码与旧密码相同，将跳过）" if i["outcome"] == "input_rejected" else ""}' for i in batch['items'])
+                await self.reply(event, f'已选择 {len(batch["items"])} 个账号：\n{scope}\n{confirm}')
+            else:
+                await self.reply(event, f'已选择 {len(batch["items"])} 个账号，范围请在主人私聊或后台查看。{confirm}')
+            return
+        if not argument or len(argument) != 32:
+            raise TaskError('请提供有效批次编号')
+        if command == '忍3批量确认':
+            batch = await self.password_batches.confirm(bot, argument, actor)
+        elif command == '忍3批量取消':
+            batch = await self.password_batches.cancel(bot, argument)
+        else:
+            batch = await self.password_batches.get(bot, argument)
+        # Accepted is not success: the summary reports each account separately.
+        await self.reply(event, self.batch_summary(batch, detailed=private))
 
     async def password_command(self, event):
         if not self.is_owner(event):
@@ -493,6 +559,9 @@ class Ninja3:
         command, argument = pieces[0], pieces[1].strip() if len(pieces) > 1 else ''
         actor = 'qq:' + event.user_id
         try:
+            if command.startswith('忍3批量'):
+                await self.batch_command(event, command, argument, actor)
+                return
             if command == '忍3改密':
                 accounts = await self.store.all(bot, 'accounts')
                 if not argument:
@@ -993,6 +1062,27 @@ class Ninja3:
                         result = await getattr(tasks, parts[2])(bot, parts[1], 'backend')
                     else:
                         result = await getattr(tasks, parts[2])(bot, parts[1])
+                else:
+                    raise BusinessError('方法不适用', 405)
+                return web.json_response({'success': True, 'data': result})
+            if parts[0] == 'password-batches':
+                batches = self.password_batches
+                if request.method == 'GET' and len(parts) <= 2:
+                    result = await batches.list(bot) if len(parts) == 1 else await batches.get(bot, parts[1])
+                elif request.method == 'POST' and len(parts) == 1:
+                    body = await request.json()
+                    if not isinstance(body, dict) or not {'accounts'} <= set(body) <= {'accounts', 'password'}:
+                        raise TaskError('请提供 accounts（账号列表或 "all"），可选 password')
+                    chosen = body['accounts']
+                    if chosen != 'all' and not (isinstance(chosen, list) and chosen and all(isinstance(a, str) for a in chosen)):
+                        raise TaskError('请明确选择账号或 "all"，默认不选择')
+                    if 'password' in body and not isinstance(body['password'], str):
+                        raise TaskError('指定密码须为文字')
+                    result = await batches.select(bot, 'backend', None if chosen == 'all' else chosen, new_password=body.get('password'))
+                elif request.method == 'POST' and len(parts) == 3 and parts[2] in {'confirm', 'cancel'}:
+                    if await request.json() != {}:
+                        raise TaskError('批次操作不接收额外参数')
+                    result = await batches.confirm(bot, parts[1], 'backend') if parts[2] == 'confirm' else await batches.cancel(bot, parts[1])
                 else:
                     raise BusinessError('方法不适用', 405)
                 return web.json_response({'success': True, 'data': result})

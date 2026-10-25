@@ -41,6 +41,19 @@ class SupersededError(TaskError):
     """This executor no longer owns the intent: released, cancelled, retried or completed."""
 
 
+class AccountChangedError(TaskError):
+    """The account record differs from the selected version."""
+
+
+class SamePasswordError(TaskError):
+    """A specified new password equals this account's current password."""
+
+
+class GuardRefusedError(TaskError):
+    """A caller's own precondition failed: raised by a ``confirm(guard=...)`` guard, and by a batch
+    whose runner no longer owns it (cancelled, interrupted or taken over)."""
+
+
 class IntentCipher:
     """External owner-only Fernet key; never automatically generated or stored in DB."""
 
@@ -82,6 +95,19 @@ class IntentCipher:
         except Exception:
             pass
         raise TaskError('待用密码无法恢复，账号保持暂停') from None
+
+
+def password_format_error(new: str) -> str | None:
+    """Platform rules for a new password (same as the protocol check); None when acceptable."""
+    if not isinstance(new, str) or not 6 <= len(new.encode('utf-16-le')) // 2 <= 16:
+        return '指定密码须为6到16个字符'
+    if any(c.isspace() or c == '\ufeff' for c in new):
+        return '指定密码不能包含空白字符'
+    return None
+
+
+def account_digest(row: str) -> str:
+    return hashlib.sha256(row.encode()).hexdigest()
 
 
 def random_password(old: str) -> str:
@@ -228,7 +254,7 @@ class PasswordTasks:
             account_row = self._account_row(conn, bot, account)
             if not account_row:
                 raise TaskError('账号不存在')
-            digest = hashlib.sha256(account_row.encode()).hexdigest()
+            digest = account_digest(account_row)
             row = conn.execute('SELECT payload FROM ninja3_password_tasks WHERE bot=? AND account=? AND active=1', (bot, account)).fetchone()
             if row:
                 return self.public(json.loads(row[0]))
@@ -260,9 +286,23 @@ class PasswordTasks:
 
         return dict(await self.store.atomic(select))
 
-    async def confirm(self, bot: str, key: str, actor: str) -> Record:
+    async def confirm(
+        self,
+        bot: str,
+        key: str,
+        actor: str,
+        *,
+        new_password: str | None = None,
+        expect_digest: str | None = None,
+        guard: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> Record:
+        """Default: an independent random password. ``new_password`` is an owner-specified value
+        (callers must only pass it from a trusted entry); ``expect_digest`` pins the account version;
+        ``guard`` runs inside the claim transaction and may refuse it (a caller's own precondition)."""
         if self.closed:
             raise TaskError('改密执行器已停止')
+        if new_password is not None and (problem := password_format_error(new_password)):
+            raise TaskError(problem)
 
         def claim(conn: sqlite3.Connection) -> tuple[Record, bool]:
             task = self._read(conn, bot, key)
@@ -270,15 +310,20 @@ class PasswordTasks:
                 raise TaskError('请由选择账号的主人确认')
             if task['state'] != 'selected':
                 return task, False
+            if guard is not None:
+                guard(conn)
             row = conn.execute('SELECT payload FROM ninja3_password_tasks WHERE bot=? AND account=? AND active=1', (bot, task['account'])).fetchone()
             if row:
                 return json.loads(row[0]), False
             account_row = self._account_row(conn, bot, task['account'])
             if not account_row:
                 raise TaskError('账号不存在')
-            if hashlib.sha256(account_row.encode()).hexdigest() != task['account_digest']:
-                raise TaskError('账号在选择后变化，请重新选择并确认')
+            digest = account_digest(account_row)
+            if digest != task['account_digest'] or (expect_digest is not None and digest != expect_digest):
+                raise AccountChangedError('账号在选择后变化，请重新选择并确认')
             account = json.loads(account_row)
+            if new_password is not None and new_password == account['password']:
+                raise SamePasswordError('指定密码与该账号旧密码相同')
             intent = dict(
                 bot=bot,
                 id=key,
@@ -286,7 +331,7 @@ class PasswordTasks:
                 login=account['login'],
                 area='86',
                 old_password=account['password'],
-                new_password=random_password(account['password']),
+                new_password=random_password(account['password']) if new_password is None else new_password,
             )
             # Atomic claim + encrypted intent + durable pause. No network before commit.
             task.update(active=True, state='prepared', intent=self.cipher.seal(intent))
