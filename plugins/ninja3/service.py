@@ -397,12 +397,12 @@ class Ninja3:
 
     async def authorize(self, event):
         bot, group = event.appid, event.group_id
+        if self.emergency.active(bot):
+            if event.is_group and self.is_owner(event):
+                await self.owner_private(bot, '紧急模式已开启，成员查询与授权操作暂停')
+            return
         if not event.is_group or event.is_channel or not group:
             await self.reply(event, '请在要开放的群内发送：授权 @成员')
-            return
-        if self.emergency.active(bot):
-            if self.is_owner(event):
-                await self.owner_private(bot, '紧急模式已开启，成员查询与授权操作暂停')
             return
         if not self.is_owner(event):
             await self.reply(event, '仅主人可以授权')

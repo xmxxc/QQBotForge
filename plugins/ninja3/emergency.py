@@ -323,23 +323,8 @@ class EmergencyMode:
         async with self._lock(bot):
             if bot in self.runners and not self.runners[bot].done():
                 raise EmergencyError('紧急改密仍在进行，请等待所有账号有结果后再退出')
-            state = await self._get(bot)
-            if not state or state.get('state') in {'inactive', 'exited'}:
-                return self.public(state)
-            if await self._has_running_tasks(bot, state):
-                raise EmergencyError('紧急改密仍在进行，请等待所有账号有结果后再退出')
-            generation = state['generation']
-
-            def leave(conn: sqlite3.Connection) -> Record:
-                current = self._read(conn, bot)
-                if not current or current.get('generation') != generation:
-                    raise EmergencyError('紧急模式已变化，请查看后台状态')
-                current.update(state='exited', phase='exited', exit_requested=True, updated_at=self.clock())
-                self._save(conn, bot, current)
-                return current
-
             try:
-                result = await self.store.atomic(leave)
+                result = await self.store.atomic(lambda conn: self._leave_if_idle(conn, bot))
             except (sqlite3.Error, OSError, RuntimeError) as error:
                 self._fail_closed.add(bot)
                 raise EmergencyError('紧急模式退出未能保存，成员查询仍暂停') from error
@@ -347,28 +332,42 @@ class EmergencyMode:
             self._active_cache[bot] = False
             return self.public(result)
 
+    def _leave_if_idle(self, conn: sqlite3.Connection, bot: str) -> Record:
+        """CAS-like exit: read state and child task rows under one SQLite transaction."""
+        current = self._read(conn, bot)
+        if not current or current.get('state') in {'inactive', 'exited'}:
+            return current or self.public(None)
+        if current.get('phase') in {'starting', 'running'}:
+            raise EmergencyError('紧急改密仍在进行，请等待所有账号有结果后再退出')
+        if self._has_running_tasks_in_conn(conn, bot, current):
+            raise EmergencyError('紧急改密仍在进行，请等待所有账号有结果后再退出')
+        current.update(state='exited', phase='exited', exit_requested=True, updated_at=self.clock())
+        self._save(conn, bot, current)
+        return current
+
+    @staticmethod
+    def _has_running_tasks_in_conn(conn: sqlite3.Connection, bot: str, state: Record) -> bool:
+        for item in state.get('accounts', []):
+            if item.get('status') != 'running':
+                continue
+            key = item.get('task')
+            if not key:
+                return True
+            row = conn.execute('SELECT payload FROM ninja3_password_tasks WHERE bot=? AND id=?', (bot, key)).fetchone()
+            if not row:
+                return True
+            task = json.loads(row[0])
+            if task.get('state') == 'selected':
+                return True
+            if task.get('active') and task.get('state') in {'prepared', 'preparing', 'submitting', 'verifying'}:
+                return True
+        return False
+
     async def _has_running_tasks(self, bot: str, state: Record) -> bool:
         """Check durable child-task handoffs, including tasks owned by another process."""
 
         def check(conn: sqlite3.Connection) -> bool:
-            for item in state.get('accounts', []):
-                if item.get('status') != 'running':
-                    continue
-                key = item.get('task')
-                if not key:
-                    return True
-                row = conn.execute('SELECT payload FROM ninja3_password_tasks WHERE bot=? AND id=?', (bot, key)).fetchone()
-                if not row:
-                    return True
-                task = json.loads(row[0])
-                # A paused task has crossed the remote execution boundary and is
-                # safe to leave for owner recovery.  Selected and active execution
-                # states are still in the emergency handoff and block exit.
-                if task.get('state') == 'selected':
-                    return True
-                if task.get('active') and task.get('state') in {'prepared', 'preparing', 'submitting', 'verifying'}:
-                    return True
-            return False
+            return self._has_running_tasks_in_conn(conn, bot, state)
 
         try:
             return bool(await self.store.atomic(check))

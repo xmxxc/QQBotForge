@@ -204,3 +204,27 @@ async def test_restart_clears_dead_runner_and_explicit_reentry_recovers_handoff(
     await wait_emergency(host)
     assert (await restarted.status('bot-a'))['phase'] == 'complete'
     await restarted.exit('bot-a')
+
+
+async def test_exit_cas_rechecks_a_peer_runner_inside_the_transition(changing, monkeypatch):
+    host = changing
+    emergency = host.ninja().emergency
+    monkeypatch.setattr(emergency, '_start', lambda _bot: None)
+    await emergency.enter('bot-a')
+
+    def peer_claim(conn):
+        state = emergency._read(conn, 'bot-a')
+        state.update(phase='running', runner='peer-runner', runner_pid=os.getpid())
+        emergency._save(conn, 'bot-a', state)
+
+    await emergency.store.atomic(peer_claim)
+    with pytest.raises(ValueError, match='仍在进行'):
+        await emergency.exit('bot-a')
+
+    def clear_peer(conn):
+        state = emergency._read(conn, 'bot-a')
+        state.update(phase='interrupted', runner=None, runner_pid=None)
+        emergency._save(conn, 'bot-a', state)
+
+    await emergency.store.atomic(clear_peer)
+    await emergency.exit('bot-a')
