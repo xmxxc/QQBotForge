@@ -10,9 +10,98 @@ permissions:
   contents: read
   packages: write
 
+env:
+  # Pinned Docker assets (ci-assets branch of this repository). Bump the SHA
+  # to take new assets.
+  CI_ASSETS_REPOSITORY: xmxxc/QQBotForge
+  CI_ASSETS_SHA: 380ac106188995dbb2541104686230a6a0cbafd8
+  IMAGE_NAME: qqbotforge
+
 jobs:
   build:
-    uses: ElainaCore/ElainaBot_v2/.github/workflows/docker-publish.yml@ci-assets
-    with:
-      source_sha: ${{ github.sha }}
-    secrets: inherit
+    runs-on: ubuntu-latest
+    env:
+      HAS_DOCKERHUB: ${{ secrets.DOCKER_USERNAME != '' && secrets.DOCKER_PASSWORD != '' }}
+    steps:
+      - name: Checkout source revision
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          path: source
+
+      - name: Checkout Docker assets
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.CI_ASSETS_REPOSITORY }}
+          ref: ${{ env.CI_ASSETS_SHA }}
+          path: ci-assets
+          sparse-checkout: docker
+          persist-credentials: false
+
+      - name: Record revisions
+        run: |
+          source_sha=$(git -C source rev-parse HEAD)
+          assets_sha=$(git -C ci-assets rev-parse HEAD)
+          echo "ref: $GITHUB_REF"
+          echo "source: $source_sha"
+          echo "docker assets: $CI_ASSETS_REPOSITORY $assets_sha"
+          test "$source_sha" = "$GITHUB_SHA"
+          test "$assets_sha" = "$CI_ASSETS_SHA"
+
+      - name: Stage Docker build assets
+        run: |
+          mkdir -p source/.ci
+          cp ci-assets/docker/Dockerfile source/.ci/Dockerfile
+          cp ci-assets/docker/Dockerfile.dockerignore source/.ci/Dockerfile.dockerignore
+          cp ci-assets/docker/entrypoint.sh source/.ci/entrypoint.sh
+
+      # latest only moves on main; manual runs from other branches publish the
+      # commit tag alone.
+      - name: Compute image tags
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+        run: |
+          owner=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          images="ghcr.io/$owner/$IMAGE_NAME"
+          if [ "$HAS_DOCKERHUB" = "true" ]; then
+            images="$images docker.io/$(echo "$DOCKER_USERNAME" | tr '[:upper:]' '[:lower:]')/$IMAGE_NAME"
+          fi
+          {
+            echo 'TAGS<<EOF'
+            for image in $images; do
+              echo "$image:$GITHUB_SHA"
+              if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+                echo "$image:latest"
+              fi
+            done
+            echo 'EOF'
+          } >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Docker Hub is optional: skipped unless this repository has its own
+      # DOCKER_USERNAME / DOCKER_PASSWORD secrets.
+      - name: Login to Docker Hub
+        if: env.HAS_DOCKERHUB == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: source
+          file: source/.ci/Dockerfile
+          push: true
+          tags: ${{ env.TAGS }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

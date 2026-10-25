@@ -6,6 +6,8 @@
 
 回调接收 `Event`，可原样返回、返回转换后的 `Event`，或返回 `None` 表示事件已经接管。替换事件必须保留原 `appid`。Hook 按 priority 从小到大运行，返回 `None` 后停止后续 Hook 和内置处理。异常沿用通用 Hook 管道规则：记录错误并让后续回调继续接收当前事件。因此接管私有事件的模块应自行处理异常，并明确返回 `None`。
 
+被接管的事件仍留一条接收记录，但只含元信息：消息与互动事件写入消息日志（`direction='receive'`，`content`、`raw_message` 为空，`context.consumed` 记录事件类型和接管模块），其他事件写入生命周期日志（`extra` 同样只有 `consumed`）。正文和原始报文不落盘，需要时由模块自行按其脱敏规则记录。
+
 ```python
 async def setup(ctx):
     @ctx.hook('before_event', priority=0)

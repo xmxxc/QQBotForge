@@ -183,21 +183,93 @@ test('returning to a group cannot restore a request from its earlier selection',
     assert.equal(host.nodes['gs-next'].disabled, true);
 });
 
-test('the status line names complete, in-progress, unknown and historical facts', async () => {
+test('the status line names complete, in-progress, unknown and historical facts in Chinese', async () => {
     const host = await page();
-    await host.reply(host.requests[0], {bot: 'bot-a', groups: [
+    await host.reply(host.requests[0], {bot: 'bot-a', recovery: {ready: true}, groups: [
         {group: 'g1', reliable: true, status: 'verified', reason: '', roster: {complete: true, reason: ''}},
         {group: 'g2', reliable: false, status: 'pending', reason: 'refreshing', roster: {complete: false, reason: 'roster_refreshing'}},
         {group: 'g3', reliable: false, status: 'historical', reason: 'process_restart', roster: {complete: false, reason: 'not_verified'}},
     ]});
     const status = host.nodes['gs-status'].textContent;
-    assert.match(status, /g1 已核验，名册完整/);
-    assert.match(status, /g2 进行中，名册进行中/);
-    assert.match(status, /g3 历史（process_restart），名册未知（not_verified）/);
+    assert.match(status, /g1 可靠（已核验），名册完整/);
+    assert.match(status, /g2 处理中（正在刷新），名册处理中（正在核验名册）/);
+    assert.match(status, /g3 历史（重启或重载后需重新核验），名册未知（尚未核验）/);
+    assert.doesNotMatch(status, /process_restart|not_verified/);
     host.nodes['gs-roster'].onclick();
     await host.reply(host.requests.at(-1), {complete: false, reason: 'timeout', members: []});
-    assert.equal(host.nodes['gs-status'].textContent, '已更新：名册本次结果历史（timeout）');
+    assert.equal(host.nodes['gs-status'].textContent, '已更新：名册核验：不完整，原因：超时');
     host.nodes['gs-verify'].onclick();
-    await host.reply(host.requests.at(-1), {state: 'unknown', reliable: false, status: 'pending', reason: 'permission_denied'});
-    assert.equal(host.nodes['gs-status'].textContent, '已更新：结果未知（permission_denied）');
+    await host.reply(host.requests.at(-1), {member: 'm1', state: 'unknown', reliable: false, status: 'pending', reason: 'permission_denied'});
+    assert.equal(host.nodes['gs-status'].textContent, '已更新：单人核验：m1：无权限（平台无权限），角色未知，是否 Bot 未知');
+});
+
+test('summaries keep unknown fields unknown and never report a pending recovery as success', async () => {
+    const host = await page();
+    await host.reply(host.requests[0], {bot: 'bot-a', recovery: {ready: false, reason: 'incomplete_event'}, groups: [
+        {group: 'g1', reliable: false, status: 'verified', reason: '', continuity_reason: 'recovery_pending', checked_at: null,
+            bot_state: {member_role: null}, roster: {complete: false, reason: 'recovery_pending'}},
+        {group: 'g2', reliable: false, status: 'historical', reason: 'persistence_failed', roster: {complete: false, reason: 'persistence_failed'}},
+        {group: 'g3', reliable: false, status: 'historical', reason: 'future_code', roster: {complete: false, reason: 'state_changed'}},
+    ]});
+    const text = host.nodes['gs-summary'].textContent;
+    assert.match(text, /恢复基线：未就绪（需重建，请点击“重建恢复基线”；原因：事件字段不完整）/);
+    assert.match(text, /g1：暂停使用（恢复基线未完成）；历史记录：Bot 在群（角色未知），主动消息未知；最近查询 未查询/);
+    assert.match(text, /g2：失败（保存失败）/);
+    assert.match(text, /g3：历史（其他原因（future_code））；Bot 在群状态未知/);
+    assert.doesNotMatch(text, /可靠|已就绪/);
+    // Owner details keep native IDs and raw fields.
+    assert.equal(JSON.parse(host.output()).groups[2].reason, 'future_code');
+    host.nodes['gs-rebuild'].onclick();
+    await host.reply(host.requests.at(-1), {ready: false});
+    assert.match(host.nodes['gs-status'].textContent, /恢复基线重建：未完成/);
+});
+
+test('a late response cannot replace the readable summary of the current Bot', async () => {
+    const host = await page();
+    const earlier = host.requests[0];
+    host.nodes['gs-bot'].value = 'bot-b';
+    host.nodes['gs-bot'].onchange();
+    await host.reply(host.requests.at(-1), {bot: 'bot-b', recovery: {ready: true}, groups: [{group: 'gb', reliable: false, reason: 'timeout', state: 'unknown', roster: {}}]});
+    await host.reply(earlier, {bot: 'bot-a', recovery: {ready: true}, groups: [{group: 'ga', reliable: true, roster: {complete: true}}]});
+    assert.match(host.nodes['gs-summary'].textContent, /gb：失败（超时）/);
+    assert.doesNotMatch(host.nodes['gs-summary'].textContent, /ga/);
+    host.nodes['gs-group'].value = 'group-b';
+    host.nodes['gs-group'].oninput();
+    assert.equal(host.nodes['gs-summary'].textContent, '');
+});
+
+test('the status line labels the shared cases exactly like the QQ replies', async () => {
+    const cases = JSON.parse(fs.readFileSync(path.join(__dirname, 'group_state_labels.json'), 'utf8'));
+    const host = await page();
+    await host.reply(host.requests[0], {bot: 'bot-a', recovery: {ready: false, phase: 'processing'},
+        groups: cases.map(([fact], index) => ({...fact, group: 'g' + index, roster: {}}))});
+    const status = host.nodes['gs-status'].textContent;
+    cases.forEach(([, expected], index) => assert.ok(status.includes('g' + index + ' ' + expected + '，名册'), expected));
+    assert.match(host.nodes['gs-summary'].textContent, /恢复基线：未就绪（处理中，请稍后再查看）/);
+});
+
+// #87: the recovery line follows the same cases as recovery_line in text.py (test_group_state_text.py).
+const RECOVERY = JSON.parse(fs.readFileSync(path.join(__dirname, 'group_state_recovery.json'), 'utf8'));
+
+test('the recovery line names the same next step as the QQ reply', async () => {
+    for (const [name, [recovery, expected]] of Object.entries(RECOVERY)) {
+        const host = await page();
+        await host.reply(host.requests[0], {bot: 'bot-a', recovery, groups: []});
+        assert.equal(host.nodes['gs-summary'].textContent.split('\n')[0], expected.replace('{rebuild}', '请点击“重建恢复基线”'), name);
+    }
+});
+
+test('a busy notification or unfinished write never reads as ready or as a usable group', async () => {
+    const host = await page();
+    // Shapes of real snapshots (see the matching tests in test_group_state_text.py).
+    await host.reply(host.requests[0], {bot: 'bot-a', recovery: RECOVERY.notification_busy[0], groups: [
+        {group: 'g1', reliable: false, status: 'verified', reason: '', continuity_reason: 'recovery_pending', roster: {complete: false, reason: 'recovery_pending'}}]});
+    let text = host.nodes['gs-summary'].textContent;
+    assert.match(text, /^恢复基线：未就绪（处理中，请稍后再查看；原因：恢复处理中）\ng1：暂停使用（恢复基线未完成）/);
+    host.nodes['gs-load'].onclick();
+    await host.reply(host.requests.at(-1), {bot: 'bot-a', recovery: RECOVERY.write_pending[0], groups: [
+        {group: 'g1', reliable: false, status: 'pending', reason: 'persistence_pending', roster: {complete: false, reason: 'persistence_pending'}}]});
+    text = host.nodes['gs-summary'].textContent;
+    assert.match(text, /^恢复基线：未就绪（处理中，请稍后再查看；原因：正在保存）\ng1：处理中（正在保存）/);
+    assert.doesNotMatch(text, /已就绪|可靠/);
 });

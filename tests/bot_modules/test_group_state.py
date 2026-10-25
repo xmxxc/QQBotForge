@@ -349,22 +349,40 @@ async def test_cancelled_query_ends_refresh_without_overwriting_new_facts(group_
 
 @pytest.mark.parametrize('role', [[], {}])
 @pytest.mark.parametrize('entry', ['http', 'qq'])
-async def test_malformed_platform_role_is_a_historical_error(group_host, role, entry):
+async def test_malformed_platform_role_is_a_historical_error(group_host, role, entry, monkeypatch):
     host = group_host
     previous = (await (await host.api('POST', 'refresh', body={'group': 'group-a'})).json())['data']
     host.sender.response = ({'member_role': role, 'recv_msg_setting': 'all', 'allow_proactive_msg': True}, None)
+    # #87: capture what refresh itself returned, so the comparisons below are not a snapshot against itself.
+    returned, refresh = [], host.state.refresh
+
+    async def spy(*args, **kwargs):
+        returned.append(await refresh(*args, **kwargs))
+        return returned[-1]
+
+    monkeypatch.setattr(host.state, 'refresh', spy)
     if entry == 'http':
         response = await host.api('POST', 'refresh', body={'group': 'group-a'})
         assert response.status == 200
-        result = (await response.json())['data']
+        assert (await response.json())['data'] == returned[0]
     else:
         host.sender.messages.clear()
         await host.event('群状态 刷新 group-a')
         assert len(host.sender.messages) == 1
-        result = json.loads(host.sender.messages[-1][2].split('\n', 1)[1])
+        # The owner reply is a Chinese summary (#62); the facts it summarises come from the module.
+        assert host.sender.messages[-1][2].startswith('群刷新结果\n群 group-a：未知（平台返回无法识别）\n历史记录：Bot 在群（管理员）')
+    [result] = returned
     assert not result['reliable'] and result['status'] == 'historical'
     assert result['reason'] == 'response_unknown' and result['bot_state'] == previous['bot_state']
+    # The returned fact is the public and the persisted one.
     assert (await host.state.snapshot('bot-a'))['groups'][0] == result
+    stored = (await host.state.store.get('bot-a', 'group_state', 'state'))['groups']['group-a']
+    assert {key: stored[key] for key in ('version', 'reliable', 'status', 'reason', 'bot_state')} == {
+        key: result[key] for key in ('version', 'reliable', 'status', 'reason', 'bot_state')
+    }
+    # Negative control: the earlier verified refresh is distinguishable from the current fact.
+    assert previous['reliable'] is True and previous['version'] < result['version']
+    assert (await host.state.snapshot('bot-a'))['groups'][0] != previous
 
 
 async def test_reload_during_final_commit_rejects_old_http_result(group_host, monkeypatch):
