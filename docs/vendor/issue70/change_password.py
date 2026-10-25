@@ -2,7 +2,6 @@
 
 import argparse
 import base64
-from datetime import datetime, timezone
 import getpass
 import hashlib
 import hmac
@@ -11,13 +10,14 @@ import os
 import re
 import sys
 import warnings
+from datetime import UTC, datetime
 
 try:
     import requests
     from cryptography.hazmat.primitives import padding
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 except ImportError:
-    raise SystemExit("缺少依赖，请运行：python -m pip install requests cryptography")
+    raise SystemExit("缺少依赖，请运行：python -m pip install requests cryptography") from None
 
 
 ORIGIN = "https://user.pandadastudio.com"
@@ -67,7 +67,7 @@ def encrypt_password(password, secret, iv=None):
 
 def signed_headers(config, method, path, body, *, date=None, nonce=None, traceid=None):
     headers = {
-        "x-yh-date": date or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+        "x-yh-date": date or datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"),
         "x-yh-nonce": nonce or base64.b64encode(os.urandom(16)).decode("ascii"),
         "x-yh-traceid": traceid or base64.b64encode(os.urandom(16)).decode("ascii"),
         "x-yh-appid": config["appId"],

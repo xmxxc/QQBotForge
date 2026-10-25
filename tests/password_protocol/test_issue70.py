@@ -8,8 +8,8 @@ import pytest
 
 SOURCE = Path(__file__).resolve().parents[2] / 'docs/vendor/issue70'
 HASHES = {
-    'change_password.py': 'f356b4205e7f4e31753050d63caffda3c3a6ebf9c3c3a6ba63648260f3d78001',
-    'test_change_password.py': '9753e10b95d74d7f61eccdbc2d1cd1dbc2e92b7c160cce904496c4dd2fb9b2a8',
+    'change_password.py': '189ba280ce87f69ae170947553a4aede3bbf42b74039989c15986ad9540df701',
+    'test_change_password.py': '219e504bccac516a9d2b4db2c20191459c0a737dc011fd2ddd3a5c6b01ff0a57',
 }
 
 

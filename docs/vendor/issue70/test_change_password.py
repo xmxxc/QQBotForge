@@ -1,16 +1,14 @@
 """离线协议与提交边界测试，所有凭据均为测试数据。"""
 
 import base64
-from contextlib import redirect_stdout, redirect_stderr
 import io
 import json
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import Mock, patch
 
-import requests
-
 import change_password as app
-
+import requests
 
 KEY = base64.b64encode(bytes(range(32))).decode("ascii")
 CONFIG = {
@@ -121,9 +119,12 @@ class FlowTests(unittest.TestCase):
 
     def test_invalid_new_password_never_reaches_submission(self):
         for password in ["tiny", "with space", "😀" * 9, "x" * 17]:
-            with self.subTest(password=password), patch.object(app, "hidden_input", return_value=password):
-                with self.assertRaises(app.ScriptError):
-                    app.prompt_new_password("old-test")
+            with (
+                self.subTest(password=password),
+                patch.object(app, "hidden_input", return_value=password),
+                self.assertRaises(app.ScriptError),
+            ):
+                app.prompt_new_password("old-test")
 
 
 if __name__ == "__main__":
