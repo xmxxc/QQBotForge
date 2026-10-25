@@ -158,3 +158,71 @@ async def test_account_form_new_edit_delete_and_rejection_in_a_real_browser(ninj
     finally:
         await server.close()
     assert errors == []
+
+
+async def test_group_auto_grant_switch_in_a_real_browser(ninja):
+    executable = chrome()
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+    from playwright.async_api import async_playwright
+
+    from web import auth
+    from web.api import handle_ext_route
+
+    host = ninja
+    app = web.Application()
+
+    async def index(request):
+        return web.Response(text=PAGE.read_text(encoding='utf-8'), content_type='text/html')
+
+    app.router.add_get('/', index)
+    app.router.add_route('*', '/api/ext/{tail:.*}', handle_ext_route)
+    server = TestServer(app, host='127.0.0.1')
+    await server.start_server()
+    base = str(server.make_url('/'))
+    errors = []
+
+    async def rules():
+        return [r['group'] for r in (await host.access.access_snapshot('bot-a', 'ninja3')).get('join_rules', [])]
+
+    async def stored():
+        return {g['group']: g for g in (await host.ninja_api('GET', 'groups'))[1]['data']}
+
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(executable_path=executable, headless=True)
+            context = await browser.new_context()
+            await context.add_cookies([{'name': auth.SESSION_COOKIE, 'value': 'group-test', 'url': base}])
+            page = await context.new_page()
+            page.set_default_timeout(5000)
+            page.on('pageerror', lambda error: errors.append(str(error)))
+            await page.goto(base)
+            await page.fill('#bot', 'bot-a')
+            await page.click('#refresh')
+            await page.wait_for_function("() => document.getElementById('status').textContent.startsWith('已加载')")
+            assert not await page.is_checked('#group-auto')
+            # A closed group with the switch on stores the intent but syncs no rule.
+            await page.fill('#group', 'group-a')
+            await page.check('#group-auto')
+            await page.click('#group-form button')
+            await page.wait_for_function("() => document.getElementById('status').textContent === '群已保存；授权同步：saved'")
+            assert '未开放，入群自动授权（群未开放，不生效）' in await page.text_content('#groups')
+            assert (await stored())['group-a']['auto_grant'] is True and await rules() == []
+            assert not await page.is_checked('#group-auto')  # the form resets after a save
+            # Opening the group from the table keeps the switch and syncs the rule.
+            await page.click('#groups tr:has-text("group-a") button:text-is("开放")')
+            await page.wait_for_function("() => document.getElementById('groups').textContent.includes('开放，入群自动授权关闭')")
+            assert await rules() == ['group-a']
+            # The sync log renders after the table within the same refresh.
+            await page.wait_for_function("() => document.getElementById('operations').textContent.includes('入群自动授权 false → true')")
+            # Turning only the switch off removes the rule and leaves the group open.
+            await page.click('#groups tr:has-text("group-a") button:text-is("关闭自动授权")')
+            await page.wait_for_function("() => document.getElementById('groups').textContent.includes('开放关闭开启自动授权')")
+            assert await rules() == [] and (await stored())['group-a']['enabled'] is True
+            # The sync log renders after the table within the same refresh.
+            await page.wait_for_function("() => document.getElementById('operations').textContent.includes('入群自动授权 true → false')")
+            await page.wait_for_function("() => document.getElementById('acl-status').textContent === '一致'")
+            await browser.close()
+    finally:
+        await server.close()
+    assert errors == []
