@@ -280,21 +280,25 @@ async def test_cancel_or_unload_reports_inflight_and_pending(lifecycle_app, unlo
 async def test_setup_failure_removes_partial_subscriptions(lifecycle_app, tmp_path):
     app, manager = lifecycle_app
     bad = tmp_path / 'modules/bad'
+    observed = tmp_path / 'bad-lifecycle-events.log'
     bad.mkdir()
-    (bad / 'main.py').write_text('''events = []
+    (bad / 'main.py').write_text(f'''from pathlib import Path
+
+observed = Path({str(observed)!r})
+
 async def callback(event):
-    events.append(event)
+    observed.write_text('called\\n', encoding='utf-8')
 def setup(ctx):
     ctx.subscribe_group_lifecycle(callback)
     raise ValueError('setup failed')
 ''')
     manager.discover()
     assert not await manager.enable('bad', _skip_deps=True, _persist=False)
-    module = manager.get_module('bad')
+    assert manager.get_module('bad') is None
     await context(app, manager)
     await webhook(app, lifecycle())
     await eventually(lambda: manager.get('consumer')['events'])
-    assert module.events == []
+    assert not observed.exists()
 
 
 async def test_timeout_does_not_overlap_cancellation_resistant_callback(lifecycle_app):

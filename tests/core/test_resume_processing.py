@@ -454,19 +454,24 @@ async def test_actual_module_unload_reload_and_setup_failure(wired, tmp_path):
     first.feed(0, t='GROUP_MEMBER_ADD', s=3, d={'group_openid': 'g', 'member_openid': 'other'})
     await until(lambda: replacement['received'] == ['GROUP_MEMBER_ADD'])
     broken = module_root / 'broken'
+    observed = tmp_path / 'broken-recovery-events.log'
     broken.mkdir()
-    (broken / 'main.py').write_text("""received = []
+    (broken / 'main.py').write_text(f"""from pathlib import Path
+
+observed = Path({str(observed)!r})
+
 async def consume(delivery):
-    received.append(delivery.event)
+    observed.write_text('called\\n', encoding='utf-8')
 def setup(ctx):
     ctx.subscribe_recovery_events(consume, event_types={'GUILD_UPDATE'})
     raise ValueError('sample setup failure')
 """)
     manager.discover()
     assert not await manager.enable('broken', _skip_deps=True, _persist=False)
+    assert manager.get_module('broken') is None
     first.feed(0, t='GUILD_UPDATE', s=4, d={'id': 'guild'})
     await until(lambda: len(ordinary) == 3)
-    assert manager.get_module('broken').received == []
+    assert not observed.exists()
     await manager.shutdown()
 
 
