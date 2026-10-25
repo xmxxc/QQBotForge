@@ -88,17 +88,21 @@ class HookManager:
 
     async def pipeline(self, hook_name, data):
         """管道执行 — 数据依次流过回调, 返回 None 表示拦截"""
+        return (await self.pipeline_with_owner(hook_name, data))[0]
+
+    async def pipeline_with_owner(self, hook_name, data):
+        """同 pipeline，另返回拦截者 owner：(data, None) 或 (None, owner)"""
         if data is None:
-            return None
+            return None, None
         loop = asyncio.get_running_loop()
         for _, owner, cb, is_coro, _token in self._get_sorted(hook_name):
             try:
                 data = await cb(data) if is_coro else await loop.run_in_executor(None, cb, data)
                 if data is None:
-                    return None
+                    return None, owner
             except Exception as e:
                 log.warning(f"[{owner}] hook '{hook_name}': {e}")
-        return data
+        return data, None
 
     def has(self, hook_name):
         """是否有回调注册"""
