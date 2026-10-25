@@ -7,6 +7,7 @@ are substituted; nothing calls a Hook or the grant path directly.
 """
 
 import asyncio
+import re
 import sqlite3
 import threading
 
@@ -18,13 +19,22 @@ from test_access_control import request
 from test_ninja3 import SECRET
 from test_ninja3 import ninja as ninja  # noqa: F401
 
-LISTED = ['本群开放账号：\n1. 账号A\n发送“账号 名称”获取']
 CREDENTIALS = [f'名称：账号A\n账号：fake-login\n密码：{SECRET}']
 REFUSED = ['你暂无查询权限，已记录给主人']
 UNSURE = ['暂时无法确认查询资格，已记录给主人']
 RETRY = ['暂时无法确认查询资格，请稍后重试']
 DENIED = ['你暂无查询权限']
 UNAVAILABLE = ['账号查询暂不可用，请联系主人']
+
+
+def assert_listed(reply, names=('账号A',)):
+    """Check the paginated directory while ignoring its dynamic menu token."""
+    assert len(reply) == 1
+    lines = reply[0].splitlines()
+    page = re.fullmatch(r'本群开放账号（(\d+)/(\d+)）：', lines[0])
+    assert page and (int(page[1]), int(page[2])) == (1, (len(names) + 5) // 6)
+    assert lines[1 : 1 + len(names)] == [f'{index}. {name}' for index, name in enumerate(names, 1)]
+    assert re.fullmatch(r'五分钟内发送“忍3选择 [0-9a-f]{32} <编号>”', lines[1 + len(names)])
 
 
 class Frames:
@@ -154,7 +164,7 @@ async def test_trusted_join_grants_this_cycle_leave_revokes_and_rejoin_is_a_new_
         ['query'],
     )
     assert proof['member']['status'] == 'pending' and not proof['usable']
-    assert await host.say('账号列表', user='MEMBERJ') == LISTED
+    assert_listed(await host.say('账号列表', user='MEMBERJ'))
     assert await host.say('账号 账号A', user='MEMBERJ') == CREDENTIALS
     # Accounts opened later in this group are covered by the same continuous source.
     status, _ = await host.ninja_api(
@@ -185,7 +195,7 @@ async def test_trusted_join_grants_this_cycle_leave_revokes_and_rejoin_is_a_new_
     await settle(host, rejoin)
     (again,) = await autos(host)
     assert again['id'] != source['id'] and again['cycle'] != source['cycle'] and again['join']['event_id'] == f'event-{rejoin}'
-    assert await host.say('账号列表', user='MEMBERJ') == ['本群开放账号：\n1. 账号A\n2. 账号B\n发送“账号 名称”获取']
+    assert_listed(await host.say('账号列表', user='MEMBERJ'), ('账号A', '账号B'))
     # The owner's revocation stands; re-delivering that join adds nothing back.
     await host.access.manage_access('bot-a', 'ninja3', 'revoke', function='query', group='group-a', member='MEMBERJ', source=again['id'])
     assert await host.say('账号列表', user='MEMBERJ') == REFUSED
@@ -212,7 +222,7 @@ async def test_auto_grant_stays_in_its_bot_group_and_consumer_and_never_lifts_de
     await settle(host, frames.feed('GROUP_MEMBER_ADD', 'MEMBERJ'))
     (source,) = await autos(host)
     assert source['group'] == 'group-a'
-    assert await host.say('账号列表', user='MEMBERJ') == LISTED
+    assert_listed(await host.say('账号列表', user='MEMBERJ'))
     assert await host.say('账号列表', user='MEMBERJ', group='group-b') == REFUSED
     assert await host.say('账号列表', user='MEMBERJ', bot='bot-b') == REFUSED
     # Other consumers and other policy kinds gain nothing from the join basis.
@@ -234,7 +244,7 @@ async def test_auto_grant_stays_in_its_bot_group_and_consumer_and_never_lifts_de
     await host.access.manage_access('bot-a', 'ninja3', 'deny', function='query', group='group-a', member='MEMBERJ')
     assert await host.say('账号列表', user='MEMBERJ') == DENIED
     await host.access.manage_access('bot-a', 'ninja3', 'allow', function='query', group='group-a', member='MEMBERJ')
-    assert await host.say('账号列表', user='MEMBERJ') == LISTED
+    assert_listed(await host.say('账号列表', user='MEMBERJ'))
 
 
 @pytest.mark.parametrize('case', ['missing_event_id', 'missing_timestamp', 'missing_member', 'same_second', 'late', 'conflicting_duplicate', 'new_session'])
@@ -255,7 +265,8 @@ async def test_untrusted_or_unordered_joins_never_grant(ninja, case):
         # MEMBERK's trusted join granted; another payload reusing its event ID suspends the Bot.
         first = frames.feed('GROUP_MEMBER_ADD', 'MEMBERK')
         await settle(host, first)
-        assert await autos(host, 'MEMBERK') and await host.say('账号列表', user='MEMBERK') == LISTED
+        assert await autos(host, 'MEMBERK')
+        assert_listed(await host.say('账号列表', user='MEMBERK'))
         await settle(host, frames.feed('GROUP_MEMBER_ADD', 'MEMBERJ', event_id=f'event-{first}'))
     else:
         # A new session before the owner rebuilds: continuity is unknown.
@@ -422,7 +433,7 @@ async def test_reloads_restart_and_new_session_never_revive_an_automatic_source(
     assert await host.modules.reload('access_control')
     host.access = host.modules.get('access_control')
     await host.plugins.reload('ninja3')
-    assert await host.say('账号列表', user='MEMBERJ') == LISTED
+    assert_listed(await host.say('账号列表', user='MEMBERJ'))
     if gap == 'new_session':
         await new_session(host, frames)
     else:
@@ -439,7 +450,7 @@ async def test_reloads_restart_and_new_session_never_revive_an_automatic_source(
     assert await autos(host) == [source] and await host.say('账号列表', user='MEMBERJ') == REFUSED
     # Only the owner's own grant restores access, as a separate owner source.
     assert await host.say('授权', user='owner-a', mentions=['MEMBERJ']) == ['已授权该成员查询本群开放账号，长期有效']
-    assert await host.say('账号列表', user='MEMBERJ') == LISTED
+    assert_listed(await host.say('账号列表', user='MEMBERJ'))
 
 
 async def test_old_session_callback_finishing_late_cannot_make_its_source_usable(ninja, monkeypatch):
@@ -481,7 +492,7 @@ async def test_owner_rule_narrowed_in_authorization_survives_queries_and_reloads
     await auto(host)
     assert await host.say('账号列表', user='MEMBERJ') == REFUSED
     await settle(host, frames.feed('GROUP_MEMBER_ADD', 'MEMBERK'))
-    assert await host.say('账号列表', user='MEMBERK') == LISTED
+    assert_listed(await host.say('账号列表', user='MEMBERK'))
     # Narrowing the policy scope in authorization leaves no dormant source for a later reopening.
     await host.access.manage_access('bot-a', 'ninja3', 'policy', function='query', policy={'kind': 'explicit', 'groups': []})
     await settle(host, frames.feed('GROUP_MEMBER_ADD', 'MEMBERN'))
@@ -510,7 +521,7 @@ async def test_rule_off_alone_waits_for_a_started_write_and_stops_later_joins(ni
     snapshot = await host.access.access_snapshot('bot-a', 'ninja3')
     assert snapshot['join_rules'] == [] and source['join']['event_id'] == f'event-{first}'
     # Established like an owner source (revocable in authorization); no join after rule-off adds one.
-    assert await host.say('账号列表', user='MEMBERJ') == LISTED
+    assert_listed(await host.say('账号列表', user='MEMBERJ'))
     await settle(host, frames.feed('GROUP_MEMBER_ADD', 'MEMBERK'))
     assert not await autos(host, 'MEMBERK') and await host.say('账号列表', user='MEMBERK') == REFUSED
 
