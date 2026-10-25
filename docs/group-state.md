@@ -13,6 +13,8 @@
 
 私聊按命令给对应中文标题与摘要（群状态概览、群刷新结果、群名册核验、成员核验结果、成员人工确认、恢复基线重建），状态统一为“完整／可靠（已核验）／处理中／暂停使用（恢复基线未完成）／无权限／失败／待核验／未知／历史”加中文原因；未收到的字段显示“未知”，不补成 0 或否；恢复未完成不写成成功。群里只给“<标题>已处理”简短状态并引导到主人私聊／后台，不含成员、角色或原因。原生 ID 与原始字段保留在后台“原始字段”详情和 JSON 接口，接口字段与类型不变。原因中文表与状态规则在 `modules/group_state/text.py`，页面保留同一份副本，测试比对两份原因表并用共享用例（`tests/bot_modules/group_state_labels.json`）同时检查两边的状态文字。普通成员不能枚举群状态，写请求沿用后台会话和同源校验。Bot 的身份和群原生标识作为分区依据，展示名不能代替标识。
 
+概览的恢复行（#87）在私聊与页面上用同一规则：快照 `recovery` 在原有 `ready`／`phase`／`reason` 之外新增两个只读字段，`pause` 为模块自身判定（与事实凭据 `reason` 同源：空串、`recovery_processing`、`persistence_pending` 或 `recovery_required`），`rebuilding` 表示本 Bot 的重建正在进行。原有三项含义不变（`ready` 仍为恢复屏障本身，写入未完成时可为 true，此时 `pause=persistence_pending`）；缺少新字段的旧响应按 `phase` 回退。消费通知未完成、写入未完成显示“处理中，请稍后再查看”，重建进行中显示“正在重建”，其余显示“需重建”。`reason` 是框架记录的历史原因：重建结束未建立基线时，框架保留的 `rebuilding` 显示为“上次重建未完成”；未就绪时框架的 `baseline_established`／`replay_processed` 不作为原因，改为显示模块判定。框架常见原因（`pending_processing`、`replay_processed`、`unverified_transport`、`dependency_not_ready`、`busy`、`unsubscribed`、`baseline_required`）有中文，其他原码显示“其他原因（原码）”。共享用例在 `tests/bot_modules/group_state_recovery.json`。
+
 已知群来自实际收到的原生群事件或主人显式刷新，界面与接口始终标明 `scope=known`、`complete=false`。不把记录总数称为平台所有群。刷新复用框架 `get_group_bot_state(return_error=True)`，只接受完整可识别的平台结果。接口许可、错误、历史状态和核验时间分别显示；查询失败、空值或未获许可不表示 Bot 已离群。历史 `bot_state` 在 `reliable=false` 时只能作历史参考。重启／重载保留历史，但先标记 `process_restart`，须重建恢复基线。
 
 消费者从运行模块取得 `await group_state.snapshot(appid)`、`await group_state.refresh(appid, native_group)` 和 `group_state.capabilities()`，不要读取内部 SQLite。快照是独立副本，含 Bot、模块代际、版本、每群来源／核验时间和可靠性。进入核验与核验完成分别递增版本；不同模块代际的版本不能混用。刷新时收到同群新事实会拒绝旧结果；模块卸载后旧请求不能继续确认当前状态。冷加载与等待读取锁的在途请求同样会失效：直接消费接口抛出 RuntimeError，已进入路由的 HTTP 读取返回 503；不会返回或缓存旧代际历史快照。重新启用后由新实例加载历史并重新核验。

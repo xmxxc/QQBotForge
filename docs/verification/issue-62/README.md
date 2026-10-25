@@ -27,7 +27,7 @@ ruff check <改动的 .py>; ruff format --check <改动的 .py>
 | 全部 pytest | — | 436 通过，0 跳过 |
 | 其他页面脚本 `account_page.cjs`、`test_account_page.cjs` | — | 通过 |
 
-基线源码的失败均为断言失败：旧回复为 `已知群（不代表全部群）\n{...}` 原始 JSON、群内统一回 `已知群状态已处理…`、账密在空说明／地址时多出 `\n\n` 尾行。`test_group_state.py` 中格式异常角色用例的 QQ 分支原先解析回复 JSON，现改为核对中文摘要并从模块快照读取同一事实，其余断言不变。
+更正（#87 R4，依据 PR #84 独立审查 https://github.com/xmxxc/QQBotForge/pull/84#issuecomment-6363411981 ）：此处原写“基线源码的失败均为断言失败”，不准确。33 例 Python 失败中，15 例为 `ModuleNotFoundError`（基线缺少本票新增的文本模块，测试在导入时即失败，只说明模块不存在，不能算作行为防护的红证据），18 例为行为断言失败（旧回复为 `已知群（不代表全部群）\n{...}` 原始 JSON、群内统一回 `已知群状态已处理…`、账密在空说明／地址时多出 `\n\n` 尾行），另 1 例通过；页面为新增 4 例失败。原始红日志以 PR #84 记录为准，此处保留原表数字不改；#87 未重跑 #62 基线。`test_group_state.py` 中格式异常角色用例的 QQ 分支原先解析回复 JSON，现改为核对中文摘要并从模块快照读取同一事实，其余断言不变。
 
 具名关键用例：`test_each_owner_command_has_its_own_title_and_chinese_summary`、`test_failed_refresh_is_not_reported_as_success_or_absence`（无权限／不可识别／缺字段）、`test_recovery_barrier_is_never_reported_as_success`（不可信生命周期事件后概览与重建）、`test_group_chat_only_gets_a_short_status_for_the_operation`（5 种命令群内不含成员、角色、原因）、`test_labels_keep_unknown_progress_and_failure_apart`（共享用例 `group_state_labels.json`，页面测试用同一份）、`test_credentials_omit_empty_description_and_url`（空、仅空白、单项、两项）、`test_owner_todos_results_and_rules_are_chinese_summaries`（部分成功、未执行、重试通知、规则不含账密、群内简短）。
 
