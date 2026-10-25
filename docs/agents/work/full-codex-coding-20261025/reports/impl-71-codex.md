@@ -37,6 +37,17 @@ Exit now checks persisted emergency account handoffs and the corresponding `ninj
 
 Final red/green evidence: the prior candidate's cross-process scenario could write `state=exited` during the other process's remote child task; the final focused real-component suite is **260 passed in 53.38s**, including the new two-connection exit regression. Ruff check/format, explicit mypy, and `git diff --check e891f58..HEAD` pass. No real QQ, game, password, merge, deploy, or production operation was performed.
 
+## Final runner-ownership and privacy repair
+
+The latest review found two P1s in the preceding candidate: a peer EmergencyMode runner could observe another process's submitting child, mark it complete/unknown, and enable exit; and emergency-mode authorization/stale-menu paths could still reply publicly. The final repair base was `63c683918d3c2996dee88eb7f5c6b02bcfe5549c` (tree `06b83153f9b8ac7ee5369773fe10fc7f9b4730f6`), and the source repair is:
+
+- Final repair commit: `13e2ee1a23225c02bad5f78877660f8b9364c2a1`
+- Final repair tree: `b56ce389f75b4cde933df9785357693523c7ad6b`
+
+Emergency state now persists a runner token. A peer runner cannot claim or mutate the active owner’s row; restart takeover is allowed only after durable child tasks are no longer in selected/active execution states. The runner publishes its running handoff before child selection. Authorization in an active emergency is silent for non-owners and private for the owner; stale menu callbacks follow the same rule.
+
+Final red/green evidence: the prior candidate's peer runner could clear a submitting task and exit; its group authorization and stale callback could expose public replies. The final focused suite is **261 passed in 53.27s**, including the blocked fake-protocol two-connection runner regression and stale-menu/authorization privacy regression. Ruff check/format, explicit mypy, and diff checks pass. No real QQ, game, password, merge, deploy, or production operation was performed.
+
 ## Fixed candidate
 
 - Worker: `/opt/qqbot/QQBotForge-codex-71-worker`
