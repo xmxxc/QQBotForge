@@ -400,6 +400,10 @@ class Ninja3:
         if not event.is_group or event.is_channel or not group:
             await self.reply(event, '请在要开放的群内发送：授权 @成员')
             return
+        if self.emergency.active(bot):
+            if self.is_owner(event):
+                await self.owner_private(bot, '紧急模式已开启，成员查询与授权操作暂停')
+            return
         if not self.is_owner(event):
             await self.reply(event, '仅主人可以授权')
             return
@@ -857,7 +861,11 @@ class Ninja3:
     async def select(self, event, token, number):
         menu = self.menus.get(token)
         if not (menu and self.menu_current(event, menu) and 1 <= number <= len(menu['actions'])):
-            await self.reply(event, '菜单已失效，请重新发送：账号列表')
+            if event.is_group and self.emergency.active(event.appid):
+                if self.is_owner(event):
+                    await self.owner_private(event.appid, '菜单已失效，请重新发送：账号列表')
+            else:
+                await self.reply(event, '菜单已失效，请重新发送：账号列表')
             return
         action = menu['actions'][number - 1]
         if 'manage' in action:

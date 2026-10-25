@@ -142,6 +142,8 @@ async def test_second_emergency_connection_cannot_exit_during_remote_child_task(
     peer_store = ExtensionStore(host.tasks.store.path)
     peer = type(emergency)(peer_store, host.tasks, notify=emergency.notify)
     await peer.initialize()
+    await peer.enter('bot-a')
+    await asyncio.gather(*list(peer.runners.values()), return_exceptions=True)
     with pytest.raises(ValueError, match='仍在进行'):
         await peer.exit('bot-a')
     host.center.release.set()

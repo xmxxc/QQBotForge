@@ -82,6 +82,20 @@ async def test_owner_menu_is_shared_but_management_rechecks_owner(ninja):
             assert h.texts() == [b['text'] + '尚未交付，当前不可用']
 
 
+async def test_emergency_hides_stale_menu_and_authorization_replies(ninja):
+    h = ninja
+    await h.setup()
+    await h.say('菜单', user='owner-a')
+    payload = buttons(h)[0]['data']
+    await h.ninja().emergency.enter('bot-a')
+    assert await h.say('授权', user='MEMBERA', mentions=['MEMBERB']) == []
+    assert await h.say('授权', user='owner-a', mentions=['MEMBERB']) == []
+    await h.click(payload, user='MEMBERA', group='group-a')
+    assert h.texts() == []
+    await asyncio.gather(*list(h.ninja().emergency.runners.values()))
+    await h.ninja().emergency.exit('bot-a')
+
+
 @pytest.mark.parametrize('invalid', ['expiry', 'reload', 'bot', 'group'])
 async def test_session_domain_expiry_and_old_instance(ninja, invalid):
     h = ninja

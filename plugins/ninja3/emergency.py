@@ -47,6 +47,7 @@ class EmergencyMode:
         self._locks: dict[str, asyncio.Lock] = {}
         self._active_cache: dict[str, bool] = {}
         self._ready = False
+        self.runner_id = uuid4().hex
 
     @staticmethod
     def _read(conn: sqlite3.Connection, bot: str) -> Record | None:
@@ -110,10 +111,11 @@ class EmergencyMode:
             conn.execute('CREATE TABLE IF NOT EXISTS ninja3_emergency (bot TEXT NOT NULL,id TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(bot,id))')
             for bot, raw in conn.execute('SELECT bot,payload FROM ninja3_emergency').fetchall():
                 state = json.loads(raw)
-                if state.get('state') in {'active', 'starting'}:
+                if state.get('state') in {'active', 'starting'} and not self._durable_runner_busy(conn, bot, state):
                     # The prior process may have been killed while a child task was
                     # running.  Keep the fail-closed mode and its durable task IDs,
                     # but require an explicit owner command to resume pending items.
+                    state['runner'] = None
                     state['phase'] = 'interrupted'
                     state['error'] = 'interrupted'
                     state['updated_at'] = self.clock()
@@ -144,6 +146,37 @@ class EmergencyMode:
 
         runner.add_done_callback(finished)
 
+    @staticmethod
+    def _durable_runner_busy(conn: sqlite3.Connection, bot: str, state: Record) -> bool:
+        for item in state.get('accounts', []):
+            key = item.get('task')
+            if not key:
+                if item.get('status') == 'running':
+                    return True
+                continue
+            row = conn.execute('SELECT payload FROM ninja3_password_tasks WHERE bot=? AND id=?', (bot, key)).fetchone()
+            if not row:
+                return bool(item.get('status') == 'running')
+            task = json.loads(row[0])
+            if task.get('state') == 'selected':
+                return True
+            if task.get('active') and task.get('state') in {'prepared', 'preparing', 'submitting', 'verifying'}:
+                return True
+        return False
+
+    async def _claim_runner(self, bot: str, generation: str) -> None:
+        def claim(conn: sqlite3.Connection) -> None:
+            state = self._read(conn, bot)
+            if not state or state.get('generation') != generation or state.get('state') != 'active':
+                raise EmergencyError('紧急模式已变化，请查看后台状态')
+            owner = state.get('runner')
+            if owner not in {None, self.runner_id}:
+                raise EmergencyError('紧急模式由另一进程执行，请稍后查看状态')
+            state.update(runner=self.runner_id, phase='running', updated_at=self.clock())
+            self._save(conn, bot, state)
+
+        await self.store.atomic(claim)
+
     async def enter(self, bot: str) -> Record:
         async with self._lock(bot):
             try:
@@ -167,6 +200,7 @@ class EmergencyMode:
                     'notification': 'not_attempted',
                     'error': '',
                     'exit_requested': False,
+                    'runner': None,
                 }
                 await self.store.atomic(lambda conn: self._save(conn, bot, state))
             except (sqlite3.Error, OSError, RuntimeError, ValueError) as error:
@@ -182,7 +216,7 @@ class EmergencyMode:
     async def _update(self, bot: str, generation: str, **changes: Any) -> Record:
         def update(conn: sqlite3.Connection) -> Record:
             state = self._read(conn, bot)
-            if not state or state.get('generation') != generation or state.get('state') != 'active':
+            if not state or state.get('generation') != generation or state.get('state') != 'active' or state.get('runner') != self.runner_id:
                 raise EmergencyError('紧急模式已变化，请查看后台状态')
             state.update(changes, updated_at=self.clock())
             self._save(conn, bot, state)
@@ -197,7 +231,7 @@ class EmergencyMode:
         generation = state['generation']
         actor = 'emergency:' + generation
         try:
-            await self._update(bot, generation, phase='running')
+            await self._claim_runner(bot, generation)
             for index, item in enumerate(state['accounts']):
                 state = await self._get(bot)
                 if not state or state.get('state') != 'active' or state.get('generation') != generation:
@@ -250,7 +284,7 @@ class EmergencyMode:
     async def _update_item(self, bot: str, generation: str, index: int, **changes: Any) -> Record:
         def update(conn: sqlite3.Connection) -> Record:
             state = self._read(conn, bot)
-            if not state or state.get('generation') != generation or state.get('state') != 'active':
+            if not state or state.get('generation') != generation or state.get('state') != 'active' or state.get('runner') != self.runner_id:
                 raise EmergencyError('紧急模式已变化，请查看后台状态')
             state['accounts'][index].update(changes)
             state['updated_at'] = self.clock()
