@@ -9,8 +9,72 @@ on:
 permissions:
   contents: read
 
+env:
+  # Pinned test assets (ci-assets branch of this repository). Bump the SHA
+  # to take new assets.
+  CI_ASSETS_REPOSITORY: xmxxc/QQBotForge
+  CI_ASSETS_SHA: c30d1e42fab6c9a7c4dfbdfd062043fd235bca2d
+
 jobs:
   check:
-    uses: ElainaCore/ElainaBot_v2/.github/workflows/ci.yml@ci-assets
-    with:
-      source_sha: ${{ github.sha }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source revision
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          path: source
+
+      - name: Checkout test assets
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.CI_ASSETS_REPOSITORY }}
+          ref: ${{ env.CI_ASSETS_SHA }}
+          path: ci-assets
+          sparse-checkout: tests
+          persist-credentials: false
+
+      - name: Record revisions
+        env:
+          EVENT: ${{ github.event_name }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          source_sha=$(git -C source rev-parse HEAD)
+          assets_sha=$(git -C ci-assets rev-parse HEAD)
+          echo "event: $EVENT"
+          echo "workflow: $WORKFLOW_REF ($WORKFLOW_SHA)"
+          echo "source: $source_sha tree $(git -C source rev-parse 'HEAD^{tree}')"
+          if [ -n "$PR_HEAD_SHA" ]; then
+            echo "pull request head: $PR_HEAD_SHA base: $PR_BASE_SHA"
+          fi
+          echo "test assets: $CI_ASSETS_REPOSITORY $assets_sha"
+          test "$source_sha" = "$GITHUB_SHA"
+          test "$assets_sha" = "$CI_ASSETS_SHA"
+
+      - name: Stage tests with the source revision
+        run: bash source/.github/scripts/stage-ci-assets.sh source ci-assets
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        working-directory: source
+        run: |
+          pip install -r requirements.txt
+          pip install "pytest>=9.1,<10.0" pytest-asyncio pytest-cov "mypy>=2.2,<3.0" "ruff>=0.15,<0.16" types-PyYAML
+
+      - name: Ruff
+        working-directory: source
+        run: ruff check .
+
+      - name: Mypy
+        working-directory: source
+        run: mypy core web main.py
+
+      - name: Pytest
+        working-directory: source
+        run: pytest -q -rs
