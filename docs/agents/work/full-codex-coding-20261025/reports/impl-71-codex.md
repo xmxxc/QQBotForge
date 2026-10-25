@@ -1,5 +1,31 @@
 # #71 combined implementation report
 
+## Repair update after independent review
+
+The independent review fixed the previous candidate at `d2960f11ef5d3ea793dd08a89606c0f6eb51329c` (tree `5297db4c251a1d5d21355c202ada757ab75beafa`) and identified six blocking race and isolation defects. The repair candidate is:
+
+- Repair base: `d2960f11ef5d3ea793dd08a89606c0f6eb51329c`, tree `5297db4c251a1d5d21355c202ada757ab75beafa`
+- Repair commit: `6c43a55e66b9e2abe9a5c0b3af1d3474a218a9ae`
+- Repair tree: `4d597d3787eae41b7b6e12bfe119d8cf56657055`
+
+The repaired code normalizes an interrupted `verifying` row to paused/unknown while retaining attempts, guards verifier result writes against cancellation and executor state, detaches a canceled verifier so unload cannot wait forever, fails the emergency synchronous gate closed for every SQLite read/lock error, re-reads emergency state so another process's exit is observed, and routes all owner batch/selection/confirmation/status replies privately while emergency mode is active. New regressions cover each finding.
+
+Old review red evidence: the fixed candidate left `verifying` active across restart; a verifier that completed after cancellation could write `verified_success` and local credentials; shutdown awaited a non-cooperative verifier; locked emergency reads could allow the cached normal path; a second EmergencyMode instance kept seeing active after another instance exited; and batch/selection/status group responses bypassed the private emergency route.
+
+New repair green evidence:
+
+```text
+/tmp/qqbot-75-venv/bin/python -m pytest -q \
+  tests/password_protocol \
+  tests/bot_modules/test_ninja3_password_tasks.py \
+  tests/bot_modules/test_ninja3_password_batches.py \
+  tests/bot_modules/test_ninja3_emergency.py \
+  tests/bot_modules/test_ninja3_menus.py
+259 passed in 52.49s
+```
+
+Ruff check/format, explicit mypy for the seven Ninja3 source files, and `git diff --check d2960f1..6c43a55` passed. The final report commit is added after this repair commit, so the repair SHA/tree above remains the exact source candidate for independent review.
+
 ## Fixed candidate
 
 - Worker: `/opt/qqbot/QQBotForge-codex-71-worker`
