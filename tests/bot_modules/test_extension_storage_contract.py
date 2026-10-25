@@ -27,6 +27,9 @@ STORES = {
     'self_qa': 'modules/self_qa/storage.py',
     'account_sharing': 'plugins/account_sharing/storage.py',
 }
+_NINJA3_STORE = 'plugins/ninja3/storage.py'
+if (Path(__file__).resolve().parents[2] / _NINJA3_STORE).exists():
+    STORES['ninja3'] = _NINJA3_STORE
 COMMON_API = {'ready', 'all', 'get', 'put', 'delete', 'close'}
 EXTRAS = {'access_control': {'keys'}}
 GET_MISSING_KEYWORD = {'access_control'}
