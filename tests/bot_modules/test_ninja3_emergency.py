@@ -1,6 +1,7 @@
 """#78 persistent emergency mode through the real Ninja3 message and HTTP paths."""
 
 import asyncio
+import os
 import sqlite3
 
 import pytest
@@ -152,3 +153,36 @@ async def test_second_emergency_connection_cannot_exit_during_remote_child_task(
     assert peer.current('bot-a')
     await peer.shutdown()
     peer_store.close()
+
+
+@pytest.mark.parametrize('persist_task_id', [False, True])
+async def test_restart_clears_dead_runner_and_explicit_reentry_recovers_handoff(changing, monkeypatch, persist_task_id):
+    host = changing
+    emergency = host.ninja().emergency
+    monkeypatch.setattr(emergency, '_start', lambda _bot: None)
+    await emergency.enter('bot-a')
+    state = await emergency.status('bot-a')
+    account = state['accounts'][0]['account']
+    task = None
+    if persist_task_id:
+        task = await host.tasks.select('bot-a', account, 'emergency:' + state['generation'])
+
+    def handoff(conn):
+        current = emergency._read(conn, 'bot-a')
+        current['runner'] = 'dead-runner'
+        current['runner_pid'] = os.getpid()
+        current['phase'] = 'running'
+        current['accounts'][0].update(status='running', task=task['id'] if task else None)
+        emergency._save(conn, 'bot-a', current)
+
+    await emergency.store.atomic(handoff)
+    await host.plugins.reload('ninja3')
+    host.tasks = host.ninja().password_tasks
+    restarted = host.ninja().emergency
+    normalized = await restarted.status('bot-a')
+    assert normalized['phase'] == 'interrupted'
+    assert all(item['status'] == ('running' if persist_task_id else 'pending') for item in normalized['accounts'])
+    await restarted.enter('bot-a')
+    await wait_emergency(host)
+    assert (await restarted.status('bot-a'))['phase'] == 'complete'
+    await restarted.exit('bot-a')

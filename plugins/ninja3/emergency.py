@@ -9,6 +9,7 @@ does not silently start another password change.
 import asyncio
 import contextlib
 import json
+import os
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable
@@ -22,6 +23,7 @@ from .storage import ExtensionStore
 
 Record = dict[str, Any]
 PUBLIC_FIELDS = ('state', 'phase', 'generation', 'accounts', 'created_at', 'updated_at', 'notification', 'error', 'exit_requested')
+_LIVE_RUNNERS: set[tuple[int, str]] = set()
 
 
 class EmergencyError(ValueError):
@@ -111,14 +113,18 @@ class EmergencyMode:
             conn.execute('CREATE TABLE IF NOT EXISTS ninja3_emergency (bot TEXT NOT NULL,id TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(bot,id))')
             for bot, raw in conn.execute('SELECT bot,payload FROM ninja3_emergency').fetchall():
                 state = json.loads(raw)
-                if state.get('state') in {'active', 'starting'} and not self._durable_runner_busy(conn, bot, state):
+                if state.get('state') in {'active', 'starting'} and not self._runner_live(state):
                     # The prior process may have been killed while a child task was
                     # running.  Keep the fail-closed mode and its durable task IDs,
                     # but require an explicit owner command to resume pending items.
                     state['runner'] = None
+                    state['runner_pid'] = None
                     state['phase'] = 'interrupted'
                     state['error'] = 'interrupted'
                     state['updated_at'] = self.clock()
+                    for item in state.get('accounts', []):
+                        if item.get('status') == 'running' and not item.get('task'):
+                            item['status'] = 'pending'
                     self._save(conn, bot, state)
 
         await self.store.atomic(setup)
@@ -147,22 +153,20 @@ class EmergencyMode:
         runner.add_done_callback(finished)
 
     @staticmethod
-    def _durable_runner_busy(conn: sqlite3.Connection, bot: str, state: Record) -> bool:
-        for item in state.get('accounts', []):
-            key = item.get('task')
-            if not key:
-                if item.get('status') == 'running':
-                    return True
-                continue
-            row = conn.execute('SELECT payload FROM ninja3_password_tasks WHERE bot=? AND id=?', (bot, key)).fetchone()
-            if not row:
-                return bool(item.get('status') == 'running')
-            task = json.loads(row[0])
-            if task.get('state') == 'selected':
-                return True
-            if task.get('active') and task.get('state') in {'prepared', 'preparing', 'submitting', 'verifying'}:
-                return True
-        return False
+    def _runner_live(state: Record) -> bool:
+        runner = state.get('runner')
+        pid = state.get('runner_pid')
+        if not runner or not isinstance(pid, int):
+            return False
+        if (pid, runner) in _LIVE_RUNNERS:
+            return True
+        if pid == os.getpid():
+            return False
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+        return True
 
     async def _claim_runner(self, bot: str, generation: str) -> None:
         def claim(conn: sqlite3.Connection) -> None:
@@ -173,9 +177,11 @@ class EmergencyMode:
             if owner not in {None, self.runner_id}:
                 raise EmergencyError('紧急模式由另一进程执行，请稍后查看状态')
             state.update(runner=self.runner_id, phase='running', updated_at=self.clock())
+            state.update(runner_pid=os.getpid())
             self._save(conn, bot, state)
 
         await self.store.atomic(claim)
+        _LIVE_RUNNERS.add((os.getpid(), self.runner_id))
 
     async def enter(self, bot: str) -> Record:
         async with self._lock(bot):
@@ -201,6 +207,7 @@ class EmergencyMode:
                     'error': '',
                     'exit_requested': False,
                     'runner': None,
+                    'runner_pid': None,
                 }
                 await self.store.atomic(lambda conn: self._save(conn, bot, state))
             except (sqlite3.Error, OSError, RuntimeError, ValueError) as error:
@@ -379,3 +386,4 @@ class EmergencyMode:
             runner.cancel()
         if runners:
             await asyncio.gather(*runners, return_exceptions=True)
+        _LIVE_RUNNERS.discard((os.getpid(), self.runner_id))
