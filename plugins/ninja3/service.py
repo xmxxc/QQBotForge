@@ -629,7 +629,18 @@ class Ninja3:
             if not await self.scope_open(event):
                 await self.reply(event, '本群未开放账号查询')
                 return
-            await self.reply(event, action['manage'] + '尚未交付，当前不可用', gate=lambda: self.menu_current(event, menu) and self.is_owner(event))
+            # Capture a synchronous scope snapshot for the final send gate.  The
+            # preliminary async check above only admits the action; a group close,
+            # ACL scope edit, reload or blacklist change while Sender prepares must
+            # suppress even this placeholder prompt.
+            revision = self.revision(event.appid)
+            acl = self.access()
+            snapshot = await acl.access_snapshot(event.appid, CONSUMER)
+
+            def gate():
+                return self.menu_current(event, menu) and self.is_owner(event) and self.scope_current(event, revision, acl, snapshot)
+
+            await self.reply(event, action['manage'] + '尚未交付，当前不可用', gate=gate)
         else:
             # Resolve eligibility and credentials anew using the actual sender/clicker.
             await self.query(event, resource=action.get('resource'), page=action.get('page', 0), menu=menu)
@@ -652,6 +663,25 @@ class Ninja3:
             )
         except (BusinessError, RuntimeError, ValueError, sqlite3.Error, OSError):
             return False
+
+    def scope_current(self, event, revision, acl, snapshot):
+        """Synchronous scope freshness check used after the final async read."""
+        state = acl.scope_states.get((event.appid, CONSUMER))
+        policy = snapshot['functions'].get(FUNCTION)
+        return bool(
+            self.unchanged(event.appid, revision)
+            and self.plugin_available(event.appid)
+            and self.access_provider() is acl
+            and acl.active
+            and state is not None
+            and acl.generation == snapshot['generation']
+            and state['version'] == snapshot['version']
+            and (event.appid, CONSUMER) not in acl.scope_pending
+            and event.raw_user_id not in get_blacklist_map(event.appid, 'user')
+            and event.group_id not in get_blacklist_map(event.appid, 'group')
+            and policy is not None
+            and event.group_id in policy.get('groups', [])
+        )
 
     async def route(self, event):
         if not self.plugin_available(event.appid) or not event.is_group or event.is_channel:

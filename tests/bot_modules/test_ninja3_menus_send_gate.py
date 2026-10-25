@@ -119,3 +119,19 @@ async def test_management_prompt_rechecks_menu_after_sender_preparation(ninja, w
     wire.marker = '尚未交付'
     await run(host, wire, 'expiry', None, clock, lambda: host.click(manage, user='owner-a', group='group-a'))
     assert len(wire.sent) == 1 and CHANGED in wire.texts()[0]
+
+
+async def test_management_prompt_rechecks_scope_after_sender_preparation(ninja, wire):
+    """Closing the plugin group while preparing a placeholder must block it."""
+    host = ninja
+    await host.setup()
+    clock = [1000]
+    host.ninja().clock = lambda: clock[0]
+    wire.sent.clear()
+    await host.say('菜单', user='owner-a')
+    manage = keyboard(wire.sent[0])[1]
+    wire.sent.clear()
+    wire.marker = '尚未交付'
+    await run(host, wire, 'close_group', None, clock, lambda: host.click(manage, user='owner-a', group='group-a'))
+    assert len(wire.sent) == 1 and CHANGED in wire.texts()[0]
+    assert '尚未交付' not in wire.texts()[0]
