@@ -3,6 +3,7 @@
 import asyncio
 import sqlite3
 
+import pytest
 from account_host import account_host as account_host  # noqa: F401
 from test_access_control import access_host as access_host  # noqa: F401
 from test_ninja3 import ninja as ninja  # noqa: F401
@@ -127,3 +128,25 @@ async def test_active_emergency_routes_owner_group_management_responses_privatel
         assert await host.say(command, user='owner-a') == []
     await wait_emergency(host)
     await host.ninja().emergency.exit('bot-a')
+
+
+async def test_second_emergency_connection_cannot_exit_during_remote_child_task(changing):
+    host = changing
+    host.center.block_path = CHANGE
+    emergency = host.ninja().emergency
+    await emergency.enter('bot-a')
+    await host.center.entered.wait()
+
+    from plugins.ninja3.storage import ExtensionStore
+
+    peer_store = ExtensionStore(host.tasks.store.path)
+    peer = type(emergency)(peer_store, host.tasks, notify=emergency.notify)
+    await peer.initialize()
+    with pytest.raises(ValueError, match='仍在进行'):
+        await peer.exit('bot-a')
+    host.center.release.set()
+    await wait_emergency(host)
+    await peer.exit('bot-a')
+    assert peer.current('bot-a')
+    await peer.shutdown()
+    peer_store.close()

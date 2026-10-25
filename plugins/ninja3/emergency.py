@@ -206,6 +206,10 @@ class EmergencyMode:
                     continue
                 account = item['account']
                 try:
+                    # Publish the handoff before selecting or confirming the child
+                    # task.  A second process can then reject an exit during this
+                    # otherwise task-less window.
+                    await self._update_item(bot, generation, index, status='running')
                     # A task ID already recorded for this generation is authoritative.
                     # On restart, never create a fresh task for a completed or paused
                     # item; doing so would submit a second password change.
@@ -281,6 +285,8 @@ class EmergencyMode:
             state = await self._get(bot)
             if not state or state.get('state') in {'inactive', 'exited'}:
                 return self.public(state)
+            if await self._has_running_tasks(bot, state):
+                raise EmergencyError('紧急改密仍在进行，请等待所有账号有结果后再退出')
             generation = state['generation']
 
             def leave(conn: sqlite3.Connection) -> Record:
@@ -299,6 +305,35 @@ class EmergencyMode:
             self._fail_closed.discard(bot)
             self._active_cache[bot] = False
             return self.public(result)
+
+    async def _has_running_tasks(self, bot: str, state: Record) -> bool:
+        """Check durable child-task handoffs, including tasks owned by another process."""
+
+        def check(conn: sqlite3.Connection) -> bool:
+            for item in state.get('accounts', []):
+                if item.get('status') != 'running':
+                    continue
+                key = item.get('task')
+                if not key:
+                    return True
+                row = conn.execute('SELECT payload FROM ninja3_password_tasks WHERE bot=? AND id=?', (bot, key)).fetchone()
+                if not row:
+                    return True
+                task = json.loads(row[0])
+                # A paused task has crossed the remote execution boundary and is
+                # safe to leave for owner recovery.  Selected and active execution
+                # states are still in the emergency handoff and block exit.
+                if task.get('state') == 'selected':
+                    return True
+                if task.get('active') and task.get('state') in {'prepared', 'preparing', 'submitting', 'verifying'}:
+                    return True
+            return False
+
+        try:
+            return bool(await self.store.atomic(check))
+        except (sqlite3.Error, OSError, RuntimeError):
+            # An unreadable task table cannot prove that no remote operation is in flight.
+            raise EmergencyError('紧急任务状态暂不可读，成员查询仍暂停') from None
 
     async def status(self, bot: str) -> Record:
         return self.public(await self._get(bot))
