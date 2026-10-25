@@ -48,6 +48,17 @@ Emergency state now persists a runner token. A peer runner cannot claim or mutat
 
 Final red/green evidence: the prior candidate's peer runner could clear a submitting task and exit; its group authorization and stale callback could expose public replies. The final focused suite is **261 passed in 53.27s**, including the blocked fake-protocol two-connection runner regression and stale-menu/authorization privacy regression. Ruff check/format, explicit mypy, and diff checks pass. No real QQ, game, password, merge, deploy, or production operation was performed.
 
+## Final restart takeover repair
+
+The latest review found a restart P1: selected/running emergency handoffs retained a dead runner token, so explicit owner re-entry could not recover the mode. The repair base was `3b3347b61bd5d9bcff176454bde7a1e7bfd85f8b` (tree `587b4a4433404f9022f2bea17467113f3ab40001`), and the final source repair is:
+
+- Final repair commit: `2450b5e686a8c607eae6a565e65fab034f2ab7a1`
+- Final repair tree: `178ae7740daa9001f0718857fa1f9afdc0646a4a`
+
+Emergency runner ownership now persists the owner PID and token. A live same-process registry or live foreign PID keeps ownership; a dead owner clears the token, marks the phase interrupted, and resets a task-less running handoff to pending. The child task ID is preserved so explicit re-entry can resume a selected task without creating a second password change. New regressions cover both task-ID and no-task-ID restart windows, peer ownership, and exit recovery.
+
+Final red/green evidence: the prior candidate could retain a dead token and leave restart-selected/no-task handoffs unrecoverable. The final focused suite is **263 passed in 55.13s**. Ruff check/format, explicit mypy, and diff checks pass. No real QQ, game, password, merge, deploy, or production operation was performed.
+
 ## Fixed candidate
 
 - Worker: `/opt/qqbot/QQBotForge-codex-71-worker`
