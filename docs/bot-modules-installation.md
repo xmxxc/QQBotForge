@@ -52,6 +52,7 @@ plugins/account_sharing  ──►  modules/self_qa ──(可选，受限规则
 - `modules/access_control/storage.py`
 - `modules/self_qa/storage.py`
 - `plugins/account_sharing/storage.py`
+- `plugins/ninja3/storage.py`（personal 分支存在时）
 
 这几份不要求字节一致，也不要为消除差异把任何一份换成旧副本。修改共同行为时须同步全部副本，并运行 `tests/bot_modules/test_extension_storage_contract.py`；新增带 `ExtensionStore` 的扩展存储时，须加入该测试与上面的清单（测试会扫描 `modules/*/storage.py`、`plugins/*/storage.py` 并核对本清单）。
 
