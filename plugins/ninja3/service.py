@@ -669,6 +669,10 @@ class Ninja3:
     async def query(self, event, name=None, *, resource=None, page=0, menu=None):
         """``name=None`` lists the names; otherwise answers that account in this group."""
         bot, group, member = event.appid, event.group_id, event.raw_user_id
+        if not self.emergency.current(bot):
+            if self.is_owner(event):
+                await self.owner_private(bot, '紧急模式已开启，成员查询暂停')
+            return
         if not event.is_group or event.is_channel or not group:
             await self.reply(event, '请在已开放的群内发送：账号列表')
             return
@@ -679,10 +683,6 @@ class Ninja3:
             opened = await self.store.get(bot, 'groups', group)
             if not opened or not opened['enabled']:
                 await self.reply(event, '本群未开放账号查询')
-                return
-            if not self.emergency.current(bot):
-                if self.is_owner(event):
-                    await self.owner_private(bot, '紧急模式已开启，成员查询暂停')
                 return
             invoke = await acl.evaluate(bot, CONSUMER, FUNCTION, group, member, action='invoke')
             if not (invoke['allowed'] and invoke['reason'] == 'explicit'):

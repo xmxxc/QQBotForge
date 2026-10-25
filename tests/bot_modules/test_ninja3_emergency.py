@@ -131,6 +131,24 @@ async def test_active_emergency_routes_owner_group_management_responses_privatel
     await host.ninja().emergency.exit('bot-a')
 
 
+async def test_emergency_query_gate_covers_unopened_group_and_c2c_paths(changing):
+    host = changing
+    await host.ninja_api('DELETE', 'groups/group-a')
+    await host.ninja().emergency.enter('bot-a')
+    assert await host.say('账号列表', user='MEMBERA') == []
+    assert await host.say('账号列表', user='owner-a') == []
+
+    before = len(host.sender.messages)
+    await host.event('账号列表', user='owner-b')
+    assert len(host.sender.messages) == before
+    before = len(host.sender.messages)
+    await host.event('账号列表', user='owner-a')
+    private = host.sender.messages[before:]
+    assert private and all(message[1] == 'owner-a' for message in private)
+    await wait_emergency(host)
+    await host.ninja().emergency.exit('bot-a')
+
+
 async def test_second_emergency_connection_cannot_exit_during_remote_child_task(changing):
     host = changing
     host.center.block_path = CHANGE
