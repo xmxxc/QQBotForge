@@ -26,6 +26,17 @@ New repair green evidence:
 
 Ruff check/format, explicit mypy for the seven Ninja3 source files, and `git diff --check d2960f1..6c43a55` passed. The final report commit is added after this repair commit, so the repair SHA/tree above remains the exact source candidate for independent review.
 
+## Final cross-process exit repair
+
+The last review found one P1 in the previous repair: `EmergencyMode.exit()` only checked process-local runners. The final repair base was `adf9375e3fec400925cfb71f39d3a1ae2b6bb40d` (tree `e310cd0a2b77b0cb86a06c9e389df3dfb2204a75`), and the final source repair is:
+
+- Final repair commit: `2d962a51571c8f91c96ae14f9693dd0e8edc5824`
+- Final repair tree: `a45821d08d29e09c2c32d3cd8073a7b3d1005209`
+
+Exit now checks persisted emergency account handoffs and the corresponding `ninja3_password_tasks` rows. It rejects missing/selected/prepared/preparing/submitting/verifying child tasks even when another process owns them, while allowing paused unknown and local-only recovery tasks. The runner publishes `status=running` before child selection, closing the task-less handoff window. A real two-connection regression holds the fake change request in flight, rejects peer exit, releases it, and then permits exit.
+
+Final red/green evidence: the prior candidate's cross-process scenario could write `state=exited` during the other process's remote child task; the final focused real-component suite is **260 passed in 53.38s**, including the new two-connection exit regression. Ruff check/format, explicit mypy, and `git diff --check e891f58..HEAD` pass. No real QQ, game, password, merge, deploy, or production operation was performed.
+
 ## Fixed candidate
 
 - Worker: `/opt/qqbot/QQBotForge-codex-71-worker`
