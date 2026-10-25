@@ -44,6 +44,35 @@ plugins/account_sharing  ──►  modules/self_qa ──(可选，受限规则
 
 均为 SQLite v1 `extension_records(bot, collection, id, payload)`；高于支持版本的库拒绝打开。
 
+## 存储副本同步（#61）
+
+为保证各目录可单独安装，每个扩展各带一份 `ExtensionStore`，只依赖标准库，不导入其他扩展或公共包：
+
+- `modules/group_state/storage.py`
+- `modules/access_control/storage.py`
+- `modules/self_qa/storage.py`
+- `plugins/account_sharing/storage.py`
+
+这几份不要求字节一致，也不要为消除差异把任何一份换成旧副本。修改共同行为时须同步全部副本，并运行 `tests/bot_modules/test_extension_storage_contract.py`；新增带 `ExtensionStore` 的扩展存储时，须加入该测试与上面的清单（测试会扫描 `modules/*/storage.py`、`plugins/*/storage.py` 并核对本清单）。
+
+共同行为契约（四份均用真实临时 SQLite 参数化验证）：
+
+- 首次使用时才打开，自动创建父目录；schema 为 v1 `extension_records`，主键 `(bot, collection, id)`，`user_version=1`，`journal_mode=WAL`。
+- `user_version` 高于 1 的库拒绝打开（`RuntimeError`），不改写该库，重试仍拒绝。
+- 记录按 Bot、集合、ID 隔离；`all` 按首次写入顺序返回，`get` 缺失返回 `None`；`put` 为原位更新（不改变顺序），`delete` 只删一条，删除不存在的记录无副作用。
+- 每次写入立即提交，另一连接可见；关闭后重开仍在。payload 为 `ensure_ascii=False` 的 JSON。
+- 并发写入经同一锁串行，不丢失；`close` 等待正在执行的写入完成后再关闭连接，之后任何读写都报“扩展存储已关闭”；`close` 可重复调用。
+
+有意差异（测试只约束列出的副本）：
+
+| 行为 | 群状态 | 授权 | 问答 | 账户 |
+| --- | --- | --- | --- | --- |
+| `keys(bot, collection)` 按写入顺序返回 ID | — | 有 | — | — |
+| `get(..., missing=默认值)` 缺失时返回指定值 | — | 有 | — | — |
+| 调用方被取消（含重复取消）时先排空在途 SQLite 写入再传播取消，取消的写入不会之后在后台提交 | 有 | 有 | 未承诺 | 未承诺 |
+
+问答与账户目前直接 `await asyncio.to_thread(...)`：调用方被取消时取消立即传播，已交给存储线程的写入仍可能随后提交。是否为它们引入排空语义需另行确认规格，不随本清单强加。新增或取消差异时须同时更新本表与测试中的 `EXTRAS`／`GET_MISSING_KEYWORD`／`DRAINS_CANCELLED_WRITES`。
+
 ## 升级与迁移（由主人另行安排）
 
 1. 停用扩展并确认连接关闭，用 SQLite 备份或停机一致性副本保存四个库（不要丢弃运行中的 WAL／SHM）。
