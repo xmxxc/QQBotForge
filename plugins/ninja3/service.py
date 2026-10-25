@@ -501,6 +501,12 @@ class Ninja3:
             return 'unavailable'
         return self.outcome(await sender.send_to_user(owner['private_id'], content))
 
+    async def management_reply(self, event, content):
+        """Route owner management results privately while emergency mode is active."""
+        if event.is_group and self.emergency.active(event.appid):
+            return await self.owner_private(event.appid, content)
+        return await self.reply(event, content)
+
     async def emergency_command(self, event, command=None):
         """Enter, inspect, or leave persistent emergency mode.
 
@@ -560,7 +566,7 @@ class Ninja3:
             names, specified = argument, None
             if '指定' in argument:
                 if not private:
-                    await self.reply(event, '指定密码只接受主人私聊或已登录后台，本条未使用')
+                    await self.management_reply(event, '指定密码只接受主人私聊或已登录后台，本条未使用')
                     return
                 match = re.fullmatch(r'(.*?)\s*(?<!\S)指定\s+(\S+)\s*', argument)
                 if not match:
@@ -583,9 +589,9 @@ class Ninja3:
             confirm = f'发送“忍3批量确认 {batch["id"]}”确认；未确认不会开始。'
             if private:
                 scope = '\n'.join(f'{i["name"]}{"（指定密码与旧密码相同，将跳过）" if i["outcome"] == "input_rejected" else ""}' for i in batch['items'])
-                await self.reply(event, f'已选择 {len(batch["items"])} 个账号：\n{scope}\n{confirm}')
+                await self.management_reply(event, f'已选择 {len(batch["items"])} 个账号：\n{scope}\n{confirm}')
             else:
-                await self.reply(event, f'已选择 {len(batch["items"])} 个账号，范围请在主人私聊或后台查看。{confirm}')
+                await self.management_reply(event, f'已选择 {len(batch["items"])} 个账号，范围请在主人私聊或后台查看。{confirm}')
             return
         if not argument or len(argument) != 32:
             raise TaskError('请提供有效批次编号')
@@ -596,7 +602,7 @@ class Ninja3:
         else:
             batch = await self.password_batches.get(bot, argument)
         # Accepted is not success: the summary reports each account separately.
-        await self.reply(event, self.batch_summary(batch, detailed=private))
+        await self.management_reply(event, self.batch_summary(batch, detailed=private))
 
     async def password_command(self, event):
         if not self.is_owner(event):
@@ -620,14 +626,14 @@ class Ninja3:
                 if not argument:
                     # Group replies are public: account names are listed only in private chat.
                     names = '可选：' + '、'.join(a['name'] for a in accounts) if event.is_direct else '可选名称请在主人私聊或后台查看'
-                    await self.reply(event, '尚未选择账号。发送“忍3改密 名称”选择一个账号；再普通确认。' + names)
+                    await self.management_reply(event, '尚未选择账号。发送“忍3改密 名称”选择一个账号；再普通确认。' + names)
                     return
                 account = next((a for a in accounts if a['name'] == argument), None)
                 if account is None:
                     raise TaskError('账号不存在，请只提供单个账号名称')
                 task = await self.password_tasks.select(bot, account['id'], actor)
                 if task['state'] == 'selected':
-                    await self.reply(event, f'已选择账号。发送“忍3确认 {task["id"]}”确认随机改密；未确认不会开始。')
+                    await self.management_reply(event, f'已选择账号。发送“忍3确认 {task["id"]}”确认随机改密；未确认不会开始。')
                     return
             elif not argument or len(argument) != 32:
                 raise TaskError('请提供有效改密任务编号')
@@ -647,18 +653,12 @@ class Ninja3:
                 task = await self.password_tasks.get(bot, argument)
             # Group acknowledgement contains no detailed remote result or credentials.
             content = f'改密任务 {task["id"]} 已记录，请在主人私聊或后台查看结果。' if event.is_group else self.password_summary(task)
-            if event.is_group and not self.emergency.current(bot):
-                await self.owner_private(bot, content)
-            else:
-                await self.reply(event, content)
+            await self.management_reply(event, content)
         except TaskError as error:
-            if event.is_group and not self.emergency.current(bot):
-                await self.owner_private(bot, str(error))
-            else:
-                await self.reply(event, str(error))
+            await self.management_reply(event, str(error))
         except (sqlite3.Error, OSError, RuntimeError) as error:
             log.error(f'[{bot}] 改密任务操作失败: {type(error).__name__}')
-            await self.reply(event, '改密任务暂不可用，账号保持原有暂停状态，请查看后台')
+            await self.management_reply(event, '改密任务暂不可用，账号保持原有暂停状态，请查看后台')
 
     # ---------- member queries ----------
 
@@ -1067,7 +1067,7 @@ class Ninja3:
             lines.append(f'未送达的未授权通知 {len(pending)} 条，请在后台查看')
         if event.is_direct and not event.is_channel:
             lines.append('已记录本私聊为主人通知地址')
-        await self.reply(event, '\n'.join(lines))
+        await self.management_reply(event, '\n'.join(lines))
 
     async def status(self, bot):
         """Read-only comparison of the plugin's open scope with the authorization module's."""

@@ -152,7 +152,7 @@ class PasswordTasks:
         self.clock = clock
         self.workers: dict[tuple[str, str], asyncio.Task[None]] = {}
         # Decided outcomes whose durable write failed; keyed by task, bound to the executor token.
-        self.held: dict[tuple[str, str], tuple[str, Record]] = {}
+        self.held: dict[tuple[str, str], tuple[str, Record, bool]] = {}
         self.flushers: dict[tuple[str, str], asyncio.Task[None]] = {}
         # Held outcomes being written and settled; like workers, they block retry/release/recover.
         self.flushing: set[tuple[str, str]] = set()
@@ -194,6 +194,8 @@ class PasswordTasks:
                     recovery.append((bot, task['id']))
                 elif task['state'] == 'submitting':
                     task.update(state='paused', remote=RemoteStatus.UNKNOWN, error='interrupted')
+                elif task['state'] == 'verifying':
+                    task.update(state='paused', remote=RemoteStatus.UNKNOWN, error='interrupted', verification='inconclusive')
                 elif task['state'] in {'prepared', 'preparing'}:
                     task.update(state='paused', error='interrupted')
                 self._save(conn, bot, task)
@@ -400,13 +402,26 @@ class PasswordTasks:
             raise TaskError('待用密码关联不符，账号保持暂停')
         return intent
 
-    async def _mutate(self, bot: str, key: str, runner: str | None = None, **changes: Any) -> Record:
+    async def _mutate(
+        self,
+        bot: str,
+        key: str,
+        runner: str | None = None,
+        *,
+        guarded_state: str | None = None,
+        reject_cancel: bool = False,
+        **changes: Any,
+    ) -> Record:
         """With runner: compare-and-set on the durable executor token and active intent."""
 
         def update(conn: sqlite3.Connection) -> Record:
             task = self._read(conn, bot, key)
             if runner is not None and (task.get('runner') != runner or not task['active']):
                 raise SupersededError('改密意图已被放弃、重试或完成')
+            if guarded_state is not None and task.get('state') != guarded_state:
+                raise SupersededError('改密意图状态变化，账号保持暂停')
+            if reject_cancel and (task.get('cancel_requested') or self.closed):
+                raise SupersededError('改密已取消，账号保持暂停')
             task.update(changes)
             self._save(conn, bot, task)
             return task
@@ -466,7 +481,9 @@ class PasswordTasks:
         try:
             await asyncio.shield(finalizer)
         except asyncio.CancelledError:
-            await finalizer
+            if self.closed and not finalizer.done():
+                finalizer.cancel()
+            await asyncio.gather(finalizer, return_exceptions=True)
 
     async def _claim_verification(self, bot: str, key: str, runner: str) -> Record:
         def claim(conn: sqlite3.Connection) -> Record:
@@ -489,11 +506,26 @@ class PasswordTasks:
 
         return dict(await self.store.atomic(claim))
 
+    async def _call_verifier(self, values: VerifyInput) -> VerifyResult:
+        """Run a verifier in a detachable task so unload cannot await a hostile transport."""
+        verifier: asyncio.Future[VerifyResult] = asyncio.ensure_future(self.verifier(values))
+        try:
+            return await asyncio.shield(verifier)
+        except asyncio.CancelledError:
+            verifier.cancel()
+
+            def consume(done: asyncio.Future[VerifyResult]) -> None:
+                if not done.cancelled():
+                    done.exception()
+
+            verifier.add_done_callback(consume)
+            raise
+
     async def _verify_unknown(self, bot: str, key: str, runner: str, task: Record) -> None:
         """Verify the same sealed intent; a failed check never proves the password unchanged."""
         try:
             intent = self._intent(bot, task)
-            result = await self.verifier(VerifyInput(intent['login'], intent['area'], intent['new_password']))
+            result = await self._call_verifier(VerifyInput(intent['login'], intent['area'], intent['new_password']))
             if result.verified:
                 changes = dict(
                     state='paused',
@@ -514,11 +546,11 @@ class PasswordTasks:
         except Exception:
             changes = dict(state='paused', remote=RemoteStatus.UNKNOWN, error='verification_error', verification='inconclusive')
         try:
-            await self._persist_outcome(bot, key, runner, changes)
+            await self._persist_outcome(bot, key, runner, changes, guarded=True)
         except SupersededError:
             return
         except (sqlite3.Error, OSError):
-            self._hold(bot, key, runner, changes)
+            self._hold(bot, key, runner, changes, guarded=True)
             return
         await self._settle(bot, key, runner)
 
@@ -534,17 +566,18 @@ class PasswordTasks:
         except Exception:
             return
 
-    async def _persist_outcome(self, bot: str, key: str, runner: str, changes: Record) -> None:
+    async def _persist_outcome(self, bot: str, key: str, runner: str, changes: Record, *, guarded: bool = False) -> None:
         """A transient write failure must not turn a decisive remote result into unknown."""
         for delay in RESULT_WRITE_RETRIES:
             try:
-                await self._mutate(bot, key, runner=runner, **changes)
+                await self._mutate(bot, key, runner=runner, guarded_state='verifying' if guarded else None, reject_cancel=guarded, **changes)
                 return
             except (sqlite3.Error, OSError):
                 await asyncio.sleep(delay)
-        await self._mutate(bot, key, runner=runner, **changes)
+        await self._mutate(bot, key, runner=runner, guarded_state='verifying' if guarded else None, reject_cancel=guarded, **changes)
 
     async def _finish(self, bot: str, key: str, runner: str, result: ChangeResult | None, failure: str) -> None:
+        verification_guard = False
         if result is not None and result.remote_status == RemoteStatus.UNKNOWN:
             try:
                 task = await self.store.atomic(lambda conn: self._read(conn, bot, key))
@@ -573,8 +606,9 @@ class PasswordTasks:
                 task = await self.store.atomic(mark_verifying)
                 try:
                     if task['state'] == 'verifying':
+                        verification_guard = True
                         intent = self._intent(bot, task)
-                        verified = await self.verifier(VerifyInput(intent['login'], intent['area'], intent['new_password']))
+                        verified = await self._call_verifier(VerifyInput(intent['login'], intent['area'], intent['new_password']))
                         if verified.verified:
                             result = ChangeResult(Stage.VERIFY, RemoteStatus.VERIFIED_SUCCESS, verified.error_code)
                             failure = ''
@@ -605,14 +639,14 @@ class PasswordTasks:
             # Unknown if the durable pre-submit marker was already crossed.
             changes = dict(state='paused', error=failure)
         try:
-            await self._persist_outcome(bot, key, runner, changes)
+            await self._persist_outcome(bot, key, runner, changes, guarded=verification_guard)
         except SupersededError:
             # Result-write linearization point: a stale executor never touches a
             # released/retried/completed intent, its pause or the account.
             return
         except (sqlite3.Error, OSError):
             # Keep the decided outcome in this process instead of dropping it.
-            self._hold(bot, key, runner, changes)
+            self._hold(bot, key, runner, changes, guarded=verification_guard)
             return
         except Exception:
             # No raw exceptions or intent; active=1 and the durable marker keep it paused.
@@ -637,9 +671,9 @@ class PasswordTasks:
             # No raw exceptions or intent; active=1 keeps the account paused for recovery.
             return
 
-    def _hold(self, bot: str, key: str, runner: str, changes: Record) -> None:
+    def _hold(self, bot: str, key: str, runner: str, changes: Record, *, guarded: bool = False) -> None:
         log.error('改密任务结果暂未落盘，已在进程内保留并稍后重试: %s', key)
-        self.held[(bot, key)] = (runner, changes)
+        self.held[(bot, key)] = (runner, changes, guarded)
         if (bot, key) not in self.flushers and not self.closed:
             flusher = asyncio.create_task(self._flush_later(bot, key))
             self.flushers[(bot, key)] = flusher
@@ -661,11 +695,11 @@ class PasswordTasks:
         held = self.held.pop((bot, key), None)
         if held is None:
             return False
-        runner, changes = held
+        runner, changes, guarded = held
         self.flushing.add((bot, key))
         try:
             try:
-                await self._mutate(bot, key, runner=runner, **changes)
+                await self._mutate(bot, key, runner=runner, guarded_state='verifying' if guarded else None, reject_cancel=guarded, **changes)
             except SupersededError:
                 log.error('改密任务保留结果已被新的任务状态取代，未写入: %s', key)
                 return False
@@ -785,6 +819,8 @@ class PasswordTasks:
                 task['state'] = 'cancelled'
             elif task['state'] == 'prepared':
                 task.update(state='paused', error='cancelled')
+            elif task['state'] == 'verifying':
+                task.update(state='paused', remote=RemoteStatus.UNKNOWN, error='cancelled', verification='inconclusive')
             self._save(conn, bot, task)
             return task, True
 

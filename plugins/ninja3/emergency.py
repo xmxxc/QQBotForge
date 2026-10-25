@@ -84,15 +84,9 @@ class EmergencyMode:
         """Synchronous final-send gate: normal mode is allowed only when readable."""
         if self.closed or bot in self._fail_closed:
             return False
-        if self._ready and self._active_cache.get(bot, False):
-            return False
         try:
             with closing(self._read_only()) as conn:
                 row = self._read(conn, bot)
-        except sqlite3.OperationalError as error:
-            # A regular Ninja3 write may hold the shared SQLite writer lock.  The
-            # cached inactive state remains safe; an unavailable database does not.
-            return 'locked' in str(error).lower() or 'busy' in str(error).lower()
         except (sqlite3.Error, OSError):
             return False
         active = bool(row and row.get('state') in {'active', 'starting'})
@@ -102,15 +96,9 @@ class EmergencyMode:
     def active(self, bot: str) -> bool:
         if self.closed or bot in self._fail_closed:
             return True
-        if self._ready and self._active_cache.get(bot, False):
-            return True
         try:
             with closing(self._read_only()) as conn:
                 row = self._read(conn, bot)
-        except sqlite3.OperationalError as error:
-            if 'locked' in str(error).lower() or 'busy' in str(error).lower():
-                return self._active_cache.get(bot, False)
-            return True
         except (sqlite3.Error, OSError):
             return True
         active = bool(row and row.get('state') in {'active', 'starting'})

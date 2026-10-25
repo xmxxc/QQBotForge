@@ -86,3 +86,44 @@ async def test_non_owner_emergency_command_is_silent_and_other_bot_is_unaffected
     await host.event('忍3紧急模式', user='owner-b')
     assert len(host.sender.messages) == before
     assert (await host.ninja_api('GET', 'emergency', bot='bot-b'))[1]['data']['state'] == 'inactive'
+
+
+async def test_emergency_gate_fails_closed_on_locked_or_unreadable_sqlite(changing, monkeypatch):
+    host = changing
+    emergency = host.ninja().emergency
+    assert emergency.current('bot-a')
+
+    def locked():
+        raise sqlite3.OperationalError('database is locked')
+
+    monkeypatch.setattr(emergency, '_read_only', locked)
+    assert not emergency.current('bot-a') and emergency.active('bot-a')
+
+
+async def test_emergency_exit_is_observed_by_a_second_mode_instance(changing):
+    host = changing
+    emergency = host.ninja().emergency
+    await emergency.enter('bot-a')
+    peer = type(emergency)(host.tasks.store, host.tasks, notify=emergency.notify)
+    await peer.initialize()
+    assert not peer.current('bot-a')
+    await wait_emergency(host)
+    await emergency.exit('bot-a')
+    assert peer.current('bot-a')
+    await peer.shutdown()
+
+
+async def test_active_emergency_routes_owner_group_management_responses_privately(changing):
+    host = changing
+    await host.ninja().emergency.enter('bot-a')
+    commands = (
+        '忍3改密 账号A',
+        '忍3批量改密 账号A',
+        '忍3确认 ' + '0' * 32,
+        '忍3批量确认 ' + '0' * 32,
+        '忍3',
+    )
+    for command in commands:
+        assert await host.say(command, user='owner-a') == []
+    await wait_emergency(host)
+    await host.ninja().emergency.exit('bot-a')

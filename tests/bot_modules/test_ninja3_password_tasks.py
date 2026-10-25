@@ -679,6 +679,79 @@ async def test_failed_unknown_verification_stays_paused_and_explicit_retry_is_bo
     assert host.center.changes == 1
 
 
+async def test_restart_normalizes_interrupted_verification_and_owner_retry_stays_bounded(changing, monkeypatch):
+    host = changing
+    delayed = []
+    monkeypatch.setattr(host.tasks, '_start', lambda bot, key: delayed.append((bot, key)))
+    task = await host.select()
+    assert (await host.action(task))[0] == 200
+    raw = await raw_task(host, task)
+
+    def interrupt(conn):
+        row = host.tasks._read(conn, 'bot-a', task['id'])
+        row.update(state='verifying', remote='unknown', verification='running', verification_attempts=1, runner='stale-runner')
+        host.tasks._save(conn, 'bot-a', row)
+
+    await host.tasks.store.atomic(interrupt)
+    await host.plugins.reload('ninja3')
+    restarted = host.ninja().password_tasks
+    host.tasks = restarted
+    normalized = await raw_task(host, task)
+    assert normalized['state'] == 'paused' and normalized['remote'] == 'unknown' and normalized['verification_attempts'] == 1
+    restarted.verifier = _verification
+    assert (await restarted.verify('bot-a', task['id']))['verification_attempts'] == 1
+    await asyncio.gather(*list(restarted.workers.values()))
+    finished = await task_info(host, task)
+    assert finished['verification_attempts'] == 2 and finished['remote'] == 'unknown' and host.center.changes == 0
+    assert raw['intent'] == normalized['intent']
+
+
+async def test_cancel_during_verification_cannot_commit_verified_password(changing):
+    host = changing
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def verifier(_values):
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+        return VerifyResult(True, ErrorCode.NONE)
+
+    host.tasks.verifier = verifier
+    host.center.change_result = httpx.ReadTimeout('fake-uncertain')
+    task = await host.select()
+    await host.action(task)
+    await started.wait()
+    assert (await host.action(task, 'cancel'))[0] == 200
+    release.set()
+    await host.finished()
+    result = await task_info(host, task)
+    assert result['remote'] == 'unknown' and result['local'] != 'committed' and host.center.changes == 1
+    assert (await host.tasks.store.get('bot-a', 'accounts', host.account['id']))['password'] == OLD
+
+
+async def test_unload_does_not_wait_forever_for_verifier(changing):
+    host = changing
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def verifier(_values):
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+        return VerifyResult(False, ErrorCode.TIMEOUT)
+
+    host.tasks.verifier = verifier
+    host.center.change_result = httpx.ReadTimeout('fake-uncertain')
+    task = await host.select()
+    await host.action(task)
+    await started.wait()
+    await asyncio.wait_for(host.ninja().password_tasks.shutdown(), timeout=1)
+    release.set()
+
+
 async def test_group_reply_lists_no_account_names_but_private_does(changing):
     host = changing
     group = (await host.say('忍3改密', user='owner-a'))[0]
