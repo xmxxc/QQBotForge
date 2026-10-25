@@ -22,6 +22,7 @@ from core.base.config import cfg
 from core.base.logger import PLUGIN, get_logger
 from core.plugin._blacklist import get_blacklist_map
 
+from .emergency import EmergencyError, EmergencyMode
 from .password_batches import OUTCOMES, PasswordBatches
 from .password_tasks import PasswordTasks, TaskError
 from .storage import AccountLockedError, ExtensionStore
@@ -96,8 +97,9 @@ class Ninja3:
         self.writes = {}
         self.notice_locks = {}
         self.menus = {}  # Process-local references: reload invalidates every old menu.
-        self.password_tasks = PasswordTasks(self.store, notify=self.password_receipt, clock=clock)
+        self.password_tasks = PasswordTasks(self.store, notify=self.password_receipt, on_change=self._task_changed, clock=clock)
         self.password_batches = PasswordBatches(self.store, self.password_tasks, notify=self.password_batch_receipt, clock=clock)
+        self.emergency = EmergencyMode(self.store, self.password_tasks, notify=self.emergency_receipt, clock=clock)
 
     @staticmethod
     def _access_module():
@@ -118,9 +120,11 @@ class Ninja3:
         await self.store.ready()
         await self.password_tasks.initialize()
         await self.password_batches.initialize()
+        await self.emergency.initialize()
 
     def close(self):
         self.active = False
+        self.emergency.closed = True
         self.password_tasks.closed = True
         self.password_batches.closed = True
         self.store.close()
@@ -149,6 +153,10 @@ class Ninja3:
 
     def unchanged(self, bot, revision):
         return self.active and not self.writes.get(bot) and self.revision(bot) == revision
+
+    def _task_changed(self, bot):
+        """Durable task commits invalidate in-flight account queries like owner writes."""
+        self.revisions[bot] = self.revisions.get(bot, 0) + 1
 
     @staticmethod
     async def declare(acl, bot):
@@ -465,13 +473,21 @@ class Ninja3:
 
     def account_paused(self, bot, account):
         """Current durable task pause; future emergency checks must be ORed, never reset here."""
-        return self.password_tasks.is_paused(bot, account)
+        return self.password_tasks.is_paused(bot, account) or self.emergency.active(bot)
 
     async def password_receipt(self, bot, task):
         return await self.owner_private(bot, self.password_summary(task))
 
     async def password_batch_receipt(self, bot, batch):
         return await self.owner_private(bot, self.batch_summary(batch, detailed=True))
+
+    async def emergency_receipt(self, bot, state):
+        counts = {}
+        for item in state.get('accounts', []):
+            outcome = item.get('status', 'pending')
+            counts[outcome] = counts.get(outcome, 0) + 1
+        summary = '，'.join(f'{key} {value}' for key, value in counts.items()) or '无账号'
+        return await self.owner_private(bot, f'忍3紧急模式：{state.get("phase", "未知")}；{summary}。详细记录可在已登录后台查看。')
 
     async def owner_private(self, bot, content):
         owner = await self.store.get(bot, 'owners', 'observed_c2c')
@@ -485,9 +501,44 @@ class Ninja3:
             return 'unavailable'
         return self.outcome(await sender.send_to_user(owner['private_id'], content))
 
+    async def emergency_command(self, event, command=None):
+        """Enter, inspect, or leave persistent emergency mode.
+
+        Group invocations deliberately have no public acknowledgement.  A
+        non-owner is silent so the command cannot become a management oracle.
+        """
+        if not self.is_owner(event):
+            return
+        if event.is_channel:
+            return
+        bot = event.appid
+        command = command or (event.content or '').strip().split(maxsplit=1)[0]
+        try:
+            if command == '忍3紧急模式':
+                result = await self.emergency.enter(bot)
+                message = f'紧急模式已开启（{result["generation"]}），成员查询已暂停；全账号改密已开始，结果将在主人私聊或后台查看。'
+            elif command == '忍3紧急状态':
+                result = await self.emergency.status(bot)
+                message = f'紧急模式：{result["state"]}；阶段：{result["phase"]}。详细记录可在已登录后台查看。'
+            else:
+                result = await self.emergency.exit(bot)
+                message = '紧急模式已退出；未解决改密账号仍保持暂停，其他账号恢复查询。'
+        except EmergencyError as error:
+            message = str(error)
+        if event.is_group:
+            await self.owner_private(bot, message)
+        else:
+            await self.reply(event, message)
+
     @staticmethod
     def password_summary(task):
-        labels = {'not_submitted': '尚未提交', 'reported_success': '远端报告成功', 'rejected': '远端明确拒绝', 'unknown': '远端结果未知'}
+        labels = {
+            'not_submitted': '尚未提交',
+            'reported_success': '远端报告成功',
+            'verified_success': '登录核验确认成功',
+            'rejected': '远端明确拒绝',
+            'unknown': '远端结果未知',
+        }
         return f'忍3改密任务 {task["id"]}：{labels[task["remote"]]}；本地 {task["local"]}；状态 {task["state"]}。详细记录可在已登录后台查看。'
 
     @staticmethod
@@ -549,6 +600,8 @@ class Ninja3:
 
     async def password_command(self, event):
         if not self.is_owner(event):
+            if self.emergency.active(event.appid):
+                return
             await self.reply(event, '仅主人可以操作改密任务')
             return
         if event.is_channel:
@@ -588,16 +641,24 @@ class Ninja3:
                 task = await self.password_tasks.cancel(bot, argument)
             elif command == '忍3恢复':
                 task = await self.password_tasks.recover(bot, argument)
+            elif command == '忍3核验':
+                task = await self.password_tasks.verify(bot, argument)
             else:
                 task = await self.password_tasks.get(bot, argument)
             # Group acknowledgement contains no detailed remote result or credentials.
-            await self.reply(event, f'改密任务 {task["id"]} 已记录，请在主人私聊或后台查看结果。' if event.is_group else self.password_summary(task))
+            content = f'改密任务 {task["id"]} 已记录，请在主人私聊或后台查看结果。' if event.is_group else self.password_summary(task)
+            if event.is_group and not self.emergency.current(bot):
+                await self.owner_private(bot, content)
+            else:
+                await self.reply(event, content)
         except TaskError as error:
-            await self.reply(event, str(error))
+            if event.is_group and not self.emergency.current(bot):
+                await self.owner_private(bot, str(error))
+            else:
+                await self.reply(event, str(error))
         except (sqlite3.Error, OSError, RuntimeError) as error:
             log.error(f'[{bot}] 改密任务操作失败: {type(error).__name__}')
             await self.reply(event, '改密任务暂不可用，账号保持原有暂停状态，请查看后台')
-
 
     # ---------- member queries ----------
 
@@ -615,6 +676,10 @@ class Ninja3:
             if not opened or not opened['enabled']:
                 await self.reply(event, '本群未开放账号查询')
                 return
+            if not self.emergency.current(bot):
+                if self.is_owner(event):
+                    await self.owner_private(bot, '紧急模式已开启，成员查询暂停')
+                return
             invoke = await acl.evaluate(bot, CONSUMER, FUNCTION, group, member, action='invoke')
             if not (invoke['allowed'] and invoke['reason'] == 'explicit'):
                 await self.refuse(event, invoke, 'list' if name is None and resource is None else 'query')
@@ -625,7 +690,9 @@ class Ninja3:
             if paused is None:
                 await self.reply(event, UNAVAILABLE)
                 return
-            accounts = [a for a in await self.store.project(bot, 'accounts', DIRECTORY) if a['enabled'] and group in (a['open_groups'] or []) and a['id'] not in paused]
+            accounts = [
+                a for a in await self.store.project(bot, 'accounts', DIRECTORY) if a['enabled'] and group in (a['open_groups'] or []) and a['id'] not in paused
+            ]
             if name is None and resource is None:
                 available = []
                 for account in accounts:
@@ -690,6 +757,7 @@ class Ninja3:
             self.unchanged(event.appid, revision)
             and self.plugin_available(event.appid)
             and self.access_provider() is acl
+            and self.emergency.current(event.appid)
             and all(acl.decision_current(event.appid, d) for d in decisions)
             and (menu is None or self.menu_current(event, menu))
             and (not account_ids or self._accounts_current(event.appid, account_ids))
@@ -698,7 +766,7 @@ class Ninja3:
 
     def _accounts_current(self, bot, account_ids):
         paused = self.password_tasks.paused_accounts(bot)
-        return paused is not None and not (set(account_ids) & paused)
+        return self.emergency.current(bot) and paused is not None and not (set(account_ids) & paused)
 
     @staticmethod
     def plugin_available(bot):
@@ -719,6 +787,7 @@ class Ninja3:
             and self.plugin_available(event.appid)
             and event.is_group
             and not event.is_channel
+            and self.emergency.current(event.appid)
             and menu['bot'] == event.appid
             and menu['group'] == event.group_id
             and menu['expires_at'] > self.clock()
@@ -766,6 +835,7 @@ class Ninja3:
                 return (
                     self.unchanged(bot, revision)
                     and self.plugin_available(bot)
+                    and self.emergency.current(bot)
                     and self.access_provider() is acl
                     and acl.active
                     and acl.generation == snapshot['generation']
@@ -809,7 +879,13 @@ class Ninja3:
             def gate():
                 return self.menu_current(event, menu) and self.is_owner(event) and self.scope_current(event, revision, acl, snapshot)
 
-            await self.reply(event, action['manage'] + '尚未交付，当前不可用', gate=gate)
+            if action['manage'] == '紧急模式':
+                if not gate():
+                    await self.reply(event, CHANGED)
+                    return
+                await self.emergency_command(event, '忍3紧急模式')
+            else:
+                await self.reply(event, action['manage'] + '尚未交付，当前不可用', gate=gate)
         else:
             # Resolve eligibility and credentials anew using the actual sender/clicker.
             await self.query(event, resource=action.get('resource'), page=action.get('page', 0), menu=menu)
@@ -824,6 +900,7 @@ class Ninja3:
                 self.plugin_available(event.appid)
                 and self.access_provider() is acl
                 and acl.active
+                and self.emergency.current(event.appid)
                 and (event.appid, CONSUMER) not in acl.scope_pending
                 and self.unchanged(event.appid, revision)
                 and opened
@@ -842,6 +919,7 @@ class Ninja3:
             and self.plugin_available(event.appid)
             and self.access_provider() is acl
             and acl.active
+            and self.emergency.current(event.appid)
             and state is not None
             and acl.generation == snapshot['generation']
             and state['version'] == snapshot['version']
@@ -1054,7 +1132,7 @@ class Ninja3:
                     if not isinstance(body, dict) or set(body) != {'account'} or not isinstance(body['account'], str):
                         raise TaskError('请明确选择一个账号，不接收指定密码')
                     result = await tasks.select(bot, body['account'], 'backend')
-                elif request.method == 'POST' and len(parts) == 3 and parts[2] in {'confirm', 'retry', 'cancel', 'recover', 'release'}:
+                elif request.method == 'POST' and len(parts) == 3 and parts[2] in {'confirm', 'retry', 'cancel', 'recover', 'release', 'verify'}:
                     body = await request.json()
                     if body != {}:
                         raise TaskError('任务操作不接收额外参数')
@@ -1062,6 +1140,20 @@ class Ninja3:
                         result = await getattr(tasks, parts[2])(bot, parts[1], 'backend')
                     else:
                         result = await getattr(tasks, parts[2])(bot, parts[1])
+                else:
+                    raise BusinessError('方法不适用', 405)
+                return web.json_response({'success': True, 'data': result})
+            if parts[0] == 'emergency':
+                if request.method == 'GET' and len(parts) == 1:
+                    result = await self.emergency.status(bot)
+                elif request.method == 'POST' and len(parts) == 1:
+                    if await request.json() != {}:
+                        raise TaskError('紧急模式入口不接收额外参数')
+                    result = await self.emergency.enter(bot)
+                elif request.method == 'POST' and parts[1:] == ['exit']:
+                    if await request.json() != {}:
+                        raise TaskError('紧急模式入口不接收额外参数')
+                    result = await self.emergency.exit(bot)
                 else:
                     raise BusinessError('方法不适用', 405)
                 return web.json_response({'success': True, 'data': result})
@@ -1110,7 +1202,7 @@ class Ninja3:
                 result = await manage(bot, operation, data, key)
                 return web.json_response({'success': True, 'data': result}, status=201 if operation == 'create' else 200)
             raise BusinessError('入口不存在', 404)
-        except (BusinessError, TaskError, json.JSONDecodeError) as error:
+        except (BusinessError, TaskError, EmergencyError, json.JSONDecodeError) as error:
             return web.json_response({'success': False, 'error': str(error)}, status=getattr(error, 'status', 422))
         except AccountLockedError as error:
             return web.json_response({'success': False, 'error': str(error)}, status=409)

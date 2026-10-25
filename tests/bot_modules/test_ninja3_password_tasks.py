@@ -18,13 +18,17 @@ from test_access_control import access_host as access_host  # noqa: F401
 from test_ninja3 import grant
 from test_ninja3 import ninja as ninja  # noqa: F401
 
-from plugins.ninja3.password_protocol import change_password
+from plugins.ninja3.password_protocol import ErrorCode, VerifyResult, change_password
 from plugins.ninja3.password_tasks import IntentCipher, PasswordTasks, random_password
 from plugins.ninja3.storage import ExtensionStore
 
 LOGIN = '16600000000'
 OLD = 'fake-old-password'
 CHANGE = '/api/web/user_center/change_pwd'
+
+
+async def _verification(_values):
+    return VerifyResult(False, ErrorCode.IDENTITY)
 
 
 @pytest.fixture(autouse=True)
@@ -240,6 +244,7 @@ async def test_durable_concurrent_claim_across_two_connections_returns_same_task
 )
 async def test_rejected_unknown_pause_only_target_and_restart_never_resubmits(changing, response, remote):
     host = changing
+    host.tasks.verifier = lambda values: _verification(False)
     await host.setup(name='账号B', password='fake-other-account')
     host.center.change_result = response
     task = await host.select()
@@ -616,6 +621,7 @@ async def test_rejected_retry_reuses_same_intent_and_release_restores_unchanged_
 
 async def test_unknown_result_cannot_be_retried_or_released(changing):
     host = changing
+    host.tasks.verifier = lambda values: _verification(False)
     host.center.change_result = httpx.ReadTimeout('fake')
     task = await host.select()
     await host.action(task)
@@ -625,6 +631,52 @@ async def test_unknown_result_cannot_be_retried_or_released(changing):
         assert status == 422 and '未知' in response['error']
     assert '未知' in (await host.say('忍3放弃 ' + task['id'], user='owner-a'))[0]
     assert host.ninja().account_paused('bot-a', host.account['id']) and host.center.changes == 1
+
+
+async def test_unknown_result_is_verified_once_with_the_same_new_password(changing):
+    host = changing
+    calls = []
+
+    async def verify(values):
+        calls.append(values)
+        return VerifyResult(True, ErrorCode.NONE)
+
+    host.tasks.verifier = verify
+    host.center.change_result = httpx.ReadTimeout('fake-uncertain')
+    task = await host.select()
+    await host.action(task)
+    await host.finished()
+    result = await task_info(host, task)
+    raw = await raw_task(host, task)
+    intent = host.tasks._intent('bot-a', raw)
+    assert result['remote'] == 'verified_success' and result['local'] == 'committed' and result['state'] == 'completed'
+    assert len(calls) == 1 and calls[0].phone == intent['login'] and calls[0].password == intent['new_password']
+    assert host.center.changes == 1 and not host.tasks.is_paused('bot-a', host.account['id'])
+
+
+async def test_failed_unknown_verification_stays_paused_and_explicit_retry_is_bounded(changing):
+    host = changing
+    results = [VerifyResult(False, ErrorCode.IDENTITY), VerifyResult(False, ErrorCode.TIMEOUT)]
+    calls = []
+
+    async def verify(values):
+        calls.append(values)
+        return results.pop(0)
+
+    host.tasks.verifier = verify
+    host.center.change_result = httpx.ReadTimeout('fake-uncertain')
+    task = await host.select()
+    await host.action(task)
+    await host.finished()
+    first = await task_info(host, task)
+    assert first['remote'] == 'unknown' and first['verification'] == 'inconclusive' and first['verification_attempts'] == 1
+    assert host.tasks.is_paused('bot-a', host.account['id']) and host.center.changes == 1
+    assert (await host.action(task, 'verify'))[0] == 200
+    await host.finished()
+    second = await task_info(host, task)
+    assert second['remote'] == 'unknown' and second['verification_attempts'] == 2 and len(calls) == 2
+    assert (await host.action(task, 'verify'))[0] == 422
+    assert host.center.changes == 1
 
 
 async def test_group_reply_lists_no_account_names_but_private_does(changing):

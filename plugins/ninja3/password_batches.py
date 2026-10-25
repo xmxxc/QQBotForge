@@ -119,7 +119,7 @@ class PasswordBatches:
             return 'released'
         if task['state'] in RUNNING:
             return 'running'
-        if remote == RemoteStatus.REPORTED_SUCCESS:
+        if remote in {RemoteStatus.REPORTED_SUCCESS, RemoteStatus.VERIFIED_SUCCESS}:
             return 'local_pending' if local != 'committed' else 'success'
         if remote == RemoteStatus.REJECTED:
             return 'rejected'

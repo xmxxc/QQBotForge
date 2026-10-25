@@ -17,10 +17,14 @@ from test_ninja3_password_tasks import CHANGE, LOGIN, OLD, task_info
 from test_ninja3_password_tasks import changing as changing  # noqa: F401
 from test_ninja3_password_tasks import forbid_game_network as forbid_game_network  # noqa: F401
 
-from plugins.ninja3.password_protocol import change_password
+from plugins.ninja3.password_protocol import ErrorCode, VerifyResult, change_password
 
 SUCCESS = httpx.Response(200, json={'code': 100})
 REJECT = httpx.Response(200, json={'code': 1300})
+
+
+async def _verification_false(_values):
+    return VerifyResult(False, ErrorCode.IDENTITY)
 
 
 def script(host, *results):
@@ -90,6 +94,7 @@ async def stored(host, password):
 
 async def test_backend_random_batch_shows_scope_then_runs_each_account_once_with_mixed_results(changing, monkeypatch):
     host = changing
+    host.tasks.verifier = _verification_false
     a, b, c, d = await accounts(host, '账号B', '账号C', '账号D')
     status, response = await batch_api(host, 'POST', body={'accounts': []})
     assert status == 422  # default is nothing selected

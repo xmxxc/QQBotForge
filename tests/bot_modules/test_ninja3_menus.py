@@ -1,5 +1,7 @@
 """#74 real message, interaction and sender boundary with fake identities only."""
 
+import asyncio
+
 import pytest
 from account_host import account_host as account_host  # noqa: F401
 from test_access_control import access_host as access_host  # noqa: F401
@@ -70,7 +72,14 @@ async def test_owner_menu_is_shared_but_management_rechecks_owner(ninja):
         await h.click(b['data'], user='MEMBERA', group='group-a')
         assert h.texts() == ['仅主人可以管理']
         await h.click(b['data'], user='owner-a', group='group-a')
-        assert h.texts() == [b['text'] + '尚未交付，当前不可用']
+        if b['text'] == '紧急模式':
+            assert h.texts() == []
+            assert (await h.ninja_api('GET', 'emergency'))[1]['data']['state'] == 'active'
+            await asyncio.gather(*list(h.ninja().emergency.runners.values()))
+            await h.event('忍3退出紧急模式', user='owner-a')
+            assert (await h.ninja_api('GET', 'emergency'))[1]['data']['state'] == 'exited'
+        else:
+            assert h.texts() == [b['text'] + '尚未交付，当前不可用']
 
 
 @pytest.mark.parametrize('invalid', ['expiry', 'reload', 'bot', 'group'])

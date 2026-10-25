@@ -1,0 +1,88 @@
+"""#78 persistent emergency mode through the real Ninja3 message and HTTP paths."""
+
+import asyncio
+import sqlite3
+
+from account_host import account_host as account_host  # noqa: F401
+from test_access_control import access_host as access_host  # noqa: F401
+from test_ninja3 import ninja as ninja  # noqa: F401
+from test_ninja3_password_tasks import CHANGE
+from test_ninja3_password_tasks import changing as changing  # noqa: F401
+
+
+async def wait_emergency(host):
+    for _ in range(200):
+        runners = list(host.ninja().emergency.runners.values())
+        if not runners:
+            return
+        await asyncio.gather(*runners, return_exceptions=True)
+    raise AssertionError('emergency runner did not finish')
+
+
+async def private_messages(host):
+    return [message[2] for message in host.sender.messages if message[1] == 'owner-a']
+
+
+async def test_enter_persists_before_all_account_tasks_and_exit_restores_only_resolved_accounts(changing):
+    host = changing
+    second = await host.setup(name='账号B', login='16600000000', password='other-old')
+    await host.event('忍3紧急模式', user='owner-a')
+    status, response = await host.ninja_api('GET', 'emergency')
+    assert status == 200 and response['data']['state'] == 'active'
+    assert await host.say('账号列表', user='MEMBERA') == []
+    await wait_emergency(host)
+    result = (await host.ninja_api('GET', 'emergency'))[1]['data']
+    assert result['phase'] == 'complete' and len(result['accounts']) == 2
+    assert host.center.changes == 2
+    assert (await host.tasks.store.get('bot-a', 'accounts', second['id']))['password'] != 'other-old'
+    assert not [message for message in host.sender.messages if message[:2] == ('bot-a', 'group-a')]
+    assert any('紧急模式' in message for message in await private_messages(host))
+    await host.event('忍3退出紧急模式', user='owner-a')
+    assert (await host.ninja_api('GET', 'emergency'))[1]['data']['state'] == 'exited'
+    assert '密码：' in (await host.say('账号 账号A', user='MEMBERA'))[0]
+
+
+async def test_emergency_save_failure_is_fail_closed_until_a_later_owner_retry(changing, monkeypatch):
+    host = changing
+    emergency = host.ninja().emergency
+    real = emergency.store.atomic
+
+    async def fail(_action):
+        raise sqlite3.OperationalError('fake emergency write failure')
+
+    monkeypatch.setattr(emergency.store, 'atomic', fail)
+    await host.event('忍3紧急模式', user='owner-a')
+    assert await host.say('账号列表', user='MEMBERA') == []
+    monkeypatch.setattr(emergency.store, 'atomic', real)
+    await host.event('忍3紧急模式', user='owner-a')
+    await wait_emergency(host)
+    assert (await host.ninja_api('GET', 'emergency'))[1]['data']['state'] == 'active'
+
+
+async def test_running_emergency_blocks_exit_and_restart_does_not_repeat_change(changing):
+    host = changing
+    host.center.block_path = CHANGE
+    await host.event('忍3紧急模式', user='owner-a')
+    await host.center.entered.wait()
+    await host.event('忍3退出紧急模式', user='owner-a')
+    assert any('仍在进行' in message for message in await private_messages(host))
+    host.center.release.set()
+    await wait_emergency(host)
+    changes = host.center.changes
+    await host.plugins.reload('ninja3')
+    host.tasks = host.ninja().password_tasks
+    assert (await host.ninja_api('GET', 'emergency'))[1]['data']['state'] == 'active'
+    assert await host.say('账号列表', user='MEMBERA') == []
+    await host.event('忍3紧急模式', user='owner-a')
+    await wait_emergency(host)
+    assert host.center.changes == changes
+    await host.event('忍3退出紧急模式', user='owner-a')
+    assert (await host.ninja_api('GET', 'emergency'))[1]['data']['state'] == 'exited'
+
+
+async def test_non_owner_emergency_command_is_silent_and_other_bot_is_unaffected(changing):
+    host = changing
+    before = len(host.sender.messages)
+    await host.event('忍3紧急模式', user='owner-b')
+    assert len(host.sender.messages) == before
+    assert (await host.ninja_api('GET', 'emergency', bot='bot-b'))[1]['data']['state'] == 'inactive'

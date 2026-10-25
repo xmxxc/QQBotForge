@@ -27,6 +27,7 @@ class Stage(StrEnum):
     IDENTITY = 'identity'
     PREPARE_SUBMIT = 'prepare_submit'
     SUBMIT = 'submit'
+    VERIFY = 'verify'
 
 
 class RemoteStatus(StrEnum):
@@ -34,6 +35,7 @@ class RemoteStatus(StrEnum):
     REPORTED_SUCCESS = 'reported_success'
     REJECTED = 'rejected'
     UNKNOWN = 'unknown'
+    VERIFIED_SUCCESS = 'verified_success'
 
 
 class ErrorCode(StrEnum):
@@ -69,6 +71,21 @@ class ChangeInput:
     area: str = field(repr=False)
     old_password: str = field(repr=False)
     new_password: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class VerifyInput:
+    """The fixed intent and identity used to check an uncertain change result."""
+
+    phone: str = field(repr=False)
+    area: str = field(repr=False)
+    password: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class VerifyResult:
+    verified: bool
+    error_code: ErrorCode
 
 
 class _ProtocolError(Exception):
@@ -239,3 +256,60 @@ async def change_password(
         return decisive
     status = RemoteStatus.UNKNOWN if submitted else RemoteStatus.NOT_SUBMITTED
     return ChangeResult(stage, status, code)
+
+
+async def verify_password(
+    values: VerifyInput,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    random_bytes: Callable[[int], bytes] = os.urandom,
+) -> VerifyResult:
+    """Log in once with the fixed new password and verify the same account identity.
+
+    A successful password login alone is insufficient: the account-center userinfo
+    response must contain the exact phone and area from the intent.  Every failure is
+    deliberately inconclusive and leaves the durable task paused as ``unknown``.
+    """
+    try:
+        if not re.fullmatch(r'[0-9]{6,15}', values.phone) or not re.fullmatch(r'[0-9]{1,4}', values.area):
+            raise _ProtocolError(ErrorCode.INVALID_INPUT)
+        if not values.password or not 6 <= len(values.password.encode('utf-16-le')) // 2 <= 16 or any(c.isspace() or c == '\ufeff' for c in values.password):
+            raise _ProtocolError(ErrorCode.INVALID_INPUT)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=False, trust_env=False, timeout=30) as client:
+            config = _config(await client.get(ORIGIN + '/env.js', timeout=20))
+
+            def request(method: str, path: str, payload: dict[str, str] | None = None) -> httpx.Request:
+                body = b'' if payload is None else json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+                headers = _headers(config, method, path, body, now().astimezone(UTC).strftime('%Y%m%dT%H%M%SZ'), random_bytes(16), random_bytes(16))
+                if payload is not None:
+                    headers['Content-Type'] = 'application/json;charset=UTF-8'
+                return client.build_request(method, ORIGIN + config['baseUrl'] + path, content=body, headers=headers)
+
+            _data(
+                await client.send(
+                    request(
+                        'POST',
+                        '/login/pwd',
+                        {
+                            'phone': values.phone,
+                            'pwd': _encrypt(values.password, config['encryptoSecret'], random_bytes(16)),
+                            'area': values.area,
+                        },
+                    )
+                )
+            )
+            identity = _data(await client.send(request('GET', '/user_center/userinfo')))
+            if not isinstance(identity, dict) or identity.get('phone') != values.phone or identity.get('area') != values.area:
+                return VerifyResult(False, ErrorCode.IDENTITY)
+            return VerifyResult(True, ErrorCode.NONE)
+    except _ProtocolError as exc:
+        return VerifyResult(False, exc.code)
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        return VerifyResult(False, ErrorCode.CANCELLED)
+    except (httpx.TimeoutException, TimeoutError):
+        return VerifyResult(False, ErrorCode.TIMEOUT)
+    except httpx.RequestError:
+        return VerifyResult(False, ErrorCode.TRANSPORT)
+    except Exception:
+        return VerifyResult(False, ErrorCode.PREPARATION)

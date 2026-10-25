@@ -18,7 +18,7 @@ from cryptography.fernet import Fernet
 
 from core.base.logger import PLUGIN, get_logger
 
-from .password_protocol import ChangeInput, ChangeResult, RemoteStatus, change_password
+from .password_protocol import ChangeInput, ChangeResult, RemoteStatus, Stage, VerifyInput, VerifyResult, change_password, verify_password
 from .storage import ExtensionStore
 
 Record = dict[str, Any]
@@ -28,9 +28,22 @@ RESULT_WRITE_RETRIES = (0.2, 0.5, 1, 2, 5, 10)
 # After that, a decided result stays in this process; background flushes back off, then
 # only an explicit recover retries (no busy loop, no unbounded blocking of entry points).
 HELD_RESULT_RETRIES = (30, 60, 120, 300, 600)
+MAX_VERIFICATION_ATTEMPTS = 2
 # Remote results proving the remote password was not changed by this intent.
 UNCHANGED_REMOTE = {RemoteStatus.NOT_SUBMITTED, RemoteStatus.REJECTED}
-PUBLIC_FIELDS = ('id', 'account', 'state', 'remote', 'local', 'error', 'notification', 'created_at', 'cancel_requested')
+PUBLIC_FIELDS = (
+    'id',
+    'account',
+    'state',
+    'remote',
+    'local',
+    'error',
+    'notification',
+    'created_at',
+    'cancel_requested',
+    'verification',
+    'verification_attempts',
+)
 
 
 class TaskError(ValueError):
@@ -125,13 +138,17 @@ class PasswordTasks:
         *,
         cipher: IntentCipher | None = None,
         protocol: Callable[..., Awaitable[ChangeResult]] = change_password,
+        verifier: Callable[..., Awaitable[VerifyResult]] = verify_password,
         notify: Callable[[str, Record], Awaitable[str]],
+        on_change: Callable[[str], None] | None = None,
         clock: Callable[[], float] = time.time,
     ):
         self.store = store
         self.cipher = cipher or IntentCipher()
         self.protocol = protocol
+        self.verifier = verifier
         self.notify = notify
+        self.on_change = on_change
         self.clock = clock
         self.workers: dict[tuple[str, str], asyncio.Task[None]] = {}
         # Decided outcomes whose durable write failed; keyed by task, bound to the executor token.
@@ -143,7 +160,7 @@ class PasswordTasks:
 
     @staticmethod
     def public(task: Record) -> Record:
-        return {key: task[key] for key in PUBLIC_FIELDS}
+        return {key: task.get(key, 'not_attempted' if key == 'verification' else 0 if key == 'verification_attempts' else '') for key in PUBLIC_FIELDS}
 
     @staticmethod
     def _read(conn: sqlite3.Connection, bot: str, key: str) -> Record:
@@ -171,7 +188,9 @@ class PasswordTasks:
             recovery = []
             for bot, raw in conn.execute('SELECT bot,payload FROM ninja3_password_tasks WHERE active=1').fetchall():
                 task = json.loads(raw)
-                if task['remote'] == RemoteStatus.REPORTED_SUCCESS:
+                task.setdefault('verification', 'not_attempted')
+                task.setdefault('verification_attempts', 0)
+                if task['remote'] in {RemoteStatus.REPORTED_SUCCESS, RemoteStatus.VERIFIED_SUCCESS}:
                     recovery.append((bot, task['id']))
                 elif task['state'] == 'submitting':
                     task.update(state='paused', remote=RemoteStatus.UNKNOWN, error='interrupted')
@@ -184,6 +203,9 @@ class PasswordTasks:
         for bot, key in recovery:
             # Restart only completes a known remote success locally; never calls protocol.
             await self.recover(bot, key)
+        # A process restart does not silently perform another login.  The owner can
+        # use the authenticated ``核验`` entry after restart; this keeps verification
+        # bounded and makes restart behavior explicit while preserving the intent.
 
     def _read_only(self) -> sqlite3.Connection:
         """Zero-busy-timeout read-only connection: a locked/unavailable database denies immediately."""
@@ -278,6 +300,8 @@ class PasswordTasks:
                 local='not_committed',
                 error='',
                 notification='not_attempted',
+                verification='not_attempted',
+                verification_attempts=0,
                 created_at=self.clock(),
                 cancel_requested=False,
             )
@@ -357,6 +381,19 @@ class PasswordTasks:
 
         worker.add_done_callback(finished)
 
+    def _start_verification(self, bot: str, key: str) -> None:
+        """Schedule bounded verification of a durable unknown without submitting again."""
+        worker = asyncio.create_task(self._verify_run(bot, key))
+        self.workers[(bot, key)] = worker
+
+        def finished(done: asyncio.Task[None]) -> None:
+            if self.workers.get((bot, key)) is done:
+                self.workers.pop((bot, key))
+            if not done.cancelled():
+                done.exception()
+
+        worker.add_done_callback(finished)
+
     def _intent(self, bot: str, task: Record) -> Record:
         intent = self.cipher.open(task['intent'])
         if any(intent.get(k) != v for k, v in {'bot': bot, 'id': task['id'], 'account': task['account']}.items()):
@@ -431,6 +468,72 @@ class PasswordTasks:
         except asyncio.CancelledError:
             await finalizer
 
+    async def _claim_verification(self, bot: str, key: str, runner: str) -> Record:
+        def claim(conn: sqlite3.Connection) -> Record:
+            task = self._read(conn, bot, key)
+            if (
+                not task['active']
+                or task['state'] != 'paused'
+                or task['remote'] != RemoteStatus.UNKNOWN
+                or task.get('verification_attempts', 0) >= MAX_VERIFICATION_ATTEMPTS
+            ):
+                raise SupersededError('未知结果核验条件已变化')
+            task.update(
+                state='verifying',
+                runner=runner,
+                verification='running',
+                verification_attempts=task.get('verification_attempts', 0) + 1,
+            )
+            self._save(conn, bot, task)
+            return task
+
+        return dict(await self.store.atomic(claim))
+
+    async def _verify_unknown(self, bot: str, key: str, runner: str, task: Record) -> None:
+        """Verify the same sealed intent; a failed check never proves the password unchanged."""
+        try:
+            intent = self._intent(bot, task)
+            result = await self.verifier(VerifyInput(intent['login'], intent['area'], intent['new_password']))
+            if result.verified:
+                changes = dict(
+                    state='paused',
+                    remote=RemoteStatus.VERIFIED_SUCCESS,
+                    local='pending',
+                    error='',
+                    verification='verified',
+                )
+            else:
+                changes = dict(
+                    state='paused',
+                    remote=RemoteStatus.UNKNOWN,
+                    error='verification_' + result.error_code.value,
+                    verification='inconclusive',
+                )
+        except SupersededError:
+            return
+        except Exception:
+            changes = dict(state='paused', remote=RemoteStatus.UNKNOWN, error='verification_error', verification='inconclusive')
+        try:
+            await self._persist_outcome(bot, key, runner, changes)
+        except SupersededError:
+            return
+        except (sqlite3.Error, OSError):
+            self._hold(bot, key, runner, changes)
+            return
+        await self._settle(bot, key, runner)
+
+    async def _verify_run(self, bot: str, key: str) -> None:
+        runner = uuid4().hex
+        try:
+            task = await self._claim_verification(bot, key, runner)
+            await self._verify_unknown(bot, key, runner, task)
+        except asyncio.CancelledError:
+            return
+        except SupersededError:
+            return
+        except Exception:
+            return
+
     async def _persist_outcome(self, bot: str, key: str, runner: str, changes: Record) -> None:
         """A transient write failure must not turn a decisive remote result into unknown."""
         for delay in RESULT_WRITE_RETRIES:
@@ -442,6 +545,51 @@ class PasswordTasks:
         await self._mutate(bot, key, runner=runner, **changes)
 
     async def _finish(self, bot: str, key: str, runner: str, result: ChangeResult | None, failure: str) -> None:
+        if result is not None and result.remote_status == RemoteStatus.UNKNOWN:
+            try:
+                task = await self.store.atomic(lambda conn: self._read(conn, bot, key))
+
+                # The submit marker is already durable.  Move this same executor into
+                # verification before logging a result, so a release/retry/restart can
+                # supersede it without a late login or write.
+                def mark_verifying(conn: sqlite3.Connection) -> Record:
+                    current = self._read(conn, bot, key)
+                    if current.get('runner') != runner or not current['active'] or current['state'] != 'submitting':
+                        raise SupersededError('未知结果核验条件已变化')
+                    if current['cancel_requested'] or self.closed:
+                        current.update(state='paused', verification='skipped')
+                        self._save(conn, bot, current)
+                        return current
+                    if current.get('verification_attempts', 0) >= MAX_VERIFICATION_ATTEMPTS:
+                        raise SupersededError('未知结果核验次数已达上限')
+                    current.update(
+                        state='verifying',
+                        verification='running',
+                        verification_attempts=current.get('verification_attempts', 0) + 1,
+                    )
+                    self._save(conn, bot, current)
+                    return current
+
+                task = await self.store.atomic(mark_verifying)
+                try:
+                    if task['state'] == 'verifying':
+                        intent = self._intent(bot, task)
+                        verified = await self.verifier(VerifyInput(intent['login'], intent['area'], intent['new_password']))
+                        if verified.verified:
+                            result = ChangeResult(Stage.VERIFY, RemoteStatus.VERIFIED_SUCCESS, verified.error_code)
+                            failure = ''
+                        else:
+                            result = ChangeResult(Stage.VERIFY, RemoteStatus.UNKNOWN, verified.error_code)
+                except SupersededError:
+                    return
+                except Exception:
+                    result = ChangeResult(result.stage, RemoteStatus.UNKNOWN, result.error_code)
+            except SupersededError:
+                return
+            except (sqlite3.Error, OSError):
+                # If the verification claim cannot be read, keep the original unknown
+                # marker; never convert a storage failure into a new remote attempt.
+                pass
         if result is not None:
             changes = dict(
                 state='paused',
@@ -449,6 +597,10 @@ class PasswordTasks:
                 error=result.error_code.value,
                 local='pending' if result.remote_status == RemoteStatus.REPORTED_SUCCESS else 'not_committed',
             )
+            if result.remote_status == RemoteStatus.VERIFIED_SUCCESS:
+                changes.update(local='pending', verification='verified')
+            elif result.remote_status == RemoteStatus.UNKNOWN:
+                changes.update(verification='inconclusive')
         else:
             # Unknown if the durable pre-submit marker was already crossed.
             changes = dict(state='paused', error=failure)
@@ -473,9 +625,11 @@ class PasswordTasks:
             task = await self.store.atomic(lambda conn: self._read(conn, bot, key))
             if task.get('runner') != runner:
                 return
-            if task['remote'] == RemoteStatus.REPORTED_SUCCESS:
+            if task['remote'] in {RemoteStatus.REPORTED_SUCCESS, RemoteStatus.VERIFIED_SUCCESS}:
                 try:
                     await self._commit_local(bot, key)
+                    if self.on_change is not None:
+                        self.on_change(bot)
                 except Exception:
                     await self._mutate(bot, key, runner=runner, error='local_commit_failed')
             await self._receipt(bot, key, runner)
@@ -527,7 +681,7 @@ class PasswordTasks:
     async def _commit_local(self, bot: str, key: str) -> None:
         def commit(conn: sqlite3.Connection) -> None:
             task = self._read(conn, bot, key)
-            if task['remote'] != RemoteStatus.REPORTED_SUCCESS or task['local'] == 'committed' or not task['active']:
+            if task['remote'] not in {RemoteStatus.REPORTED_SUCCESS, RemoteStatus.VERIFIED_SUCCESS} or task['local'] == 'committed' or not task['active']:
                 return
             intent = self._intent(bot, task)
             row = self._account_row(conn, bot, task['account'])
@@ -556,14 +710,30 @@ class PasswordTasks:
         except (sqlite3.Error, OSError):
             raise TaskError('存储暂不可写，已确定结果仍保留在本进程，请稍后再恢复') from None
         task = await self.store.atomic(lambda conn: self._read(conn, bot, key))
-        if task['remote'] != RemoteStatus.REPORTED_SUCCESS:
+        if task['remote'] not in {RemoteStatus.REPORTED_SUCCESS, RemoteStatus.VERIFIED_SUCCESS}:
             raise TaskError('仅允许恢复已确认成功的本地提交；未知结果保持暂停')
         try:
             await self._commit_local(bot, key)
+            if self.on_change is not None:
+                self.on_change(bot)
         except Exception:
             # The known remote success is already durable, even with a lost key/disk.
             return await self.get(bot, key)
         await self._receipt(bot, key, task.get('runner'))
+        return await self.get(bot, key)
+
+    async def verify(self, bot: str, key: str) -> Record:
+        """Run one explicit owner-requested verification attempt for an unknown result."""
+        if self.closed:
+            raise TaskError('改密执行器已停止')
+        if (bot, key) in self.workers or (bot, key) in self.held or (bot, key) in self.flushing:
+            raise TaskError('任务正在处理中，请稍后再核验')
+        task = await self.store.atomic(lambda conn: self._read(conn, bot, key))
+        if task['remote'] != RemoteStatus.UNKNOWN or task['state'] != 'paused' or not task['active']:
+            raise TaskError('仅未知结果任务可以核验')
+        if task.get('verification_attempts', 0) >= MAX_VERIFICATION_ATTEMPTS:
+            raise TaskError('未知结果核验次数已达上限，请在后台人工核对')
+        self._start_verification(bot, key)
         return await self.get(bot, key)
 
     async def retry(self, bot: str, key: str, actor: str) -> Record:

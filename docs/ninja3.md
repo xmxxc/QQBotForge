@@ -28,6 +28,7 @@
   - 群状态处理中或写入中（可重试）只回复“暂时无法确认查询资格，请稍后重试”，不记录。
 主人须先私聊 Bot 发送 `忍3` 登记通知地址；未登记、平台拒绝或结果未知时通知保留在后台“未授权查询通知”，可重试，重试不授权也不发账密。
 - 管理：后台接口 `GET/POST/PATCH/DELETE /api/ext/ninja3/accounts[/ID]`、`GET/POST /api/ext/ninja3/groups`、`DELETE /api/ext/ninja3/groups/<群ID>`、`GET/POST /api/ext/ninja3/notices`、`GET /api/ext/ninja3/status`、`GET /api/ext/ninja3/operations`，均需框架后台会话，返回 no-store。接口不返回密码；同 Bot 账号名称不可重复，开放群须先添加。删除群同时从所有账号移除。撤权、拒绝、到期调整使用“授权管理”的 `ninja3` 消费方。
+- 紧急模式：主人可发送 `忍3紧急模式`、菜单入口或后台 `GET/POST /api/ext/ninja3/emergency`；先持久化 fail-closed 状态，再把当前 Bot 本插件所有账号逐项交给改密任务。`POST /api/ext/ninja3/emergency/exit` 只退出模式，不改变未解决任务的暂停。重启保留状态和阶段，不能自动重复改密；运行中任务阻止退出，群内进入和结果只私聊主人，非主人命令静默。`GET` 只返回阶段、账号引用和安全结果，不返回意图或密码。
 - 日志：新操作日志只记录 Bot、群、成员、账号 ID 与结果，不含密码。框架消息正文日志是否记录回复正文沿用现有约定，本插件不改变。
 
 ## 验证

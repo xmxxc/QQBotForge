@@ -17,7 +17,9 @@ from plugins.ninja3.password_protocol import (
     ErrorCode,
     RemoteStatus,
     Stage,
+    VerifyInput,
     change_password,
+    verify_password,
 )
 
 VALUES = ChangeInput('16600000000', '86', 'old-test-secret', 'new-test-secret')
@@ -108,6 +110,17 @@ async def test_success_executes_protocol_and_once_only(original):
         'new_pwd': original.app.encrypt_password(VALUES.new_password, KEY, bytes(range(16))),
     }
     assert platform.requests[2].content == b''
+
+
+async def test_unknown_result_verification_logs_in_with_new_password_and_checks_identity():
+    platform = Platform()
+    result = await verify_password(VerifyInput(VALUES.phone, VALUES.area, VALUES.new_password), transport=httpx.MockTransport(platform.handle))
+    assert result.verified and result.error_code == ErrorCode.NONE
+    assert [request.url.path for request in platform.requests] == PATHS[:3]
+    mismatch = Platform(identity={'phone': '16600000001', 'area': VALUES.area})
+    result = await verify_password(VerifyInput(VALUES.phone, VALUES.area, VALUES.new_password), transport=httpx.MockTransport(mismatch.handle))
+    assert not result.verified and result.error_code == ErrorCode.IDENTITY
+    assert [request.url.path for request in mismatch.requests] == PATHS[:3]
 
 
 @pytest.mark.parametrize('key', [base64.b64encode(b'another-fake-key').decode(), KEY])

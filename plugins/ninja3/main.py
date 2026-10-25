@@ -46,6 +46,7 @@ async def unload():
     unregister_page('ninja3')
     unregister_route('*', PREFIX + '*')
     if _instance is not None:
+        await _instance.emergency.shutdown()
         await _instance.password_batches.shutdown()
         await _instance.password_tasks.shutdown()
         _instance.close()
@@ -53,7 +54,7 @@ async def unload():
 
 
 @handler(
-    r'^(?:忍3(?:批量(?:改密|确认|任务|取消)|改密|确认|重试|任务|取消|恢复|放弃)(?:\s.*)?|授权(?:\s.*)?|账号列表|账号\s+\S.*|忍3)$',
+    r'^(?:忍3(?:批量(?:改密|确认|任务|取消)|改密|确认|重试|任务|取消|恢复|核验|放弃|紧急模式|退出紧急模式|紧急状态)(?:\s.*)?|授权(?:\s.*)?|账号列表|账号\s+\S.*|忍3)$',
     name='忍者必须死3',
     priority=20,
     block=True,
@@ -64,7 +65,9 @@ async def entry(event, _match):
         await event.reply('忍者必须死3 未加载，请联系主人')
         return
     content = (event.content or '').strip()
-    if content.startswith(('忍3批量', '忍3改密', '忍3确认', '忍3重试', '忍3任务', '忍3取消', '忍3恢复', '忍3放弃')):
+    if content.startswith(('忍3紧急模式', '忍3退出紧急模式', '忍3紧急状态')):
+        await _instance.emergency_command(event)
+    elif content.startswith(('忍3批量', '忍3改密', '忍3确认', '忍3重试', '忍3任务', '忍3取消', '忍3恢复', '忍3核验', '忍3放弃')):
         await _instance.password_command(event)
     elif content.startswith('授权'):
         await _instance.authorize(event)
