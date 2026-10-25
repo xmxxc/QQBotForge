@@ -59,6 +59,17 @@ Emergency runner ownership now persists the owner PID and token. A live same-pro
 
 Final red/green evidence: the prior candidate could retain a dead token and leave restart-selected/no-task handoffs unrecoverable. The final focused suite is **263 passed in 55.13s**. Ruff check/format, explicit mypy, and diff checks pass. No real QQ, game, password, merge, deploy, or production operation was performed.
 
+## Final emergency query privacy repair
+
+The latest review found a P2: `Ninja3.query()` performed group validity checks and public replies before the emergency gate, allowing unopened-group and non-owner C2C query responses during emergency mode. The repair base was `17b8abfbc3fbc1949da559456881096993c0b09d` (tree `57e63fee38079499abecd05ff82335789edeb716`), and the final source repair is:
+
+- Final repair commit: `823913b5fe9ebc4de653fb7bb36fca5bacbf142a`
+- Final repair tree: `d88dbadac5595001bc45d3c68e1fa5058a5b7c59`
+
+The emergency gate now runs before group validity and direct-message checks. Non-owners remain silent; owners receive the private management response even for unopened groups and C2C queries. Normal non-emergency query replies remain unchanged. A focused regression covers unopened-group group queries, owner group queries, non-owner C2C queries, and owner C2C privacy.
+
+Final red/green evidence: the prior candidate could publicly reply before reaching the emergency gate; the final focused suite is **264 passed in 53.95s**. Ruff check/format, explicit mypy, and diff checks pass. No real QQ, game, password, merge, deploy, or production operation was performed.
+
 ## Fixed candidate
 
 - Worker: `/opt/qqbot/QQBotForge-codex-71-worker`
