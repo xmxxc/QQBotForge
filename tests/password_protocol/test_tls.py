@@ -55,7 +55,7 @@ def test_protocol_clients_use_verifying_context(monkeypatch, call):
 
     if call == 'change':
         result = asyncio.run(protocol.change_password(VALUES, before_submit=before_submit))
-        assert result.error_code == protocol.ErrorCode.TRANSPORT
+        assert result == protocol.ChangeResult(protocol.Stage.PREPARE, protocol.RemoteStatus.NOT_SUBMITTED, protocol.ErrorCode.TRANSPORT)
     else:
         result = asyncio.run(protocol.verify_password(VerifyInput(VALUES.phone, VALUES.area, VALUES.new_password)))
         assert result.verified is False
