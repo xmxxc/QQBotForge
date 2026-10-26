@@ -35,6 +35,15 @@ def test_no_form_control_shadows_a_form_method():
     assert parser.shadowing == []
 
 
+def bots_route(bots):
+    from aiohttp import web
+
+    async def handler(request):
+        return web.json_response({'success': True, 'data': {'bots': bots}})
+
+    return handler
+
+
 def chrome():
     path = os.environ.get('NINJA3_CHROME') or shutil.which('google-chrome') or shutil.which('chromium')
     if not path:
@@ -60,6 +69,7 @@ async def test_account_form_new_edit_delete_and_rejection_in_a_real_browser(ninj
         return web.Response(text=PAGE.read_text(encoding='utf-8'), content_type='text/html')
 
     app.router.add_get('/', index)
+    app.router.add_get('/api/bots', bots_route([{'appid': 'bot-a', 'name': 'Bot A'}]))
     app.router.add_route('*', '/api/ext/{tail:.*}', handle_ext_route)
     server = TestServer(app, host='127.0.0.1')
     await server.start_server()
@@ -78,8 +88,7 @@ async def test_account_form_new_edit_delete_and_rejection_in_a_real_browser(ninj
             page.set_default_timeout(5000)
             page.on('pageerror', lambda error: errors.append(str(error)))
             await page.goto(base)
-            await page.fill('#bot', 'bot-a')
-            await page.click('#refresh')
+            # A single configured Bot is selected and loaded without any input.
             await page.wait_for_function("() => document.getElementById('status').textContent.startsWith('已加载')")
 
             async def save(expect):
@@ -176,6 +185,7 @@ async def test_group_auto_grant_switch_in_a_real_browser(ninja):
         return web.Response(text=PAGE.read_text(encoding='utf-8'), content_type='text/html')
 
     app.router.add_get('/', index)
+    app.router.add_get('/api/bots', bots_route([{'appid': 'bot-a', 'name': 'Bot A'}]))
     app.router.add_route('*', '/api/ext/{tail:.*}', handle_ext_route)
     server = TestServer(app, host='127.0.0.1')
     await server.start_server()
@@ -197,9 +207,9 @@ async def test_group_auto_grant_switch_in_a_real_browser(ninja):
             page.set_default_timeout(5000)
             page.on('pageerror', lambda error: errors.append(str(error)))
             await page.goto(base)
-            await page.fill('#bot', 'bot-a')
-            await page.click('#refresh')
+            # A single configured Bot is selected and loaded without any input.
             await page.wait_for_function("() => document.getElementById('status').textContent.startsWith('已加载')")
+            assert await page.input_value('#bot') == 'bot-a'
             assert not await page.is_checked('#group-auto')
             # A closed group with the switch on stores the intent but syncs no rule.
             await page.fill('#group', 'group-a')
@@ -222,6 +232,60 @@ async def test_group_auto_grant_switch_in_a_real_browser(ninja):
             # The sync log renders after the table within the same refresh.
             await page.wait_for_function("() => document.getElementById('operations').textContent.includes('入群自动授权 true → false')")
             await page.wait_for_function("() => document.getElementById('acl-status').textContent === '一致'")
+            await browser.close()
+    finally:
+        await server.close()
+    assert errors == []
+
+
+async def test_bot_select_waits_for_a_choice_and_clears_on_switch(ninja):
+    executable = chrome()
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+    from playwright.async_api import async_playwright
+
+    from web import auth
+    from web.api import handle_ext_route
+
+    host = ninja
+    await host.ninja_api('POST', 'groups', {'group': 'group-a', 'enabled': True})
+    app = web.Application()
+
+    async def index(request):
+        return web.Response(text=PAGE.read_text(encoding='utf-8'), content_type='text/html')
+
+    app.router.add_get('/', index)
+    app.router.add_get('/api/bots', bots_route([{'appid': 'bot-a', 'name': 'Bot A'}, {'appid': 'bot-b', 'name': 'Bot B'}]))
+    app.router.add_route('*', '/api/ext/{tail:.*}', handle_ext_route)
+    server = TestServer(app, host='127.0.0.1')
+    await server.start_server()
+    base = str(server.make_url('/'))
+    errors = []
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(executable_path=executable, headless=True)
+            context = await browser.new_context()
+            await context.add_cookies([{'name': auth.SESSION_COOKIE, 'value': 'group-test', 'url': base}])
+            page = await context.new_page()
+            page.set_default_timeout(5000)
+            page.on('pageerror', lambda error: errors.append(str(error)))
+            await page.goto(base)
+            # Several Bots: nothing is guessed or loaded until the owner picks one.
+            await page.wait_for_function("() => document.getElementById('status').textContent === '请先选择 Bot'")
+            assert await page.input_value('#bot') == ''
+            assert await page.text_content('#groups') == ''
+            await page.click('#refresh')
+            await page.wait_for_function("() => document.getElementById('status').textContent === '请先选择 Bot'")
+            await page.select_option('#bot', 'bot-a')
+            await page.wait_for_function("() => document.getElementById('status').textContent === '已加载 1 个群、0 个账号'")
+            assert 'group-a' in await page.text_content('#groups')
+            # Switching Bot drops the previous Bot's rows and form state before loading the new one.
+            await page.fill('#name', '未保存的账号')
+            await page.select_option('#bot', 'bot-b')
+            await page.wait_for_function("() => document.getElementById('status').textContent === '已加载 0 个群、0 个账号'")
+            assert await page.text_content('#groups') == '' and await page.input_value('#name') == ''
+            await page.select_option('#bot', '')
+            await page.wait_for_function("() => document.getElementById('status').textContent === '请先选择 Bot'")
             await browser.close()
     finally:
         await server.close()
