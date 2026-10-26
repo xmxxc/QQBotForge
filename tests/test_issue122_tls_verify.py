@@ -35,8 +35,9 @@ def _probe():
     env = {k: v for k, v in os.environ.items() if not k.startswith(('SSL_CERT', 'REQUESTS_CA'))}
     out = subprocess.run(
         [sys.executable, '-c', _PROBE, _ROOT], cwd=_ROOT, env=env,
-        capture_output=True, text=True, timeout=60, check=True,
+        capture_output=True, text=True, timeout=60, check=False,
     )
+    assert out.returncode == 0, out.stderr
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
