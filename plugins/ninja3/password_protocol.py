@@ -7,11 +7,13 @@ import hmac
 import json
 import os
 import re
+import ssl
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 
+import certifi
 import httpx
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -92,6 +94,15 @@ class _ProtocolError(Exception):
     def __init__(self, code: ErrorCode):
         self.code = code
         super().__init__(code.value)
+
+
+def _tls_context() -> ssl.SSLContext:
+    """Verifying context built directly, independent of ssl.create_default_context (#122)."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.load_verify_locations(certifi.where())
+    if context.verify_mode != ssl.CERT_REQUIRED or not context.check_hostname:
+        raise ssl.SSLError('account-center TLS context must verify certificates and hostnames')
+    return context
 
 
 def _encrypt(password: str, secret: str, iv: bytes) -> str:
@@ -189,7 +200,7 @@ async def change_password(
     decisive: ChangeResult | None = None
     try:
         _validate(values)
-        async with httpx.AsyncClient(transport=transport, follow_redirects=False, trust_env=False, timeout=30) as client:
+        async with httpx.AsyncClient(transport=transport, verify=_tls_context(), follow_redirects=False, trust_env=False, timeout=30) as client:
             stage = Stage.CONFIG
             config = _config(await client.get(ORIGIN + '/env.js', timeout=20))
 
@@ -276,7 +287,7 @@ async def verify_password(
             raise _ProtocolError(ErrorCode.INVALID_INPUT)
         if not values.password or not 6 <= len(values.password.encode('utf-16-le')) // 2 <= 16 or any(c.isspace() or c == '\ufeff' for c in values.password):
             raise _ProtocolError(ErrorCode.INVALID_INPUT)
-        async with httpx.AsyncClient(transport=transport, follow_redirects=False, trust_env=False, timeout=30) as client:
+        async with httpx.AsyncClient(transport=transport, verify=_tls_context(), follow_redirects=False, trust_env=False, timeout=30) as client:
             config = _config(await client.get(ORIGIN + '/env.js', timeout=20))
 
             def request(method: str, path: str, payload: dict[str, str] | None = None) -> httpx.Request:
