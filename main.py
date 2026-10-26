@@ -7,26 +7,12 @@ import json
 import os
 import pathlib
 import shutil
-import ssl
 import sys
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 sys.dont_write_bytecode = True
-
-# 全局跳过 SSL 证书验证
-_orig_ctx = ssl.create_default_context
-
-
-def _no_verify(*a, **kw):
-    c = _orig_ctx(*a, **kw)
-    c.check_hostname = False
-    c.verify_mode = ssl.CERT_NONE
-    return c
-
-
-ssl.create_default_context = _no_verify
 
 # 加载 .env
 _env = os.path.join(_ROOT, '.env')
