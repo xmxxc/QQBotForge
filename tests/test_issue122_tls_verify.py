@@ -30,15 +30,45 @@ print(json.dumps({
 }))
 """
 
+_INFO_PROBE = """
+import json, ssl, sys
+sys.path.insert(0, sys.argv[1])
+orig = ssl.create_default_context
 
-def _probe():
+def weakened(*args, **kwargs):
+    context = orig(*args, **kwargs)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+ssl.create_default_context = weakened
+from web.tools._bot import info
+
+context = info._SSL_CTX
+print(json.dumps({
+    'verify_mode': int(context.verify_mode),
+    'check_hostname': context.check_hostname,
+}))
+"""
+
+
+def _run_probe(script):
     env = {k: v for k, v in os.environ.items() if not k.startswith(('SSL_CERT', 'REQUESTS_CA'))}
     out = subprocess.run(
-        [sys.executable, '-c', _PROBE, _ROOT], cwd=_ROOT, env=env,
-        capture_output=True, text=True, timeout=60, check=False,
+        [sys.executable, '-c', script, _ROOT],
+        cwd=_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
     )
     assert out.returncode == 0, out.stderr
     return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def _probe():
+    return _run_probe(_PROBE)
 
 
 def test_importing_main_keeps_tls_verification():
@@ -49,3 +79,10 @@ def test_importing_main_keeps_tls_verification():
     assert result['default'] == required
     assert result['httpx'] == required
     assert result['info'] == required
+
+
+def test_robot_info_tls_context_ignores_weakened_default_factory():
+    result = _run_probe(_INFO_PROBE)
+
+    assert result['verify_mode'] == 2  # ssl.CERT_REQUIRED
+    assert result['check_hostname'] is True
