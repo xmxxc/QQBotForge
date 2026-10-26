@@ -65,8 +65,9 @@ class ChangeResult:
 class ChangeInput:
     """Resolved secrets only; task authorization and protected storage belong to caller.
 
-    Identity contract: userinfo.data must have exact, unmasked string phone/area.
-    This schema is deliberately fail-closed pending sanitized platform evidence.
+    Identity contract: userinfo.data must have the masked phone string returned by
+    the account center. ``area`` is still sent to login, but is not part of the
+    userinfo identity contract.
     """
 
     phone: str = field(repr=False)
@@ -180,6 +181,17 @@ def _validate(values: ChangeInput) -> None:
         raise _ProtocolError(ErrorCode.INVALID_INPUT)
 
 
+def _identity_matches(identity: object, phone: str) -> bool:
+    """Accept only the account center's exact masked phone representation."""
+    if not isinstance(identity, dict):
+        return False
+    phone_value = identity.get('phone')
+    if type(phone_value) is not str:
+        return False
+    expected = f'+86 {phone[:3]}****{phone[-4:]}'
+    return phone_value == expected
+
+
 async def change_password(
     values: ChangeInput,
     *,
@@ -227,7 +239,7 @@ async def change_password(
             )
             stage = Stage.IDENTITY
             identity = _data(await client.send(request('GET', '/user_center/userinfo')))
-            if not isinstance(identity, dict) or identity.get('phone') != values.phone or identity.get('area') != values.area:
+            if not _identity_matches(identity, values.phone):
                 raise _ProtocolError(ErrorCode.IDENTITY)
             prepared = request(
                 'POST',
@@ -279,7 +291,7 @@ async def verify_password(
     """Log in once with the fixed new password and verify the same account identity.
 
     A successful password login alone is insufficient: the account-center userinfo
-    response must contain the exact phone and area from the intent.  Every failure is
+    response must contain the exact masked phone for the intent. Every failure is
     deliberately inconclusive and leaves the durable task paused as ``unknown``.
     """
     try:
@@ -311,7 +323,7 @@ async def verify_password(
                 )
             )
             identity = _data(await client.send(request('GET', '/user_center/userinfo')))
-            if not isinstance(identity, dict) or identity.get('phone') != values.phone or identity.get('area') != values.area:
+            if not _identity_matches(identity, values.phone):
                 return VerifyResult(False, ErrorCode.IDENTITY)
             return VerifyResult(True, ErrorCode.NONE)
     except _ProtocolError as exc:

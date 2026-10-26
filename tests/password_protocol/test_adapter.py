@@ -36,7 +36,7 @@ async def ready():
 class Platform:
     def __init__(self, *, config=None, identity=None, override=None):
         self.config = CONFIG if config is None else config
-        self.identity = {'phone': VALUES.phone, 'area': VALUES.area} if identity is None else identity
+        self.identity = {'id': '12345678', 'phone': '+86 166****0000'} if identity is None else identity
         self.override = override or {}
         self.requests = []
 
@@ -117,10 +117,18 @@ async def test_unknown_result_verification_logs_in_with_new_password_and_checks_
     result = await verify_password(VerifyInput(VALUES.phone, VALUES.area, VALUES.new_password), transport=httpx.MockTransport(platform.handle))
     assert result.verified and result.error_code == ErrorCode.NONE
     assert [request.url.path for request in platform.requests] == PATHS[:3]
-    mismatch = Platform(identity={'phone': '16600000001', 'area': VALUES.area})
+    mismatch = Platform(identity={'phone': '+86 166****0001'})
     result = await verify_password(VerifyInput(VALUES.phone, VALUES.area, VALUES.new_password), transport=httpx.MockTransport(mismatch.handle))
     assert not result.verified and result.error_code == ErrorCode.IDENTITY
     assert [request.url.path for request in mismatch.requests] == PATHS[:3]
+
+
+@pytest.mark.parametrize('identity', [{}, {'phone': '+86 166****0001'}, {'phone': '166****0000'}, {'phone': 16600000000}])
+async def test_verify_rejects_missing_malformed_or_typed_phone(identity):
+    platform = Platform(identity=identity)
+    result = await verify_password(VerifyInput(VALUES.phone, VALUES.area, VALUES.new_password), transport=httpx.MockTransport(platform.handle))
+    assert not result.verified and result.error_code == ErrorCode.IDENTITY
+    assert [request.url.path for request in platform.requests] == PATHS[:3]
 
 
 @pytest.mark.parametrize('key', [base64.b64encode(b'another-fake-key').decode(), KEY])
@@ -147,16 +155,15 @@ async def test_dynamic_config_signing_and_encryption(original, key):
     'identity',
     [
         {},
-        {'phone': '16600000001', 'area': '86'},
-        {'phone': '166****0000', 'area': '86'},
-        {'phone': VALUES.phone},
-        {'phone': VALUES.phone, 'area': 86},
-        {'phone': VALUES.phone, 'area': '1'},
-        {'phone': [VALUES.phone], 'area': '86'},
+        {'phone': '+86 166****0001'},
+        {'phone': '166****0000'},
+        {'phone': '+86 16600000000'},
+        {'phone': 16600000000},
+        {'phone': ['+86 166****0000']},
         [],
     ],
 )
-async def test_identity_must_match_exact_actual_session(identity):
+async def test_identity_requires_exact_masked_phone(identity):
     platform = Platform(identity=identity)
     called = []
 
@@ -167,6 +174,14 @@ async def test_identity_must_match_exact_actual_session(identity):
     assert result.remote_status == RemoteStatus.NOT_SUBMITTED
     assert result.error_code == ErrorCode.IDENTITY
     assert platform.changes == 0 and not called
+
+
+@pytest.mark.parametrize('identity', [{'phone': '+86 166****0000'}, {'phone': '+86 166****0000', 'id': 'not-used'}])
+async def test_identity_accepts_masked_phone_without_area_or_id(identity):
+    platform = Platform(identity=identity)
+    result = await platform.run()
+    assert result.remote_status == RemoteStatus.REPORTED_SUCCESS
+    assert platform.changes == 1
 
 
 @pytest.mark.parametrize('path', PATHS)

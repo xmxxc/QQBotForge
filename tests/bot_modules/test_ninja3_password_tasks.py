@@ -60,7 +60,7 @@ class FakeCenter:
         self.block_path = None
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
-        self.identity = {'phone': LOGIN, 'area': '86'}
+        self.identity = {'id': '12345678', 'phone': '+86 166****0000'}
 
     async def handle(self, request):
         self.requests.append(request)
@@ -369,7 +369,7 @@ async def test_missing_key_or_transaction_failure_never_starts_or_loses_existing
 
 async def test_identity_failure_and_notification_failure_do_not_lift_pause(changing):
     host = changing
-    host.center.identity = {'phone': '16600000001', 'area': '86'}
+    host.center.identity = {'phone': '+86 166****0001'}
     host.sender.push_result = (False, {'code': 'fake-push-failure'})
     task = await host.select()
     await host.action(task)
@@ -470,7 +470,7 @@ async def handle(request):
         config=dict(appId='fake-app',baseUrl='/api/web',backend='user.pandadastudio.com',signSecret=key,encryptoSecret=key)
         return httpx.Response(200,text='\n'.join(f'{k}: "{v}",' for k,v in config.items()))
     if path.endswith('/login/pwd'): return httpx.Response(200,json={'code':100})
-    if path.endswith('/userinfo'): return httpx.Response(200,json={'code':100,'data':{'phone':'16600000000','area':'86'}})
+    if path.endswith('/userinfo'): return httpx.Response(200,json={'code':100,'data':{'id':'12345678','phone':'+86 166****0000'}})
     if path.endswith('/change_pwd'): os._exit(75)
     raise AssertionError('unexpected path')
 async def run():
