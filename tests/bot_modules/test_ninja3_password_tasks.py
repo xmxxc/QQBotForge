@@ -699,7 +699,8 @@ async def test_restart_normalizes_interrupted_verification_and_owner_retry_stays
     normalized = await raw_task(host, task)
     assert normalized['state'] == 'paused' and normalized['remote'] == 'unknown' and normalized['verification_attempts'] == 1
     restarted.verifier = _verification
-    assert (await restarted.verify('bot-a', task['id']))['verification_attempts'] == 1
+    # verify() returns a snapshot after scheduling; the worker may already have claimed its attempt.
+    assert (await restarted.verify('bot-a', task['id']))['verification_attempts'] in {1, 2}
     await asyncio.gather(*list(restarted.workers.values()))
     finished = await task_info(host, task)
     assert finished['verification_attempts'] == 2 and finished['remote'] == 'unknown' and host.center.changes == 0
