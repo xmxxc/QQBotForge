@@ -62,11 +62,12 @@ async def test_authorization_denied_while_http_and_ws_sources_belong_to_differen
     denied = await acl.evaluate('bot-a', 'reports', 'read', 'group-a', 'member-a', 'report-r')
     assert (denied['allowed'], denied['reason'], denied['retryable']) == (False, 'group_facts_recovery_required', False)
     assert acl.decision_current('bot-b', decisions['bot-b'])
-    # A formal replacement restores one owner; after READY and a baseline (the owner check starts a new member
-    # cycle, as after any credential rebuild, so the grant is issued again) authorization works again.
+    # A formal replacement restores source ownership. R17 preserves the old grant
+    # after READY, current owner confirmation and a baseline with no observed member transition.
     await wired.change_secret('bot-a', 'fake-secret-bot-a-3')
     await wired.ready_ws('bot-a', session='session-a-3')
     await trusted(wired, 'bot-a')
-    await acl.manage_access('bot-a', 'reports', 'grant', function='read', group='group-a', member='member-a', resources=['report-r'])
     allowed = await acl.evaluate('bot-a', 'reports', 'read', 'group-a', 'member-a', 'report-r')
     assert allowed['allowed'] and acl.decision_current('bot-a', allowed), allowed['reason']
+    assert [source['id'] for source in allowed['sources']] == [source['id'] for source in decisions['bot-a']['sources']]
+    assert not acl.decision_current('bot-a', decisions['bot-a'])

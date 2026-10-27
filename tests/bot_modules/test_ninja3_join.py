@@ -423,7 +423,8 @@ async def test_leave_during_the_source_write_retires_it_and_rule_off_waits_for_i
 
 
 @pytest.mark.parametrize('gap', ['reload_group_state', 'restart_modules', 'new_session'])
-async def test_reloads_restart_and_new_session_never_revive_an_automatic_source(ninja, gap):
+@pytest.mark.parametrize('verification', ['platform', 'owner'])
+async def test_reloads_restart_and_new_session_never_revive_an_automatic_source(ninja, gap, verification):
     host, frames = ninja, Frames(ninja)
     await host.setup()
     await auto(host)
@@ -444,6 +445,8 @@ async def test_reloads_restart_and_new_session_never_revive_an_automatic_source(
             await host.plugins.reload('ninja3')
             host.access = host.modules.get('access_control')
     assert await host.say('账号列表', user='MEMBERJ') == UNSURE
+    if verification == 'owner':
+        await host.state.confirm_member('bot-a', 'group-a', 'MEMBERJ', evidence='owner checked current presence')
     await owner_rebuild(host, 'MEMBERJ')
     proof = await host.state.fact('bot-a', 'group-a', 'MEMBERJ')
     assert proof['usable'] and proof['member']['cycle'] == source['cycle'] and proof['join'] is None

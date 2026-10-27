@@ -103,9 +103,10 @@ class GroupState:
                     group.setdefault('roster', {'complete': False, 'reason': 'not_verified'})
                     group['roster'].update(complete=False, reason='process_restart')
                     for member in group['members'].values():
-                        member.update(
-                            reliable=False, cycle_uncertain=True, status='left' if member.get('status') == 'left' else 'historical', reason='process_restart'
-                        )
+                        # Earlier releases marked every member at restart; R17 keeps the cycle
+                        # unless a transition was observed, so that legacy marker is dropped.
+                        member.pop('cycle_uncertain', None)
+                        member.update(reliable=False, status='left' if member.get('status') == 'left' else 'historical', reason='process_restart')
                 state['version'] += 1
                 self.durable[bot] = {}
                 self.states[bot] = state
@@ -463,11 +464,11 @@ class GroupState:
                 record.update(status='historical', reason=reason)
             raise
 
-    async def _commit_member(self, bot, state, native_group, member, fact, *, previous=None, manual=False, continuity_unknown=False):
+    async def _commit_member(self, bot, state, native_group, member, fact, *, previous=None, manual=False):
         published: dict = {}
 
         def apply(candidate, updated):
-            self._merge_member(updated, {'member': member, **fact}, manual=manual, previous=previous, continuity_unknown=continuity_unknown)
+            self._merge_member(updated, {'member': member, **fact}, manual=manual, previous=previous)
             self._invalidate(candidate, updated, 'individual_verification')
             published.update(updated['members'][member], group=native_group, version=updated['version'], generation=self.generation)
 
@@ -513,10 +514,7 @@ class GroupState:
             'confirmation_revision': self.recovery.get_status(bot).revision,
         }
         try:
-            return await self._commit_member(
-                bot, state, native_group, member, fact, previous=previous, manual=True,
-                continuity_unknown=self.recovery.get_status(bot).phase in {'needs_baseline', 'unsupported', 'closed'},
-            )
+            return await self._commit_member(bot, state, native_group, member, fact, previous=previous, manual=True)
         except BaseException as error:
             if reason := self._abandon(state, group, version, error, 'confirmation'):
                 record.update(status='historical', reason=reason)
@@ -762,6 +760,8 @@ class GroupState:
             self.recovery.invalidate(bot, reason='missing_native_group')
             for group in state['groups'].values():
                 self._suspend(state, group, 'missing_native_group')
+                if event.event_type in {'GROUP_MEMBER_ADD', 'GROUP_MEMBER_REMOVE'}:
+                    self._uncertain(group['members'].values())
             await self._save(bot, state)
             for group in state['groups'].values():
                 await self._notify(bot, group, 'missing_native_group', event=event)
@@ -799,6 +799,10 @@ class GroupState:
         if reason:
             # Ambiguous events never revive an earlier presence or cycle.
             target.update(reliable=False, reason=reason)
+            if is_member:
+                # A rejected transition may still be a real leave/join: an owner
+                # confirmation cannot vouch for continuity across it (R17).
+                self._uncertain([target] if target is not group else group['members'].values())
             self.recovery.invalidate(bot, reason=reason)
         else:
             added = event.event_type in {'GROUP_MEMBER_ADD', 'GROUP_ADD_ROBOT'}
@@ -852,15 +856,26 @@ class GroupState:
         for member in group['members'].values():
             member.update(reliable=False, reason=reason, native_join=None)
 
-    def _merge_member(self, group, data, *, manual=False, previous=None, continuity_unknown=False):
+    @staticmethod
+    def _uncertain(members):
+        for member in members:
+            member['transition_uncertain'] = True
+
+    def _merge_member(self, group, data, *, manual=False, previous=None):
         previous = previous if previous is not None else group['members'].get(data['member'], {})
         cycle = previous.get('cycle') or uuid4().hex
         joined = data.get('joined_at')
         anchor = previous.get('cycle_anchor') or previous.get('checked_at')
+        # A cancelled verification can leave a persisted pending status over a
+        # departure. Its terminal state still belongs to the old cycle.
+        departed = previous.get('status') == 'left' or previous.get('state') == 'left'
+        # R17: verification alone preserves the cycle. Only an observed departure/
+        # join, a rejected transition the owner cannot see past, or platform
+        # evidence of a different join establishes a new one.
         changed = (
-            previous.get('status') == 'left'
+            departed
             or manual
-            and (previous.get('cycle_uncertain') or continuity_unknown)
+            and previous.get('transition_uncertain')
             or (
                 joined is not None
                 and (
@@ -879,9 +894,9 @@ class GroupState:
         result = {**copy.deepcopy(previous), **data, 'cycle': cycle}
         result['cycle_anchor'] = self.clock() if anchor is None or cycle != previous.get('cycle') else anchor
         if stale:
-            result.update(reliable=False, status='left' if previous.get('status') == 'left' else 'pending', state='unknown', reason='stale_membership')
+            result.update(reliable=False, status='left' if departed else 'pending', state='unknown', reason='stale_membership')
         if result.get('reliable'):
-            result['cycle_uncertain'] = False
+            result['transition_uncertain'] = False
         group['members'][data['member']] = result
         return result
 

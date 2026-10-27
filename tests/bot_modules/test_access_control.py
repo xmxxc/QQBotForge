@@ -324,11 +324,13 @@ async def test_group_state_late_enable_and_reload_rebinds_authorization(access_h
 
 
 @pytest.mark.parametrize('gap', ['restart', 'failed_query', 'new_session'])
-async def test_manual_current_presence_after_restart_does_not_restore_old_grant(access_host, gap):
+async def test_manual_current_presence_after_restart_restores_valid_explicit_grant(access_host, gap):
     host = access_host
     acl = await configure(host)
     await host.state.confirm_member('bot-a', 'group-a', 'member-a', evidence='verified before restart')
     old = await acl.manage_access('bot-a', 'reports', 'grant', function='read', group='group-a', member='member-a', resources=['report-r'])
+    before = await acl.evaluate('bot-a', 'reports', 'read', 'group-a', 'member-a', 'report-r')
+    assert before['allowed'] and acl.decision_current('bot-a', before)
     if gap == 'new_session':
         host.sockets['bot-a'].feed(9, d=False)
         second = host.gateways['bot-a'].add()
@@ -340,15 +342,23 @@ async def test_manual_current_presence_after_restart_does_not_restore_old_grant(
         assert not await host.state.rebuild('bot-a')
     else:
         assert await host.modules.reload('group_state')
+        assert await host.modules.reload('access_control')
+        acl = host.access = host.modules.get('access_control')
         if gap == 'failed_query':
             await host.state.verify_member('bot-a', 'group-a', 'member-a')
-    # Owner confirms only current presence, not continuity over the unknown gap.
+    assert not acl.decision_current('bot-a', before)
+    assert not (await acl.evaluate('bot-a', 'reports', 'read', 'group-a', 'member-a', 'report-r'))['allowed']
+    # R17: no observed leave/join; owner verification retains the original cycle.
     await host.state.confirm_member('bot-a', 'group-a', 'member-a', evidence='currently in group')
+    assert not (await acl.evaluate('bot-a', 'reports', 'read', 'group-a', 'member-a', 'report-r'))['allowed']
     assert await host.state.rebuild('bot-a')
     after = await acl.evaluate('bot-a', 'reports', 'read', 'group-a', 'member-a', 'report-r')
-    assert not after['allowed']
+    assert after['allowed'] and after['cycle'] == old['cycle'] and acl.decision_current('bot-a', after)
+    assert not acl.decision_current('bot-a', before)
     snapshot = await acl.access_snapshot('bot-a', 'reports')
-    assert not snapshot['grants'] and snapshot['revocations'][-1]['id'] == old['id']
+    assert snapshot['grants'] == [old] and not snapshot['revocations']
+    report = await acl.audience_report('bot-a', 'reports', 'read', 'group-a', 'report-r')
+    assert not report['complete'] and not report['eligible']
 
 
 def platform_member(host, *members, group='group-a'):
