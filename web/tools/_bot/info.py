@@ -9,8 +9,6 @@ from aiohttp import web
 from core.base.config import cfg
 
 _SSL_CTX = ssl.create_default_context()
-_SSL_CTX.check_hostname = False
-_SSL_CTX.verify_mode = ssl.CERT_NONE
 
 _API_URL = 'https://qun.qq.com/qunpro/robot/proxy/domain/qun.qq.com/cgi-bin/group_pro/robot/manager/share_info?bkn=508459323&robot_appid={}'
 _QR_API = 'https://api.2dcode.biz/v1/create-qr-code?data={}'
