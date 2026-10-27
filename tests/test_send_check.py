@@ -408,6 +408,44 @@ async def test_rich_generic_entries_reject_check_without_business_request(hooks)
     assert wire.requests == []
 
 
+async def test_issue130_channel_image_before_send_and_stream_query_reject(hooks):
+    """#130: native channel images and queried stream paths remain unsupported."""
+    wire = Wire()
+    sender, _ = make_sender(wire)
+    check_calls = []
+
+    def check():
+        check_calls.append(True)
+        return True
+
+    channel_event = make_event()
+    channel_event.reply_endpoint = '/channels/C1/messages'
+    channel_event.needs_msg_id = False
+    channel_event.needs_event_id = False
+
+    calls = (
+        lambda: sender.send_to_channel('C1', 'image', image={'url': 'https://example.test/image.png'}, send_check=check),
+        lambda: sender.reply(channel_event, 'image', image={'url': 'https://example.test/image.png'}, send_check=check),
+        lambda: sender.post_json('/channels/C1/messages', {'image': {'url': 'https://example.test/image.png'}}, send_check=check),
+        lambda: sender.post_json('/v2/users/U1/stream_messages?trace=1', {'content_raw': 'x'}, send_check=check),
+    )
+    for call in calls:
+        with pytest.raises(TypeError):
+            await call()
+
+    async def add_image(packet):
+        payload = dict(packet['payload'])
+        payload['image'] = {'url': 'https://example.test/hook.png'}
+        return {**packet, 'payload': payload}
+
+    hooks.register('before_send', add_image, owner='issue130')
+    with pytest.raises(TypeError):
+        await sender.reply(make_event(), 'hook image', send_check=check)
+
+    assert check_calls == []
+    assert wire.requests == []
+
+
 async def test_rich_generic_entries_without_check_remain_compatible(hooks):
     wire = Wire()
     sender, _ = make_sender(wire)
