@@ -73,6 +73,9 @@ class Management:
             if set(values) - {'function', 'group', 'resource', 'actions'} or not {'function', 'group'} <= values.keys():
                 raise ValueError('全员报告须明确功能和群')
             return self.service.audience.owner_view(await self.service.audience_report(bot, consumer, **values))
+        if operation == 'join_rule' and values.get('enabled') is not False:
+            # Owners may narrow here; enabling automatic grants belongs to the consumer that owns the rule.
+            raise ValueError('入群自动授权只能由消费方插件开启，此处只能关闭')
         return await self.service.manage_access(bot, consumer, operation, **values)
 
     async def http(self, request):

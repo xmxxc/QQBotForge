@@ -1,0 +1,292 @@
+"""忍者必须死3 owner page: real DOM behaviour against the real plugin routes (fake data only)."""
+
+import os
+import shutil
+from html.parser import HTMLParser
+from pathlib import Path
+
+import pytest
+from account_host import account_host as account_host  # noqa: F401
+from test_access_control import access_host as access_host  # noqa: F401
+from test_ninja3 import ninja as ninja  # noqa: F401
+
+PAGE = Path(__file__).absolute().parents[2] / 'plugins/ninja3/page.html'
+# Named form controls override these HTMLFormElement members ([LegacyOverrideBuiltIns]).
+FORM_METHODS = {'reset', 'submit', 'requestSubmit', 'checkValidity', 'reportValidity'}
+
+
+def test_no_form_control_shadows_a_form_method():
+    class Controls(HTMLParser):
+        depth, shadowing = 0, []
+
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == 'form':
+                self.depth += 1
+            elif self.depth and FORM_METHODS & {attrs.get('id'), attrs.get('name')}:
+                self.shadowing.append((tag, attrs.get('id'), attrs.get('name')))
+
+        def handle_endtag(self, tag):
+            if tag == 'form':
+                self.depth -= 1
+
+    parser = Controls()
+    parser.feed(PAGE.read_text(encoding='utf-8'))
+    assert parser.shadowing == []
+
+
+def bots_route(bots):
+    from aiohttp import web
+
+    async def handler(request):
+        return web.json_response({'success': True, 'data': {'bots': bots}})
+
+    return handler
+
+
+def chrome():
+    path = os.environ.get('NINJA3_CHROME') or shutil.which('google-chrome') or shutil.which('chromium')
+    if not path:
+        pytest.skip('未找到 Chrome／Chromium，浏览器页面回归未运行')
+    pytest.importorskip('playwright.async_api', reason='未安装 playwright，浏览器页面回归未运行')
+    return path
+
+
+async def test_account_form_new_edit_delete_and_rejection_in_a_real_browser(ninja):
+    executable = chrome()
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+    from playwright.async_api import async_playwright
+
+    from web import auth
+    from web.api import handle_ext_route
+
+    host = ninja
+    await host.ninja_api('POST', 'groups', {'group': 'group-a', 'enabled': True})
+    app = web.Application()
+
+    async def index(request):
+        return web.Response(text=PAGE.read_text(encoding='utf-8'), content_type='text/html')
+
+    app.router.add_get('/', index)
+    app.router.add_get('/api/bots', bots_route([{'appid': 'bot-a', 'name': 'Bot A'}]))
+    app.router.add_route('*', '/api/ext/{tail:.*}', handle_ext_route)
+    server = TestServer(app, host='127.0.0.1')
+    await server.start_server()
+    base = str(server.make_url('/'))
+    errors = []
+
+    async def accounts():
+        return {a['name']: a for a in (await host.ninja_api())[1]['data']}
+
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(executable_path=executable, headless=True)
+            context = await browser.new_context()
+            await context.add_cookies([{'name': auth.SESSION_COOKIE, 'value': 'group-test', 'url': base}])
+            page = await context.new_page()
+            page.set_default_timeout(5000)
+            page.on('pageerror', lambda error: errors.append(str(error)))
+            await page.goto(base)
+            # A single configured Bot is selected and loaded without any input.
+            await page.wait_for_function("() => document.getElementById('status').textContent.startsWith('已加载')")
+
+            async def save(expect):
+                # Discard the previous result so a repeated success cannot satisfy this wait.
+                await page.locator('#status').evaluate("element => element.textContent = ''")
+                async with page.expect_response(
+                    lambda response: '/api/ext/ninja3/accounts' in response.url and response.request.method in {'POST', 'PATCH'}
+                ) as submitted:
+                    await page.click('#account button:not([type])')
+                response = await submitted.value
+                try:
+                    await page.wait_for_function('text => document.getElementById("status").textContent.includes(text)', arg=expect)
+                except Exception:
+                    raise AssertionError(f'页面未显示“{expect}”：状态={await page.text_content("#status")!r} 页面错误={errors}') from None
+                message = await page.text_content('#status')
+                result = await response.json()
+                if response.ok:
+                    sync = {'not_needed': '启用状态未变，未改授权', 'saved': '已同步本账号', 'unavailable': '授权模块不可用', 'failed': '失败'}
+                    assert message == '账号已保存；授权同步：' + sync[result['data']['acl_sync']['status']]
+                else:
+                    assert message == result['error']
+                return message
+
+            async def fill(name, login, password):
+                await page.fill('#name', name)
+                await page.fill('#login', login)
+                await page.fill('#password', password)
+
+            # 1. Create A: the list refreshes and the status shows this save's actual sync result.
+            await fill('账号A', 'fake-login-a', 'fake-pass-a')
+            await page.check('#enabled')
+            assert await save('账号已保存') == '账号已保存；授权同步：已同步本账号'
+            assert '账号A' in await page.text_content('#rows')
+            a = (await accounts())['账号A']
+            # 2. Edit A, press 新增, fill B and save: a second ID; A's credentials untouched.
+            await page.click('#rows tr:has-text("账号A") button:text("编辑")')
+            await page.click('#account button:text("新增")')
+            assert await page.input_value('#name') == ''
+            assert await page.input_value('#id') == ''
+            await fill('账号B', 'fake-login-b', 'fake-pass-b')
+            await save('账号已保存')
+            saved = await accounts()
+            assert set(saved) == {'账号A', '账号B'} and saved['账号B']['id'] != a['id']
+            assert (saved['账号A']['id'], saved['账号A']['login']) == (a['id'], 'fake-login-a')
+            stored = await host.ninja().store.get('bot-a', 'accounts', a['id'])
+            assert stored['password'] == 'fake-pass-a'
+            # 3. Editing changes only that record; the next 新增 leaves no old ID behind.
+            await page.click('#rows tr:has-text("账号B") button:text("编辑")')
+            await page.fill('#login', 'fake-login-b2')
+            await save('账号已保存')
+            saved = await accounts()
+            assert (saved['账号A']['login'], saved['账号B']['login']) == ('fake-login-a', 'fake-login-b2') and len(saved) == 2
+            await page.click('#account button:text("新增")')
+            assert await page.input_value('#id') == ''
+            await fill('账号C', 'fake-login-c', 'fake-pass-c')
+            await save('账号已保存')
+            assert len(await accounts()) == 3
+            # 4. Delete: list and form agree, no page error; 新增 still works afterwards.
+            await page.click('#rows tr:has-text("账号C") button:text("编辑")')
+            page.once('dialog', lambda dialog: dialog.accept())
+            await page.click('#rows tr:has-text("账号C") button:text("删除")')
+            await page.wait_for_function("() => !document.getElementById('rows').textContent.includes('账号C')")
+            assert set(await accounts()) == {'账号A', '账号B'} and await page.input_value('#name') == ''
+            assert await page.input_value('#id') == ''
+            await fill('账号D', 'fake-login-d', 'fake-pass-d')
+            await save('账号已保存')
+            assert set(await accounts()) == {'账号A', '账号B', '账号D'}
+            # 5. A rejected save reports the error and leaves both server data and the form as they were.
+            await page.click('#rows tr:has-text("账号D") button:text("编辑")')
+            await page.fill('#name', '账号A')
+            assert await save('名称不能重复') == '同一 Bot 下账号名称不能重复'
+            assert await page.input_value('#name') == '账号A' and await page.input_value('#login') == 'fake-login-d'
+            saved = await accounts()
+            assert (saved['账号A']['id'], saved['账号D']['login']) == (a['id'], 'fake-login-d') and len(saved) == 3
+            await browser.close()
+    finally:
+        await server.close()
+    assert errors == []
+
+
+async def test_group_auto_grant_switch_in_a_real_browser(ninja):
+    executable = chrome()
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+    from playwright.async_api import async_playwright
+
+    from web import auth
+    from web.api import handle_ext_route
+
+    host = ninja
+    app = web.Application()
+
+    async def index(request):
+        return web.Response(text=PAGE.read_text(encoding='utf-8'), content_type='text/html')
+
+    app.router.add_get('/', index)
+    app.router.add_get('/api/bots', bots_route([{'appid': 'bot-a', 'name': 'Bot A'}]))
+    app.router.add_route('*', '/api/ext/{tail:.*}', handle_ext_route)
+    server = TestServer(app, host='127.0.0.1')
+    await server.start_server()
+    base = str(server.make_url('/'))
+    errors = []
+
+    async def rules():
+        return [r['group'] for r in (await host.access.access_snapshot('bot-a', 'ninja3')).get('join_rules', [])]
+
+    async def stored():
+        return {g['group']: g for g in (await host.ninja_api('GET', 'groups'))[1]['data']}
+
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(executable_path=executable, headless=True)
+            context = await browser.new_context()
+            await context.add_cookies([{'name': auth.SESSION_COOKIE, 'value': 'group-test', 'url': base}])
+            page = await context.new_page()
+            page.set_default_timeout(5000)
+            page.on('pageerror', lambda error: errors.append(str(error)))
+            await page.goto(base)
+            # A single configured Bot is selected and loaded without any input.
+            await page.wait_for_function("() => document.getElementById('status').textContent.startsWith('已加载')")
+            assert await page.input_value('#bot') == 'bot-a'
+            assert not await page.is_checked('#group-auto')
+            # A closed group with the switch on stores the intent but syncs no rule.
+            await page.fill('#group', 'group-a')
+            await page.check('#group-auto')
+            await page.click('#group-form button')
+            await page.wait_for_function("() => document.getElementById('status').textContent === '群已保存；授权同步：saved'")
+            assert '未开放，入群自动授权（群未开放，不生效）' in await page.text_content('#groups')
+            assert (await stored())['group-a']['auto_grant'] is True and await rules() == []
+            assert not await page.is_checked('#group-auto')  # the form resets after a save
+            # Opening the group from the table keeps the switch and syncs the rule.
+            await page.click('#groups tr:has-text("group-a") button:text-is("开放")')
+            await page.wait_for_function("() => document.getElementById('groups').textContent.includes('开放，入群自动授权关闭')")
+            assert await rules() == ['group-a']
+            # The sync log renders after the table within the same refresh.
+            await page.wait_for_function("() => document.getElementById('operations').textContent.includes('入群自动授权 false → true')")
+            # Turning only the switch off removes the rule and leaves the group open.
+            await page.click('#groups tr:has-text("group-a") button:text-is("关闭自动授权")')
+            await page.wait_for_function("() => document.getElementById('groups').textContent.includes('开放关闭开启自动授权')")
+            assert await rules() == [] and (await stored())['group-a']['enabled'] is True
+            # The sync log renders after the table within the same refresh.
+            await page.wait_for_function("() => document.getElementById('operations').textContent.includes('入群自动授权 true → false')")
+            await page.wait_for_function("() => document.getElementById('acl-status').textContent === '一致'")
+            await browser.close()
+    finally:
+        await server.close()
+    assert errors == []
+
+
+async def test_bot_select_waits_for_a_choice_and_clears_on_switch(ninja):
+    executable = chrome()
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+    from playwright.async_api import async_playwright
+
+    from web import auth
+    from web.api import handle_ext_route
+
+    host = ninja
+    await host.ninja_api('POST', 'groups', {'group': 'group-a', 'enabled': True})
+    app = web.Application()
+
+    async def index(request):
+        return web.Response(text=PAGE.read_text(encoding='utf-8'), content_type='text/html')
+
+    app.router.add_get('/', index)
+    app.router.add_get('/api/bots', bots_route([{'appid': 'bot-a', 'name': 'Bot A'}, {'appid': 'bot-b', 'name': 'Bot B'}]))
+    app.router.add_route('*', '/api/ext/{tail:.*}', handle_ext_route)
+    server = TestServer(app, host='127.0.0.1')
+    await server.start_server()
+    base = str(server.make_url('/'))
+    errors = []
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(executable_path=executable, headless=True)
+            context = await browser.new_context()
+            await context.add_cookies([{'name': auth.SESSION_COOKIE, 'value': 'group-test', 'url': base}])
+            page = await context.new_page()
+            page.set_default_timeout(5000)
+            page.on('pageerror', lambda error: errors.append(str(error)))
+            await page.goto(base)
+            # Several Bots: nothing is guessed or loaded until the owner picks one.
+            await page.wait_for_function("() => document.getElementById('status').textContent === '请先选择 Bot'")
+            assert await page.input_value('#bot') == ''
+            assert await page.text_content('#groups') == ''
+            await page.click('#refresh')
+            await page.wait_for_function("() => document.getElementById('status').textContent === '请先选择 Bot'")
+            await page.select_option('#bot', 'bot-a')
+            await page.wait_for_function("() => document.getElementById('status').textContent === '已加载 1 个群、0 个账号'")
+            assert 'group-a' in await page.text_content('#groups')
+            # Switching Bot drops the previous Bot's rows and form state before loading the new one.
+            await page.fill('#name', '未保存的账号')
+            await page.select_option('#bot', 'bot-b')
+            await page.wait_for_function("() => document.getElementById('status').textContent === '已加载 0 个群、0 个账号'")
+            assert await page.text_content('#groups') == '' and await page.input_value('#name') == ''
+            await page.select_option('#bot', '')
+            await page.wait_for_function("() => document.getElementById('status').textContent === '请先选择 Bot'")
+            await browser.close()
+    finally:
+        await server.close()
+    assert errors == []

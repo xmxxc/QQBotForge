@@ -31,7 +31,7 @@ _NINJA3_STORE = 'plugins/ninja3/storage.py'
 if (Path(__file__).resolve().parents[2] / _NINJA3_STORE).exists():
     STORES['ninja3'] = _NINJA3_STORE
 COMMON_API = {'ready', 'all', 'get', 'put', 'delete', 'close'}
-EXTRAS = {'access_control': {'keys'}}
+EXTRAS = {'access_control': {'keys'}, 'ninja3': {'atomic', 'project'}}
 GET_MISSING_KEYWORD = {'access_control'}
 # Reviewed in-flight write drain on cancellation; not imposed on the other copies.
 DRAINS_CANCELLED_WRITES = ['group_state', 'access_control']
@@ -148,7 +148,7 @@ async def test_v1_schema_and_wal_on_first_use(tmp_path, name):
 async def test_newer_database_version_is_rejected_untouched(tmp_path, name):
     path = tmp_path / 'future.db'
     with sqlite3.connect(path) as connection:
-        connection.execute('PRAGMA user_version=2')
+        connection.execute('PRAGMA user_version=3')
     store = load(name)(path)
     try:
         for _ in range(2):  # A refused open leaves no half-open connection behind.
@@ -157,7 +157,7 @@ async def test_newer_database_version_is_rejected_untouched(tmp_path, name):
     finally:
         store.close()
     with sqlite3.connect(path) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == 2
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == 3
         assert connection.execute('PRAGMA journal_mode').fetchone()[0] != 'wal'
         assert connection.execute("SELECT name FROM sqlite_master WHERE name='extension_records'").fetchall() == []
 
