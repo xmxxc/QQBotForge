@@ -143,14 +143,7 @@ async def test_single_member_confirmation_preserves_scope_and_never_proves_roste
     assert not report['complete'] and not report['eligible'] and not report['failures_complete']
 
 
-@pytest.mark.parametrize('failed_query', [False, True])
-async def test_cancelled_query_cannot_erase_unconsumed_departure_on_restart(access_host, failed_query):
-    host = access_host
-    old = await granted(host)
-    # A consumer that was offline must still retire the leave when it next reads history.
-    await host.modules.disable('access_control', _persist=False)
-    host.lifecycle('GROUP_MEMBER_REMOVE', member='member-a')
-    await lifecycle_done(host, 2)
+async def blocked_query(host):
     entered = asyncio.Event()
 
     async def slow_platform(path, cursor):
@@ -160,22 +153,75 @@ async def test_cancelled_query_cannot_erase_unconsumed_departure_on_restart(acce
     host.sender.after_json = slow_platform
     pending = asyncio.create_task(host.state.verify_member('bot-a', 'group-a', 'member-a'))
     await until(entered.is_set)  # the query's pending marker is already on disk
+    return pending
+
+
+async def cancelled_query(host):
+    pending = await blocked_query(host)
     pending.cancel()
     with pytest.raises(asyncio.CancelledError):
         await pending
     host.sender.after_json = None
-    assert await host.modules.reload('group_state')
-    assert await host.modules.enable('access_control', _skip_deps=True, _persist=False)
+
+
+async def failed_query(host):
+    # Without member-query permission the platform answer is unknown: a stale merge.
+    assert not (await host.state.verify_member('bot-a', 'group-a', 'member-a'))['reliable']
+
+
+@pytest.mark.parametrize(
+    'steps, consumer_online',
+    [
+        (('cancel',), False),
+        (('cancel', 'fail'), False),
+        (('fail', 'cancel'), False),
+        (('fail', 'restart_mid_query'), False),
+        (('restart_mid_query', 'fail'), False),
+        (('fail', 'cancel'), True),
+    ],
+)
+async def test_interrupted_queries_cannot_erase_unconsumed_departure_on_restart(access_host, steps, consumer_online):
+    host = access_host
+    old = await granted(host)
+    if not consumer_online:
+        # A consumer that was offline must still retire the leave when it next reads history.
+        await host.modules.disable('access_control', _persist=False)
+    host.lifecycle('GROUP_MEMBER_REMOVE', member='member-a')
+    await lifecycle_done(host, 2)
+    restarted = False
+    for step in steps:
+        if step == 'cancel':
+            await cancelled_query(host)
+        elif step == 'fail':
+            await failed_query(host)
+        else:
+            # The process stops while the pending marker is on disk; a cold instance loads it.
+            pending = await blocked_query(host)
+            assert await host.modules.reload('group_state')
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+            host.sender.after_json = None
+            restarted = True
+    if not restarted:
+        assert await host.modules.reload('group_state')
+    if consumer_online:
+        assert await host.modules.reload('access_control')
+    else:
+        assert await host.modules.enable('access_control', _skip_deps=True, _persist=False)
     host.access = host.modules.get('access_control')
     host.access.clock = lambda: 100
-    if failed_query:
-        assert not (await host.state.verify_member('bot-a', 'group-a', 'member-a'))['reliable']
     await host.state.confirm_member('bot-a', 'group-a', 'member-a', evidence='present after departure')
     assert await host.state.rebuild('bot-a')
     after = await evaluate(host)
     assert not after['allowed'] and after['cycle'] != old['cycle']
     snapshot = await host.access.access_snapshot('bot-a', 'reports')
     assert not snapshot['grants'] and [r['id'] for r in snapshot['revocations']] == [old['id']]
+    # The new cycle consumed the leave: a later restart and confirmation keep it.
+    cycle = after['cycle']
+    state, acl = await restart_modules(host)
+    acl.clock = lambda: 100
+    await state.confirm_member('bot-a', 'group-a', 'member-a', evidence='present once more')
+    assert (await state.fact('bot-a', 'group-a', 'member-a'))['member']['cycle'] == cycle
 
 
 @pytest.mark.parametrize('race', ['write_pending', 'cancelled', 'leave'])
@@ -270,3 +316,86 @@ async def test_restart_marker_persisted_by_earlier_release_does_not_retire_sourc
     after = await evaluate(host)
     assert after['allowed'] and after['cycle'] == old['cycle'] and after['sources'][0]['id'] == old['id']
     assert 'cycle_uncertain' not in (await state.fact('bot-a', 'group-a', 'member-a'))['member']
+
+
+async def legacy_record(host, **member):
+    # Shape a record as releases before transition tracking persisted it.
+    state = await host.state._state('bot-a')
+    record = state['groups']['group-a']['members']['member-a']
+    for key in ('transition_uncertain', 'left_cycle'):
+        record.pop(key, None)
+    record.update(member)
+    await host.state._save('bot-a', state)
+
+
+@pytest.mark.parametrize('reason', ['late_event', 'same_time_conflict', 'conflicting_duplicate', 'incomplete_event', 'missing_native_group'])
+async def test_rejected_transition_recorded_by_earlier_release_is_not_proof_of_continuity(access_host, reason):
+    host = access_host
+    old = await granted(host)
+    await legacy_record(host, reliable=False, reason=reason, cycle_uncertain=False)
+    state, acl = await restart_modules(host)
+    acl.clock = lambda: 100
+    await state.confirm_member('bot-a', 'group-a', 'member-a', evidence='currently present')
+    assert await state.rebuild('bot-a')
+    after = await evaluate(host)
+    assert not after['allowed'] and after['cycle'] != old['cycle']
+    assert [r['id'] for r in (await acl.access_snapshot('bot-a', 'reports'))['revocations']] == [old['id']]
+
+
+async def test_unconsumed_leave_recorded_by_earlier_release_is_not_erased(access_host):
+    host = access_host
+    old = await granted(host)
+    await host.modules.disable('access_control', _persist=False)
+    host.lifecycle('GROUP_MEMBER_REMOVE', member='member-a')
+    await lifecycle_done(host, 2)
+    # A stale merge and a cancelled query in the earlier release overwrote both markers.
+    await legacy_record(host, status='historical', state='unknown', reason='verification_cancelled')
+    assert await host.modules.reload('group_state')
+    assert await host.modules.enable('access_control', _skip_deps=True, _persist=False)
+    host.access = host.modules.get('access_control')
+    host.access.clock = lambda: 100
+    await host.state.confirm_member('bot-a', 'group-a', 'member-a', evidence='present after departure')
+    assert await host.state.rebuild('bot-a')
+    after = await evaluate(host)
+    assert not after['allowed'] and after['cycle'] != old['cycle']
+
+
+@pytest.mark.parametrize('tracked', [False, True])
+async def test_backfill_runs_once_and_keeps_unaffected_cycles(access_host, tracked):
+    host = access_host
+    old = await granted(host)
+    if tracked:
+        # After the migration, a bot-level rejection leaves its reason without marking members.
+        state, _ = await restart_modules(host)
+        loaded = await state._state('bot-a')
+        loaded['groups']['group-a']['members']['member-a']['reason'] = 'late_event'
+        await state._save('bot-a', loaded)
+    else:
+        await legacy_record(host, reason='process_restart')
+    state, acl = await restart_modules(host)
+    acl.clock = lambda: 100
+    await state.confirm_member('bot-a', 'group-a', 'member-a', evidence='currently present')
+    assert await state.rebuild('bot-a')
+    after = await evaluate(host)
+    assert after['allowed'] and after['cycle'] == old['cycle'] and after['sources'][0]['id'] == old['id']
+
+
+async def test_trusted_join_after_rejected_transition_is_confirmed_in_its_own_cycle(access_host):
+    host = access_host
+    await configure(host)
+    await host.state.confirm_member('bot-a', 'group-a', 'member-b', evidence='owner checked')
+    host.lifecycle('GROUP_MEMBER_REMOVE', member='member-a', sequence=2, timestamp=1000)
+    await lifecycle_done(host, 2)
+    host.lifecycle('GROUP_MEMBER_REMOVE', member='member-a', sequence=3, timestamp=999)  # late, rejected
+    await lifecycle_done(host, 3)
+    record = host.state.states['bot-a']['groups']['group-a']['members']['member-a']
+    assert record['transition_uncertain'] is True
+    await host.state.confirm_member('bot-a', 'group-a', 'member-b', evidence='owner checked')
+    assert await host.state.rebuild('bot-a')
+    host.lifecycle('GROUP_MEMBER_ADD', member='member-a', sequence=4, timestamp=1100)
+    await lifecycle_done(host, 4)
+    joined = host.state.states['bot-a']['groups']['group-a']['members']['member-a']
+    assert joined['transition_uncertain'] is False and joined['native_join']['cycle'] == joined['cycle']
+    await host.state.confirm_member('bot-a', 'group-a', 'member-a', evidence='owner saw the join')
+    confirmed = host.state.states['bot-a']['groups']['group-a']['members']['member-a']
+    assert confirmed['cycle'] == joined['cycle']

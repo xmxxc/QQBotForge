@@ -25,6 +25,7 @@ from .text import owner_reply, short_reply
 
 PREFIX = '/api/ext/group-state/'
 MESSAGE_TYPES = {'GROUP_AT_MESSAGE_CREATE', 'GROUP_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE'}
+REJECTED_TRANSITIONS = {'late_event', 'same_time_conflict', 'conflicting_duplicate', 'incomplete_event', 'missing_native_group'}
 log = get_logger(EXTENSION, '群状态')
 
 
@@ -106,6 +107,8 @@ class GroupState:
                         # Earlier releases marked every member at restart; R17 keeps the cycle
                         # unless a transition was observed, so that legacy marker is dropped.
                         member.pop('cycle_uncertain', None)
+                        if 'transition_uncertain' not in member:
+                            self._backfill_transitions(member)
                         member.update(reliable=False, status='left' if member.get('status') == 'left' else 'historical', reason='process_restart')
                 state['version'] += 1
                 self.durable[bot] = {}
@@ -761,7 +764,7 @@ class GroupState:
             for group in state['groups'].values():
                 self._suspend(state, group, 'missing_native_group')
                 if event.event_type in {'GROUP_MEMBER_ADD', 'GROUP_MEMBER_REMOVE'}:
-                    self._uncertain(group['members'].values())
+                    self._mark_transition_uncertain(group['members'].values())
             await self._save(bot, state)
             for group in state['groups'].values():
                 await self._notify(bot, group, 'missing_native_group', event=event)
@@ -802,7 +805,7 @@ class GroupState:
             if is_member:
                 # A rejected transition may still be a real leave/join: an owner
                 # confirmation cannot vouch for continuity across it (R17).
-                self._uncertain([target] if target is not group else group['members'].values())
+                self._mark_transition_uncertain([target] if target is not group else group['members'].values())
             self.recovery.invalidate(bot, reason=reason)
         else:
             added = event.event_type in {'GROUP_MEMBER_ADD', 'GROUP_ADD_ROBOT'}
@@ -832,9 +835,13 @@ class GroupState:
                         state='unknown',
                         reliable=False,
                         reason='join_requires_verification',
+                        # The join already starts a new cycle; confirming it must not start another.
+                        transition_uncertain=False,
                     )
                 else:
-                    target.update(status='left', state='left', reliable=True, reason='', left_at=timestamp, native_join=None)
+                    target.update(
+                        status='left', state='left', reliable=True, reason='', left_at=timestamp, left_cycle=target.get('cycle'), native_join=None
+                    )
                 target.update(source='native_lifecycle', last_transition={'time': timestamp, 'event_id': event.event_id, 'type': event.event_type})
             else:
                 group.update(status='pending' if added else 'left', reliable=False, reason='bot_added_requires_baseline' if added else 'bot_removed')
@@ -857,18 +864,27 @@ class GroupState:
             member.update(reliable=False, reason=reason, native_join=None)
 
     @staticmethod
-    def _uncertain(members):
+    def _mark_transition_uncertain(members):
         for member in members:
             member['transition_uncertain'] = True
+
+    @staticmethod
+    def _backfill_transitions(member):
+        # Records written before transition tracking keep the rejected-event reason that
+        # the old _suspend put on every member of the group, and may hold a leave whose
+        # status/state a stale or abandoned query already overwrote.
+        member['transition_uncertain'] = member.get('reason') in REJECTED_TRANSITIONS
+        if member.get('last_transition', {}).get('type') == 'GROUP_MEMBER_REMOVE' and member.get('state') != 'present':
+            member.setdefault('left_cycle', member.get('cycle'))
 
     def _merge_member(self, group, data, *, manual=False, previous=None):
         previous = previous if previous is not None else group['members'].get(data['member'], {})
         cycle = previous.get('cycle') or uuid4().hex
         joined = data.get('joined_at')
         anchor = previous.get('cycle_anchor') or previous.get('checked_at')
-        # A cancelled verification can leave a persisted pending status over a
-        # departure. Its terminal state still belongs to the old cycle.
-        departed = previous.get('status') == 'left' or previous.get('state') == 'left'
+        # Stale, cancelled or restarted queries overwrite status and state; the cycle a
+        # trusted leave ended stays ended until a new cycle starts.
+        departed = previous.get('status') == 'left' or previous.get('state') == 'left' or 'left_cycle' in previous and previous['left_cycle'] == previous.get('cycle')
         # R17: verification alone preserves the cycle. Only an observed departure/
         # join, a rejected transition the owner cannot see past, or platform
         # evidence of a different join establishes a new one.
