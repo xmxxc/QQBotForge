@@ -806,7 +806,7 @@ if isinstance(data, dict) and data.get('send_check') == 'blocked':
 - 失败关闭：返回假值、抛出异常、不可调用或返回可等待对象（异步函数）都会拦截。日志只记录异常类型，不记录异常内容。
 - 拦截结果：`reply()` 返回、`send_to_*()` / `post_json()` 的 `data` 为 `{'code': -1, 'message': ..., 'send_check': 'blocked', 'attempted': bool}`。`code` 为 `-1`（与网络异常相同，结果未知），不是平台明确拒绝，不应据此改发其他内容。拦截时不触发 `send_failed`、`after_send`、`api_error` 模板，也不写入错误日志。
 - 重试：token 失效重试和网络重试前都会再次检查；此时拦截返回 `attempted=True`，表示此前的请求已发出、结果未知。请求进入 HTTP 客户端后无法撤回。
-- 未传 `send_check` 时行为不变。媒体、Ark、卡片和流式消息暂不支持该参数，传入会抛出 `TypeError`。覆写了 `post_json(endpoint, payload)` 的旧子类只在传入检查时抛出 `TypeError`，不会发送。
+- 未传 `send_check` 时行为不变。图片、媒体、Ark、卡片和流式消息暂不支持该参数，传入会抛出 `TypeError`。覆写了 `post_json(endpoint, payload)` 的旧子类只在传入检查时抛出 `TypeError`，不会发送。
 
 ### 5.8 订阅消息
 
