@@ -29,7 +29,7 @@ _SEND_CHECK_RICH_ERROR = 'send_check 不支持图片、媒体、Ark、卡片和�
 
 
 def _has_rich_payload(payload):
-    """Return whether *payload* is a media/Ark/card message payload."""
+    """Return whether *payload* contains an unsupported rich message payload."""
     if not isinstance(payload, dict):
         return False
     return (
