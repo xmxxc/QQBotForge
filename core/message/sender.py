@@ -18,8 +18,10 @@ from core.message._http import (
     MSG_TYPE_MEDIA,
     MSG_TYPE_TEXT,
     _HttpMixin,
+    _is_send_check_blocked,
     _is_violation,
     _msg_seq,
+    _reject_rich_send_check,
     log,
 )
 from core.message._material import _MaterialMixin
@@ -147,9 +149,16 @@ class MessageSender(_HttpMixin, _MediaSendMixin, _MaterialMixin, _SenderLogMixin
         template_vars=None,
         prompt_buttons=None,
         auto_delete_time=None,
+        send_check=None,
         **kwargs,
     ):
-        """回复事件消息"""
+        """回复事件消息; send_check 见 _HttpMixin._request"""
+        if send_check is not None and (
+            media is not None
+            or msg_type in (MSG_TYPE_MEDIA, MSG_TYPE_ARK, MSG_TYPE_CARD)
+            or any(key in kwargs for key in ('media', 'ark', 'card'))
+        ):
+            raise TypeError('send_check 不支持媒体、Ark、卡片和流式消息')
         if template_name:
             use_md = cfg.get_bot_setting(self._appid, 'message.use_markdown', True)
             vars_ = {'user_id': event.user_id or '', 'group_id': event.group_id or ''}
@@ -176,7 +185,7 @@ class MessageSender(_HttpMixin, _MediaSendMixin, _MaterialMixin, _SenderLogMixin
             prompt_buttons=prompt_buttons,
             **kwargs,
         )
-        return await self._reply_send(endpoint, event, payload, content, auto_delete_time)
+        return await self._reply_send(endpoint, event, payload, content, auto_delete_time, send_check=send_check)
 
     async def reply_stream(
         self,
@@ -345,9 +354,9 @@ class MessageSender(_HttpMixin, _MediaSendMixin, _MaterialMixin, _SenderLogMixin
             self._log_push(endpoint, last_payload, full_text, last_data)
         return last_data
 
-    async def _reply_send(self, endpoint, event, payload, content, auto_delete_time):
+    async def _reply_send(self, endpoint, event, payload, content, auto_delete_time, *, send_check=None):
         """回复发送公共尾部: 发送 + 成功后自动撤回 (reply/reply_ark/reply_card 共用)"""
-        success, data = await self._send_with_error_handling(endpoint, payload, event, content)
+        success, data = await self._send_with_error_handling(endpoint, payload, event, content, send_check=send_check)
         if success:
             self._maybe_auto_recall(event, data, auto_delete_time)
         return data
@@ -442,6 +451,7 @@ class MessageSender(_HttpMixin, _MediaSendMixin, _MaterialMixin, _SenderLogMixin
         media=None,
         msg_type=None,
         skip_suffix=False,
+        send_check=None,
         **kwargs,
     ):
         return await self._send_push(
@@ -453,6 +463,7 @@ class MessageSender(_HttpMixin, _MediaSendMixin, _MaterialMixin, _SenderLogMixin
             msg_id=msg_id,
             event_id=event_id,
             skip_suffix=skip_suffix,
+            send_check=send_check,
             **kwargs,
         )
 
@@ -467,6 +478,7 @@ class MessageSender(_HttpMixin, _MediaSendMixin, _MaterialMixin, _SenderLogMixin
         media=None,
         msg_type=None,
         skip_suffix=False,
+        send_check=None,
         **kwargs,
     ):
         return await self._send_push(
@@ -478,10 +490,17 @@ class MessageSender(_HttpMixin, _MediaSendMixin, _MaterialMixin, _SenderLogMixin
             msg_id=msg_id,
             event_id=event_id,
             skip_suffix=skip_suffix,
+            send_check=send_check,
             **kwargs,
         )
 
-    async def _send_push(self, endpoint, content, buttons, media, msg_type, **kwargs):
+    async def _send_push(self, endpoint, content, buttons, media, msg_type, *, send_check=None, **kwargs):
+        if send_check is not None and (
+            media is not None
+            or msg_type in (MSG_TYPE_MEDIA, MSG_TYPE_ARK, MSG_TYPE_CARD)
+            or any(key in kwargs for key in ('media', 'ark', 'card'))
+        ):
+            raise TypeError('send_check 不支持媒体、Ark、卡片和流式消息')
         skip_suffix = kwargs.pop('skip_suffix', False)
         payload = self._build_core_payload(
             content,
@@ -491,10 +510,10 @@ class MessageSender(_HttpMixin, _MediaSendMixin, _MaterialMixin, _SenderLogMixin
             skip_suffix=skip_suffix,
             **kwargs,
         )
-        ok, data = await self.post_json(endpoint, payload)
+        ok, data = await self._post_message(endpoint, payload, send_check)
         if ok:
             self._log_push(endpoint, payload, content, data)
-        else:
+        elif not _is_send_check_blocked(data):
             # 违规拦截: 先给插件机会重发其他内容, 补救成功则不写报错日志
             remedied = await self._handle_send_failure(endpoint, data)
             if not (_is_violation(data) and remedied):
@@ -509,7 +528,7 @@ class MessageSender(_HttpMixin, _MediaSendMixin, _MaterialMixin, _SenderLogMixin
                 )
         return ok, data, payload
 
-    async def send_to_channel(self, channel_id, content=None, *, msg_id=None, buttons=None, **kwargs):
+    async def send_to_channel(self, channel_id, content=None, *, msg_id=None, buttons=None, send_check=None, **kwargs):
         endpoint = f'/channels/{channel_id}/messages'
         payload = {'content': content or ''}
         if msg_id:
@@ -517,7 +536,8 @@ class MessageSender(_HttpMixin, _MediaSendMixin, _MaterialMixin, _SenderLogMixin
         if buttons:
             payload['keyboard'] = build_keyboard(buttons, self._appid)
         payload.update(kwargs)
-        return await self.post_json(endpoint, payload)
+        _reject_rich_send_check(payload, send_check)
+        return await self._post_message(endpoint, payload, send_check)
 
     async def send_image(self, target_type, target_id, image_data, content='', *, msg_id=None):
         """主动推送图片 (target_type: 'group' 或 'user')"""
