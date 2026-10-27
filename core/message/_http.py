@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import random
+from urllib.parse import urlsplit
 
 from core.base.logger import FRAMEWORK, get_logger
 from core.message.response import loads_raw_response
@@ -23,8 +24,8 @@ MSG_TYPE_CARD = 8
 # send_check contract.  Keep this check at the common HTTP boundary so all
 # generic MessageSender entry points fail closed before a business request.
 _RICH_MSG_TYPES = frozenset({MSG_TYPE_MEDIA, MSG_TYPE_ARK, MSG_TYPE_CARD})
-_RICH_PAYLOAD_KEYS = frozenset({'media', 'ark', 'card'})
-_SEND_CHECK_RICH_ERROR = 'send_check 不支持媒体、Ark、卡片和流式消息'
+_RICH_PAYLOAD_KEYS = frozenset({'image', 'media', 'ark', 'card'})
+_SEND_CHECK_RICH_ERROR = 'send_check 不支持图片、媒体、Ark、卡片和流式消息'
 
 
 def _has_rich_payload(payload):
@@ -41,7 +42,7 @@ def _reject_rich_send_check(payload, send_check, endpoint=''):
     """Reject send_check for rich message payloads before any HTTP request."""
     if send_check is not None and (
         _has_rich_payload(payload)
-        or str(endpoint).rstrip('/').endswith('/stream_messages')
+        or urlsplit(str(endpoint)).path.rstrip('/').endswith('/stream_messages')
     ):
         raise TypeError(_SEND_CHECK_RICH_ERROR)
 
