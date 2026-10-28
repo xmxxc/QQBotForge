@@ -10,6 +10,7 @@ import time
 from core.base.config import cfg
 from core.base.logger import FRAMEWORK, report_error_raw
 from core.base.metrics import counter
+from core.display import clean_display_name, queue_member_name
 from core.message import bot_openid
 from core.message._http import (
     MSG_TYPE_ARK,
@@ -862,6 +863,9 @@ class MessageSender(_HttpMixin, _MediaSendMixin, _MaterialMixin, _SenderLogMixin
                     member_openid = str(member.get('member_openid') or '').strip()
                     if not member_openid:
                         continue
+                    username = clean_display_name(member.get('username', ''))
+                    if username:
+                        queue_member_name(self._log_service, member_openid, username)
                     entry = user_map.setdefault(
                         member_openid,
                         {'userid': member_openid, 'last_active': ''},
@@ -935,6 +939,9 @@ class MessageSender(_HttpMixin, _MediaSendMixin, _MaterialMixin, _SenderLogMixin
             member_openid = str(member.get('member_openid') or '').strip()
             if not member_openid:
                 continue
+            username = clean_display_name(member.get('username', ''))
+            if username:
+                queue_member_name(self._log_service, member_openid, username)
             entry = user_map.setdefault(
                 member_openid,
                 {'userid': member_openid, 'value': 1, 'last_active': ''},
@@ -1132,7 +1139,7 @@ class MessageSender(_HttpMixin, _MediaSendMixin, _MaterialMixin, _SenderLogMixin
             group_id, 'info', handle_error=not return_error)
         if not success:
             return (None, data) if return_error else None
-        group_name = str(data.get('group_name') or '')
+        group_name = clean_display_name(data.get('group_name', ''))
         try:
             member_num = max(0, int(data.get('group_member_num') or 0))
         except (TypeError, ValueError):

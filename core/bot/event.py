@@ -12,6 +12,7 @@ from itertools import islice
 from core.base.config import cfg
 from core.base.logger import FRAMEWORK, get_logger, report_error
 from core.base.tasks import spawn
+from core.display import clean_display_name, queue_member_name
 from core.message.event import (
     FRIEND_ADD,
     FRIEND_DEL,
@@ -80,6 +81,7 @@ class _TrackItem:
     is_bot: bool
     is_direct: bool
     reply_event: object | None
+    mentions: tuple[tuple[str, str], ...] = ()
     queued: bool = False
     version: int = 0
 
@@ -91,6 +93,10 @@ class _TrackItem:
         self.is_bot = self.is_bot or newer.is_bot
         self.is_direct = self.is_direct or newer.is_direct
         self.reply_event = newer.reply_event or self.reply_event
+        if newer.mentions:
+            mentions = dict(self.mentions)
+            mentions.update(newer.mentions)
+            self.mentions = tuple(mentions.items())
         self.version += 1
 
     @property
@@ -150,6 +156,28 @@ class EventHandlerMixin:
 
     # ==================== 用户追踪后台队列 ====================
 
+    @staticmethod
+    def _mention_names(event):
+        """提取非机器人 @成员的最新名字，供后台写入 users 表。"""
+        result = []
+        for mention in getattr(event, 'mentions', ()) or ():
+            if not isinstance(mention, dict):
+                continue
+            if mention.get('bot') or mention.get('is_you'):
+                continue
+            user_id = next(
+                (
+                    mention.get(key)
+                    for key in ('member_openid', 'id', 'user_id', 'openid')
+                    if mention.get(key)
+                ),
+                '',
+            )
+            name = clean_display_name(mention.get('username', ''))
+            if user_id and name:
+                result.append((str(user_id), name))
+        return tuple(result)
+
     def _ensure_track_workers(self):
         """惰性创建用户追踪队列与 worker (需在事件循环内调用)"""
         if self._track_queue is not None:
@@ -162,10 +190,12 @@ class EventHandlerMixin:
         self._ensure_track_workers()
         uid = str(event.user_id or '')
         gid = event.group_id or ''
+        username = clean_display_name(getattr(event, 'username', '') or '')
+        mentions = self._mention_names(event)
         if event.is_group and gid:
             # 追踪对同(用户/群/角色/当天)幂等, 同键短时重复无新信息, 跳过以削减洪峰任务量
             key = (appid, event.user_id, gid, event.member_role or '',
-                   bool(getattr(event, 'username', '')), bool(getattr(event, 'is_bot', False)))
+                   username, bool(getattr(event, 'is_bot', False)), mentions)
             now = time.time()
             if now > self._track_recent_purge:
                 self._track_recent_purge = now + _CACHE_PRUNE_INTERVAL
@@ -181,12 +211,13 @@ class EventHandlerMixin:
             appid=str(appid),
             uid=uid,
             gid=gid,
-            username=getattr(event, 'username', '') or '',
+            username=username,
             member_role=event.member_role or '',
             is_bot=bool(getattr(event, 'is_bot', False)),
             is_direct=bool(event.is_direct),
             # 全量群消息不会触发新用户欢迎，不必为回复保留完整事件树。
             reply_event=None if event.event_type == GROUP_MESSAGE_CREATE else event,
+            mentions=mentions,
         )
         job = self._track_jobs.get(item.key)
         if job is not None:
@@ -711,13 +742,14 @@ class EventHandlerMixin:
 
         self._prune_event_caches(now)
 
-        if item.username:
-            bot.log_service.db_queue(
-                'INSERT INTO users (user_id, name) VALUES (?, ?) '
-                'ON CONFLICT(user_id) DO UPDATE SET name=excluded.name '
-                "WHERE users.name = '' OR users.name IS NULL",
-                (uid, item.username),
-            )
+        username = clean_display_name(item.username)
+        if username:
+            queue_member_name(bot.log_service, uid, username)
+        for mention_uid, mention_name in item.mentions:
+            mention_name = clean_display_name(mention_name)
+            if not mention_name:
+                continue
+            queue_member_name(bot.log_service, mention_uid, mention_name)
 
         # 已知用户: 跳过 DB 查询
         if uid in self._known_users:
