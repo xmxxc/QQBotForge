@@ -14,7 +14,7 @@ env:
   # Pinned Docker assets (ci-assets branch of this repository). Bump the SHA
   # to take new assets.
   CI_ASSETS_REPOSITORY: xmxxc/QQBotForge
-  CI_ASSETS_SHA: 5fd275ee4621e6a4bfc90f45b198a0084acfbb4a
+  CI_ASSETS_SHA: f80f33d45d11cbe41a0e5a3d512b6ac41dcc577e
   IMAGE_NAME: qqbotforge
 
 jobs:

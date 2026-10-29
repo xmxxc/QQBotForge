@@ -37,6 +37,7 @@ log = get_logger(FRAMEWORK, '事件处理')
 _USER_CACHE_TTL = 3600
 _DEDUP_TTL = 300
 _FULL_ACCESS_CACHE_TTL = 1800
+_FULL_ACCESS_CACHE_MAX = 10000
 _TRACK_WORKERS = 8  # 用户追踪后台 worker 数
 _TRACK_QUEUE_MAX = 5000  # 用户追踪队列上限, 满则转入合并缓冲 (不丢弃)
 _TRACK_DEDUP_TTL = 60  # 同键群消息追踪去重窗口(秒): 追踪任务对同键幂等, 短时重复直接跳过
@@ -81,7 +82,6 @@ class _TrackItem:
     is_bot: bool
     is_direct: bool
     reply_event: object | None
-    mentions: tuple[tuple[str, str], ...] = ()
     queued: bool = False
     version: int = 0
 
@@ -93,10 +93,6 @@ class _TrackItem:
         self.is_bot = self.is_bot or newer.is_bot
         self.is_direct = self.is_direct or newer.is_direct
         self.reply_event = newer.reply_event or self.reply_event
-        if newer.mentions:
-            mentions = dict(self.mentions)
-            mentions.update(newer.mentions)
-            self.mentions = tuple(mentions.items())
         self.version += 1
 
     @property
@@ -191,11 +187,13 @@ class EventHandlerMixin:
         uid = str(event.user_id or '')
         gid = event.group_id or ''
         username = clean_display_name(getattr(event, 'username', '') or '')
-        mentions = self._mention_names(event)
+        # 名字按观察顺序直接投递非阻塞 DB 队列，不能被追踪去重或 worker 调度覆盖。
+        for member_id, name in (*self._mention_names(event), (uid, username)):
+            queue_member_name(bot.log_service, member_id, name)
         if event.is_group and gid:
             # 追踪对同(用户/群/角色/当天)幂等, 同键短时重复无新信息, 跳过以削减洪峰任务量
             key = (appid, event.user_id, gid, event.member_role or '',
-                   username, bool(getattr(event, 'is_bot', False)), mentions)
+                   bool(username), bool(getattr(event, 'is_bot', False)))
             now = time.time()
             if now > self._track_recent_purge:
                 self._track_recent_purge = now + _CACHE_PRUNE_INTERVAL
@@ -217,7 +215,6 @@ class EventHandlerMixin:
             is_direct=bool(event.is_direct),
             # 全量群消息不会触发新用户欢迎，不必为回复保留完整事件树。
             reply_event=None if event.event_type == GROUP_MESSAGE_CREATE else event,
-            mentions=mentions,
         )
         job = self._track_jobs.get(item.key)
         if job is not None:
@@ -490,6 +487,8 @@ class EventHandlerMixin:
         expire = self._full_access_cache.get(cache_key)
         if expire and now < expire:
             return
+        if cache_key not in self._full_access_cache and len(self._full_access_cache) >= _FULL_ACCESS_CACHE_MAX:
+            self._full_access_cache.pop(next(iter(self._full_access_cache)))
         self._full_access_cache[cache_key] = now + _FULL_ACCESS_CACHE_TTL
         bot.log_service.db_queue(
             'INSERT INTO groups_users (group_id, is_full_access, in_group) VALUES (?, 1, 1) '
@@ -741,15 +740,6 @@ class EventHandlerMixin:
         now = time.time()
 
         self._prune_event_caches(now)
-
-        username = clean_display_name(item.username)
-        if username:
-            queue_member_name(bot.log_service, uid, username)
-        for mention_uid, mention_name in item.mentions:
-            mention_name = clean_display_name(mention_name)
-            if not mention_name:
-                continue
-            queue_member_name(bot.log_service, mention_uid, mention_name)
 
         # 已知用户: 跳过 DB 查询
         if uid in self._known_users:
