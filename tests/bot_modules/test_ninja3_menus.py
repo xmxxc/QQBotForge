@@ -1,6 +1,7 @@
 """#74 real message, interaction and sender boundary with fake identities only."""
 
 import asyncio
+import re
 
 import pytest
 from account_host import account_host as account_host  # noqa: F401
@@ -11,6 +12,17 @@ from test_ninja3 import ninja as ninja  # noqa: F401
 
 def buttons(host):
     return [b for row in host.sender.keyboards[-1] for b in row]
+
+
+def selection(host, index=1):
+    """Build the text selection command from the button's opaque token."""
+    _, token, ordinal = buttons(host)[index - 1]['data'].split(':')
+    return f'忍3选择 {token} {ordinal}'
+
+
+def selection_from_text(content, ordinal=1):
+    token = re.search(r'忍3选择 ([0-9a-f]{32})', content)[1]
+    return f'忍3选择 {token} {ordinal}'
 
 
 async def test_menu_entries_and_shared_actual_clicker(ninja, caplog):
@@ -48,8 +60,7 @@ async def test_directory_six_items_pages_and_text(ninja):
     assert [b['text'] for b in buttons(h)] == ['账号6', '账号7', '上一页']
     await h.click(buttons(h)[-1]['data'], user='MEMBERA', group='group-a')
     assert '1/2' in h.texts()[0]
-    selection = result.split('发送“')[1].split('”')[0].replace('<编号>', '1')
-    assert SECRET in str(await h.say(selection, user='MEMBERA'))
+    assert SECRET in str(await h.say(selection(h), user='MEMBERA'))
 
 
 async def test_acl_disabled_names_filtered(ninja):
@@ -107,9 +118,9 @@ async def test_session_domain_expiry_and_old_instance(ninja, invalid):
     await grant(h, group='group-b')
     now = [1000]
     h.ninja().clock = lambda: now[0]
-    result = (await h.say('账号列表', user='MEMBERA'))[0]
+    await h.say('账号列表', user='MEMBERA')
     payload = buttons(h)[0]['data']
-    selection = result.split('发送“')[1].split('”')[0].replace('<编号>', '1')
+    command = selection(h)
     if invalid == 'expiry':
         now[0] += 300
     elif invalid == 'reload':
@@ -117,21 +128,21 @@ async def test_session_domain_expiry_and_old_instance(ninja, invalid):
     kwargs = {'user': 'MEMBERA', 'group': 'group-b' if invalid == 'group' else 'group-a', 'bot': 'bot-b' if invalid == 'bot' else 'bot-a'}
     await h.click(payload, **kwargs)
     assert h.texts() == ['菜单已失效，请重新发送：账号列表']
-    assert await h.say(selection, **kwargs) == ['菜单已失效，请重新发送：账号列表']
+    assert await h.say(command, **kwargs) == ['菜单已失效，请重新发送：账号列表']
 
 
 async def test_shared_text_uses_actual_member_and_reads_current_credentials(ninja):
     h = ninja
     a = await h.setup()
     await grant(h)
-    result = (await h.say('账号列表', user='MEMBERA'))[0]
-    command = result.split('发送“')[1].split('”')[0].replace('<编号>', '1')
+    await h.say('账号列表', user='MEMBERA')
+    command = selection(h)
     assert SECRET not in str(await h.say(command, user='MEMBERB'))
     await grant(h, 'MEMBERB')
     await h.access.manage_access('bot-a', 'ninja3', 'revoke', function='query', group='group-a', member='MEMBERA')
     await h.ninja_api('PATCH', 'accounts/' + a['id'], {'password': 'fake-current', 'name': '新名称'})
     reply = await h.say(command, user='MEMBERB')
-    assert reply == ['名称：新名称\n账号：fake-login\n密码：fake-current']
+    assert reply == ['名称：新名称', 'fake-login', 'fake-current']
     assert SECRET not in str(reply)
 
 
@@ -239,8 +250,7 @@ async def test_menu_send_results_only_definite_rejection_falls_back(ninja, resul
     assert all(SECRET not in str(c) and 'fake-login' not in str(c) for c in calls)
     if attempts == 2:
         assert calls[1][0].startswith(calls[0][0]) and '按钮暂不可用' in calls[1][0]
-        selection = calls[1][0].split('发送“')[1].split('”')[0].replace('<编号>', '1')
-        assert SECRET in str(await h.say(selection, user='MEMBERA'))
+        assert SECRET in str(await h.say(selection_from_text(calls[1][0]), user='MEMBERA'))
 
 
 @pytest.mark.parametrize('change', ['account', 'acl', 'expiry'])
@@ -330,10 +340,13 @@ async def test_real_message_sender_payload_and_return_shape(ninja, monkeypatch, 
     if expected == 2:
         assert sent[1][1]['msg_type'] == 0 and 'keyboard' not in sent[1][1]
     else:
-        # Also exercise selection and a credential reply through real Sender.
+        # Also exercise selection and the split credential replies through real Sender.
         sent.clear()
         await h.click(action['data'], user='MEMBERA', group='group-a')
-        assert len(sent) == 1 and SECRET in str(sent[0][1])
+        if response.get('id') == 'fake-sent':
+            assert len(sent) == 3 and SECRET in str(sent[-1][1])
+        else:
+            assert len(sent) == 1 and SECRET not in str(sent[0][1]) and '名称：账号A' in str(sent[0][1])
 
 
 async def test_text_only_pagination_and_resource_limited_names(ninja):
@@ -387,7 +400,7 @@ async def test_transport_exception_does_not_repeat(ninja):
     assert len(calls) == 1
     calls.clear()
     assert await h.say('账号 账号A', user='MEMBERA') == []
-    assert len(calls) == 1 and SECRET in calls[0]
+    assert calls == ['名称：账号A']
 
 
 @pytest.mark.parametrize('invalid', ['c2c', 'wrong_app', 'wrong_chat', 'channel', 'blocked'])

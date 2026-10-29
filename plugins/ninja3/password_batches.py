@@ -152,6 +152,19 @@ class PasswordBatches:
     async def get(self, bot: str, key: str) -> Record:
         return await self.view(bot, await self.store.atomic(lambda conn: self._read(conn, bot, key)))
 
+    async def batch_for_task(self, bot: str, task: str) -> str | None:
+        """Find the batch that dispatched this task, without loading sealed inputs."""
+        def read(conn: sqlite3.Connection) -> str | None:
+            row = conn.execute(
+                "SELECT b.id FROM ninja3_password_batches b, json_each(b.payload, '$.items') item "
+                "WHERE b.bot=? AND json_extract(item.value, '$.task')=? "
+                "AND json_extract(item.value, '$.status') IN ('linked', 'dispatched') LIMIT 1",
+                (bot, task),
+            ).fetchone()
+            return row[0] if row else None
+
+        return await self.store.atomic(read)
+
     # ---------- selection and confirmation ----------
 
     async def select(self, bot: str, actor: str, accounts: builtins.list[str] | None, *, new_password: str | None = None) -> Record:

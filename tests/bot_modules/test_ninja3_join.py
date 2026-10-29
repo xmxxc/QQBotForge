@@ -19,7 +19,7 @@ from test_access_control import request
 from test_ninja3 import SECRET
 from test_ninja3 import ninja as ninja  # noqa: F401
 
-CREDENTIALS = [f'名称：账号A\n账号：fake-login\n密码：{SECRET}']
+CREDENTIALS = ['名称：账号A', 'fake-login', SECRET]
 REFUSED = ['你暂无查询权限，已记录给主人']
 UNSURE = ['暂时无法确认查询资格，已记录给主人']
 RETRY = ['暂时无法确认查询资格，请稍后重试']
@@ -34,7 +34,7 @@ def assert_listed(reply, names=('账号A',)):
     page = re.fullmatch(r'本群开放账号（(\d+)/(\d+)）：', lines[0])
     assert page and (int(page[1]), int(page[2])) == (1, (len(names) + 5) // 6)
     assert lines[1 : 1 + len(names)] == [f'{index}. {name}' for index, name in enumerate(names, 1)]
-    assert re.fullmatch(r'五分钟内发送“忍3选择 [0-9a-f]{32} <编号>”', lines[1 + len(names)])
+    assert len(lines) == 1 + len(names)
 
 
 class Frames:
@@ -171,7 +171,7 @@ async def test_trusted_join_grants_this_cycle_leave_revokes_and_rejoin_is_a_new_
         'POST', 'accounts', {'name': '账号B', 'login': 'fake-login', 'password': 'fake-b', 'enabled': True, 'open_groups': ['group-a']}
     )
     assert status == 201
-    assert await host.say('账号 账号B', user='MEMBERJ') == ['名称：账号B\n账号：fake-login\n密码：fake-b']
+    assert await host.say('账号 账号B', user='MEMBERJ') == ['名称：账号B', 'fake-login', 'fake-b']
     decision = await host.access.evaluate('bot-a', 'ninja3', 'query', 'group-a', 'MEMBERJ', action='invoke')
     assert decision['allowed'] and decision['fact_kind'] == 'native_join' and host.access.decision_current('bot-a', decision)
     # Another member leaving changes only group facts (no authorization write): in-flight decisions are stale.

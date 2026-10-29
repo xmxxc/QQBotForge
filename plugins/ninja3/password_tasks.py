@@ -237,6 +237,20 @@ class PasswordTasks:
         paused = self.paused_accounts(bot)
         return paused is None or account in paused
 
+    def active_task_id(self, bot: str, account: str) -> str | None:
+        """Return only the active task ID for an account, if readable."""
+        if self.closed:
+            return None
+        try:
+            with closing(self._read_only()) as conn:
+                row = conn.execute(
+                    'SELECT id FROM ninja3_password_tasks WHERE bot=? AND account=? AND active=1',
+                    (bot, account),
+                ).fetchone()
+                return row[0] if row else None
+        except (sqlite3.Error, OSError, ValueError):
+            return None
+
     def query_current(self, bot: str, accounts: list[Record]) -> bool:
         """Final gate checks pause and exact persisted account snapshot without await."""
         if self.closed:

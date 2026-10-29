@@ -113,7 +113,7 @@ class EmergencyMode:
             conn.execute('CREATE TABLE IF NOT EXISTS ninja3_emergency (bot TEXT NOT NULL,id TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(bot,id))')
             for bot, raw in conn.execute('SELECT bot,payload FROM ninja3_emergency').fetchall():
                 state = json.loads(raw)
-                if state.get('state') in {'active', 'starting'} and not self._runner_live(state):
+                if state.get('state') in {'active', 'starting'} and state.get('phase') in {'starting', 'running'} and not self._runner_live(state):
                     # The prior process may have been killed while a child task was
                     # running.  Keep the fail-closed mode and its durable task IDs,
                     # but require an explicit owner command to resume pending items.
