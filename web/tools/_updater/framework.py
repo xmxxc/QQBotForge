@@ -18,10 +18,13 @@ import aiohttp
 
 from core.application import get_app
 from web.tools._updater.shared import GITHUB_API_URL, GITHUB_BRANCH, GITHUB_REPO, GITHUB_URL, log
+from web.tools._updater.supervisor import TERMINAL, TRANSACTION_ENV, lock_owner, read_state, release_lock, state_mutex, transition
 
 _SHA_RE = re.compile(r'[0-9a-f]{8,40}')
 RECOVERY_REMINDER = '重启后请确认群成员并使用「群状态 恢复」重建群状态。'
 _WS_OK_PHASES = {'ready', 'recovering', 'replay_complete'}
+# Effective configuration keys that could change where or how personal is fetched.
+_SOURCE_OVERRIDE = re.compile(r'^(url\..*\.(insteadof|pushinsteadof)|http\.(.*\.)?(proxy|followredirects|sslverify|sslcainfo|sslcapath)|core\.gitproxy)$')
 
 
 def write_state(path, data):
@@ -53,17 +56,13 @@ class FrameworkUpdater:
         log.info('[更新] %s: %s', stage, message)
 
     def _state(self):
-        try:
-            state = json.loads(self.pending_file.read_text(encoding='utf-8'))
-            return state if isinstance(state, dict) else {}
-        except (OSError, ValueError):
-            return {}
+        return read_state(self.base_dir)
 
     def get_progress(self):
         if self.progress['is_updating']:
             return self.progress.copy()
         state = self._state()
-        if state.get('status') in ('awaiting_restart', 'awaiting_ws', 'switching'):
+        if state.get('status') in ('awaiting_restart', 'awaiting_ws', 'switching', 'rolling_back'):
             return dict(
                 self.progress, stage='restarting', message=state.get('message', ''), progress=90, is_updating=True, backup_path=state.get('backup_path')
             )
@@ -135,10 +134,26 @@ class FrameworkUpdater:
         root = self._run_git('rev-parse', '--show-toplevel')
         return 'git' if not root.returncode and Path(root.stdout.strip()).resolve() == self.base_dir else 'non_git'
 
+    def _check_source_config(self):
+        """Reject effective settings that could redirect the fixed source.
+
+        Git cannot skip repository configuration for a command run inside the
+        repository, so the effective configuration Git itself will use is
+        expanded, including include.path and every includeIf form. System and
+        global files are already excluded by _run_git's environment.
+        """
+        listed = self._run_git('config', '--includes', '--list', '--show-scope', '-z')
+        if listed.returncode not in (0, 1):
+            raise RuntimeError('无法读取 Git 有效配置，已拒绝更新')
+        # Fields are "scope\0key\nvalue\0"; the updater's own -c overrides have scope "command".
+        fields = listed.stdout.split('\0')
+        keys = [entry.split('\n', 1)[0].lower() for scope, entry in zip(fields[::2], fields[1::2], strict=False) if scope != 'command']
+        found = sorted({k for k in keys if _SOURCE_OVERRIDE.match(k)})
+        if found:
+            raise RuntimeError('Git 配置（含 include/includeIf）中的 URL 重写或代理/重定向/证书设置可能改变更新来源，已拒绝更新: ' + ', '.join(found))
+
     def _fetch(self):
-        rewrites = self._run_git('config', '--local', '--get-regexp', r'^(url\..*\.(insteadof|pushinsteadof)|http\..*\.(proxy|followredirects))$')
-        if rewrites.returncode not in (0, 1) or rewrites.stdout.strip():
-            raise RuntimeError('本地 Git URL 重写或代理/重定向设置可能改变更新来源，已拒绝更新')
+        self._check_source_config()
         self._git(
             'fetch', '--no-tags', '--no-recurse-submodules', GITHUB_URL + '.git', f'+refs/heads/{GITHUB_BRANCH}:refs/remotes/qqbotforge-updates/{GITHUB_BRANCH}'
         )
@@ -286,13 +301,24 @@ class FrameworkUpdater:
                     shutil.rmtree(resolved)
             raise
 
-    def _claim(self):
+    def _stale_lock(self):
+        """A lock whose own transaction already finished, e.g. its releaser was killed."""
+        owner, state = lock_owner(self.base_dir), self._state()
+        return bool(owner) and state.get('transaction') == owner and state.get('status') in TERMINAL
+
+    def lock_active(self):
+        return self.lock_file.exists() and not self._stale_lock()
+
+    def _claim(self, transaction):
         data_root = self.lock_file.parent.resolve()
         if not data_root.is_relative_to(self.base_dir) or data_root == self.base_dir:
             raise OSError('更新数据必须位于部署目录内部')
         self.lock_file.parent.mkdir(parents=True, exist_ok=True)
-        with self.lock_file.open('x', encoding='utf-8') as lock:
-            lock.write('manual update\n')
+        with state_mutex(self.base_dir):
+            if self._stale_lock():
+                self.lock_file.unlink()
+            with self.lock_file.open('x', encoding='utf-8') as lock:
+                lock.write(transaction)
 
     async def update_to_version(self, version, skip_backup=False, auto_restart=True):
         del skip_backup, auto_restart
@@ -300,11 +326,12 @@ class FrameworkUpdater:
             return {'success': False, 'message': '当前部署不是 Git 工作区，请拉取新镜像或重新 Git 部署'}
         if not isinstance(version, str) or not _SHA_RE.fullmatch(version):
             return {'success': False, 'message': '目标版本必须是 8 至 40 位 Git SHA'}
+        transaction = uuid4().hex
         try:
-            self._claim()
+            self._claim(transaction)
         except FileExistsError:
             return {'success': False, 'message': '已有更新或启动验证正在进行，请先查看更新结果'}
-        except OSError:
+        except (OSError, TimeoutError):
             return {'success': False, 'message': '无法创建更新锁，请检查运行目录写入权限'}
         manager = None
         was_running = False
@@ -337,12 +364,13 @@ class FrameworkUpdater:
                 old_sha=old,
                 target_sha=target,
                 backup_path=backup,
-                transaction=uuid4().hex,
+                transaction=transaction,
                 created_at=datetime.now(UTC).isoformat(),
                 message='已备份数据库，正在切换版本',
                 recovery_reminder=RECOVERY_REMINDER,
             )
-            write_state(self.pending_file, state)
+            with state_mutex(self.base_dir):
+                write_state(self.pending_file, state)
             manager = app.plugin_manager
             was_running = bool(manager and manager._watcher_running)
             if manager:
@@ -350,8 +378,9 @@ class FrameworkUpdater:
             self._report('updating', '正在切换 Git 提交', 70)
             self._git('checkout', '--no-overwrite-ignore', '--detach', target)
             switched = True
-            state.update(status='awaiting_restart', message='等待重启和 WS 连接确认')
-            write_state(self.pending_file, state)
+            state = transition(self.base_dir, transaction, ('switching',), status='awaiting_restart', message='等待重启和 WS 连接确认')
+            if not state:
+                raise RuntimeError('更新事务已被其他操作取代')
             self._trigger_restart(app, guard, state)
             self._report('completed', '已切换并安排重启；' + RECOVERY_REMINDER, 100)
             return dict(
@@ -366,25 +395,26 @@ class FrameworkUpdater:
             )
         except Exception as exc:
             message = str(exc)
+            backup_path = (state or {}).get('backup_path')
+            active = ('switching', 'awaiting_restart')
             if switched:
                 try:
                     self._git('checkout', '--no-overwrite-ignore', '--detach', old)
                 except RuntimeError:
-                    state.update(status='rollback_failed', message='启动监护器失败且无法回退；请手动检查 Git 和数据库备份')
-                    write_state(self.pending_file, state)
-                    self._report('failed', state['message'])
-                    return dict(success=False, message=state['message'], backup_path=state.get('backup_path'))
+                    failure = '启动监护器失败且无法回退；请手动检查 Git 和数据库备份'
+                    transition(self.base_dir, transaction, active, status='rollback_failed', message=failure)
+                    self._report('failed', failure)
+                    return dict(success=False, message=failure, backup_path=backup_path)
             if manager and was_running:
                 manager.start_watcher()
             if state:
-                state.update(status='failed', message=message)
-                write_state(self.pending_file, state)
-            self.lock_file.unlink(missing_ok=True)
+                transition(self.base_dir, transaction, active, status='failed', message=message)
+            release_lock(self.base_dir, transaction)
             self._report('failed', message)
-            return dict(success=False, message=message, backup_path=state.get('backup_path'))
+            return dict(success=False, message=message, backup_path=backup_path)
 
     async def update_to_latest(self, skip_backup=False, auto_restart=True):
-        if self.lock_file.exists():
+        if self.lock_active():
             return {'success': False, 'message': '已有更新或启动验证正在进行'}
         result = await self.check_for_updates()
         if not result.get('can_update'):
@@ -437,18 +467,41 @@ class FrameworkUpdater:
         if not self._recovery_task or self._recovery_task.done():
             self._recovery_task = asyncio.create_task(self.verify_startup(app))
 
+    def _own_transaction(self, state):
+        """The transaction this process was started to verify.
+
+        The monitor passes it in the environment. A process started by hand
+        after its monitor died may adopt the waiting transaction instead,
+        since nobody else can act on it any more.
+        """
+        transaction = os.environ.get(TRANSACTION_ENV)
+        if transaction:
+            return transaction
+        import psutil
+
+        try:
+            monitor = psutil.Process(int(state['supervisor_pid']))
+            if abs(monitor.create_time() - float(state['supervisor_created'])) < 0.01 and monitor.is_running():
+                return None
+        except (KeyError, TypeError, ValueError, psutil.Error):
+            pass
+        return state.get('transaction')
+
     async def verify_startup(self, app):
-        """Only real ready/recovering WS facts may acknowledge the new process."""
+        """Only real ready/recovering WS facts may acknowledge this process's own transaction."""
         state = self._state()
-        if state.get('status') != 'awaiting_ws' or self._current_sha() != state.get('target_sha'):
+        transaction = self._own_transaction(state) if state.get('status') == 'awaiting_ws' else None
+        if not transaction or state.get('transaction') != transaction or self._current_sha() != state.get('target_sha'):
             return False
-        while self._state().get('status') == 'awaiting_ws':
+        while (current := self._state()).get('transaction') == transaction and current.get('status') == 'awaiting_ws':
             statuses = app.hook_manager.connection_status.statuses
             if any(s.transport == 'websocket' and s.phase in _WS_OK_PHASES for s in statuses):
-                state.update(status='confirmed', message='新版本 WS 已连接，更新已确认；' + RECOVERY_REMINDER)
-                write_state(self.pending_file, state)
-                # A supervisor killed meanwhile could never release the lock.
-                self.lock_file.unlink(missing_ok=True)
+                confirmed = transition(
+                    self.base_dir, transaction, ('awaiting_ws',), status='confirmed', message='新版本 WS 已连接，更新已确认；' + RECOVERY_REMINDER
+                )
+                if not confirmed:
+                    return False
+                release_lock(self.base_dir, transaction)
                 return True
             await asyncio.sleep(0.2)
         return False

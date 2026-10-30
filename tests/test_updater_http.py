@@ -25,3 +25,66 @@ async def test_removed_upload_never_reads_or_writes_payload(tmp_path):
     result = await handlers.handle_upload_update(SimpleNamespace())
     assert json.loads(result.body)['success'] is False
     assert not (tmp_path / 'data/temp_update').exists()
+
+
+@pytest.fixture
+def market(tmp_path):
+    """Plugin market mirror preference as stored before the updater change."""
+    from web.tools._market import shared
+
+    (tmp_path / 'data').mkdir()
+    settings = tmp_path / 'data/update_settings.json'
+    settings.write_text(json.dumps({'custom_mirror': 'https://old-mirror.example/'}))
+    handlers.set_context(str(tmp_path))
+    shared.set_context(str(tmp_path))
+    return settings
+
+
+@pytest.mark.asyncio
+async def test_market_mirror_preference_is_listed_and_can_be_cleared(market):
+    from web.tools._market import shared
+
+    listed = json.loads((await handlers.handle_get_mirrors(None)).body)['data']
+    assert listed['custom_mirror'] == 'https://old-mirror.example/'
+    assert listed['mirrors']
+
+    async def body():
+        return {'mirror': ''}
+
+    reset = json.loads((await handlers.handle_set_custom_mirror(SimpleNamespace(json=body))).body)
+    assert reset['success'] is True
+    assert json.loads(market.read_text())['custom_mirror'] == ''
+    assert json.loads((await handlers.handle_get_mirrors(None)).body)['data']['custom_mirror'] == ''
+    assert not shared._ranked_mirror_urls('https://github.com/example/plugin/archive/main.zip')[0].startswith('https://old-mirror.example/')
+
+
+@pytest.mark.asyncio
+async def test_market_mirror_speed_test_streams_sse(market, monkeypatch):
+    async def probe(mirror, timeout=3):
+        return {'mirror': mirror, 'latency': 0.1, 'success': bool(mirror)}
+
+    monkeypatch.setattr(handlers, '_test_one_mirror', probe)
+    monkeypatch.setattr(handlers, 'GITHUB_FILE_MIRRORS', ['https://a.example/', 'https://b.example/'])
+    app = web.Application()
+    app.router.add_get('/test-mirrors', handlers.handle_test_mirrors)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get('/test-mirrors')
+        assert response.headers['Content-Type'].startswith('text/event-stream')
+        events = [json.loads(line[6:]) for line in (await response.text()).splitlines() if line.startswith('data: ')]
+    assert events[-1] == {'done': True}
+    assert {e['mirror'] for e in events[:-1]} == {'https://a.example/', 'https://b.example/', ''}
+    cache = json.loads((market.parent / 'mirror_cache.json').read_text())['mirrors'] if (market.parent / 'mirror_cache.json').exists() else None
+    assert cache is None or [m['mirror'] for m in cache] == ['https://a.example/', 'https://b.example/']
+
+
+@pytest.mark.asyncio
+async def test_framework_fetch_ignores_market_mirror(market, monkeypatch):
+    """The market preference must never reach the updater's Git fetch."""
+    commands = []
+    updater = handlers.get_updater()
+    monkeypatch.setattr(updater, '_check_source_config', lambda: None, raising=False)
+    monkeypatch.setattr(updater, '_git', lambda *args: commands.append(args) or 'f' * 40)
+    updater._fetch()
+    fetch = next(c for c in commands if c[0] == 'fetch')
+    assert 'https://github.com/xmxxc/QQBotForge.git' in fetch
+    assert not any('old-mirror' in part for c in commands for part in c)

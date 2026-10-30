@@ -235,7 +235,7 @@ def test_supervisor_handles_startup_crash_timeout_and_success(deployment, tmp_pa
     data.mkdir()
     pending = data / 'update_pending.json'
     pending.write_text(json.dumps(dict(transaction='test', status='awaiting_restart', old_sha=d.old, target_sha=d.target, backup_path='data/backup/kept')))
-    (data / 'update.lock').touch()
+    (data / 'update.lock').write_text('test')
     script = tmp_path / 'candidate.py'
     script.write_text(
         """
@@ -261,7 +261,8 @@ else:
     assert git(d.work, 'rev-parse', 'HEAD') == (d.target if mode == 'confirm' else d.old)
     assert (data / 'old-started').exists() == (mode != 'confirm')
     assert state['backup_path'] == 'data/backup/kept'
-    assert not (data / 'update.lock').exists()
+    # After a rollback the monitor releases the lock; a confirmation is released by the new process.
+    assert (data / 'update.lock').exists() == (mode == 'confirm')
 
 
 @pytest.mark.asyncio
@@ -274,7 +275,7 @@ async def test_real_connection_status_confirms_update(deployment):
     git(d.work, 'fetch', str(d.remote), 'personal')
     git(d.work, 'checkout', '--detach', d.target)
     (d.work / 'data').mkdir()
-    d.updater.pending_file.write_text(json.dumps(dict(status='awaiting_ws', target_sha=d.target)))
+    d.updater.pending_file.write_text(json.dumps(dict(transaction='t1', status='awaiting_ws', target_sha=d.target)))
     hook = HookManager()
     publisher = hook.connection_status._register('test-bot', 'websocket', bot_generation='new')
     publisher.publish('ready', reason='ready', login_kind='fresh')
@@ -417,7 +418,7 @@ def test_supervisor_rollback_ignores_ambient_git_directory(deployment, tmp_path,
     data.mkdir()
     pending = data / 'update_pending.json'
     pending.write_text(json.dumps(dict(transaction='test', status='awaiting_restart', old_sha=d.old, target_sha=d.target, backup_path='data/backup/kept')))
-    (data / 'update.lock').touch()
+    (data / 'update.lock').write_text('test')
     with monkeypatch.context() as context:
         context.setenv('GIT_DIR', str(outsider / '.git'))
         assert supervise_update(d.work, [sys.executable, '-c', 'pass'], 'test', timeout=0.2) == 0
@@ -445,8 +446,8 @@ async def test_confirmation_releases_lock_without_live_supervisor(deployment):
     git(d.work, 'fetch', str(d.remote), 'personal')
     git(d.work, 'checkout', '--detach', d.target)
     (d.work / 'data').mkdir()
-    d.updater.pending_file.write_text(json.dumps(dict(status='awaiting_ws', target_sha=d.target)))
-    d.updater.lock_file.write_text('manual update\n')
+    d.updater.pending_file.write_text(json.dumps(dict(transaction='t1', status='awaiting_ws', target_sha=d.target)))
+    d.updater.lock_file.write_text('t1')
     hook = HookManager()
     hook.connection_status._register('test-bot', 'websocket', bot_generation='new').publish('ready', reason='ready', login_kind='fresh')
     assert await d.updater.verify_startup(SimpleNamespace(hook_manager=hook)) is True
@@ -460,3 +461,57 @@ def test_startup_recovery_does_not_need_web_panel_context(tmp_path, monkeypatch)
     updater = handlers.get_updater(str(tmp_path))
     assert updater.base_dir == tmp_path.resolve()
     assert handlers.get_updater() is updater
+
+
+@pytest.fixture
+def foreign(tmp_path):
+    """A bare repository with an unrelated personal branch an attacker would redirect to."""
+    remote = tmp_path / 'foreign.git'
+    seed = tmp_path / 'foreign-seed'
+    git(tmp_path, 'init', '--bare', str(remote))
+    git(tmp_path, 'init', '-b', 'personal', str(seed))
+    git(seed, 'config', 'user.email', 'x@example.com')
+    git(seed, 'config', 'user.name', 'X')
+    (seed / 'file').write_text('foreign')
+    git(seed, 'add', '.')
+    git(seed, 'commit', '-m', 'foreign')
+    git(seed, 'push', str(remote), 'personal')
+    return remote
+
+
+@pytest.mark.parametrize('form', ['include.path', 'includeIf.gitdir', 'includeIf.onbranch'])
+def test_included_git_config_cannot_redirect_update_source(deployment, foreign, tmp_path, form):
+    d = deployment
+    included = tmp_path / 'included.config'
+    included.write_text(f'[url "{foreign}"]\n    insteadOf = {GITHUB_URL}.git\n')
+    key = {
+        'include.path': 'include.path',
+        'includeIf.gitdir': f'includeIf.gitdir:{d.work}/.git.path',
+        'includeIf.onbranch': 'includeIf.onbranch:personal.path',
+    }[form]
+    git(d.work, 'config', '--local', key, str(included))
+    result = asyncio.run(d.updater.check_for_updates())
+    assert result['can_update'] is False
+    assert 'insteadof' in result['error']
+    assert not d.requests
+
+
+@pytest.mark.parametrize('scope', ['global', 'xdg', 'system'])
+def test_global_and_system_git_config_are_ignored(deployment, foreign, tmp_path, monkeypatch, scope):
+    d = deployment
+    rewrite = f'[url "{foreign}"]\n    insteadOf = {d.remote}\n'
+    home = tmp_path / 'home'
+    (home / '.config/git').mkdir(parents=True)
+    monkeypatch.setenv('HOME', str(home))
+    monkeypatch.delenv('XDG_CONFIG_HOME', raising=False)
+    if scope == 'global':
+        (home / '.gitconfig').write_text(rewrite)
+    elif scope == 'xdg':
+        (home / '.config/git/config').write_text(rewrite)
+    else:
+        system = tmp_path / 'system.config'
+        system.write_text(rewrite)
+        monkeypatch.setenv('GIT_CONFIG_SYSTEM', str(system))
+    result = asyncio.run(d.updater.check_for_updates())
+    assert result['error'] is None
+    assert result['latest_version'] == d.target

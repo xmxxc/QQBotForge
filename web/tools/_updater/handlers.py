@@ -1,11 +1,14 @@
 """框架更新 — 版本检查/更新日志/在线更新/上传更新"""
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 
 from aiohttp import web
 
+from web.tools._market.mirror import _test_one_mirror
+from web.tools._market.mirrors import GITHUB_FILE_MIRRORS, _load_mirror_cache, _save_mirror_cache, clear_mirror_cache
 from web.tools._updater.framework import FrameworkUpdater
 
 log = logging.getLogger('ElainaBot.web.updater')
@@ -134,7 +137,7 @@ async def handle_start_update(request: web.Request):
     if not isinstance(body, dict) or ('version' in body and not isinstance(body['version'], str)):
         return web.json_response({'success': False, 'message': '更新参数无效'}, status=400)
     updater = get_updater()
-    if (_update_task and not _update_task.done()) or updater.lock_file.exists():
+    if (_update_task and not _update_task.done()) or updater.lock_active():
         return web.json_response({'success': False, 'message': '已有更新或启动验证正在进行'}, status=409)
 
     async def do_update():
@@ -155,18 +158,72 @@ async def handle_start_update(request: web.Request):
 
 
 # ==================== 镜像管理 ====================
+# 仅供插件市场（Market.js）使用；框架更新的 Git fetch 完全不读取这些设置。
 
 
 async def handle_get_mirrors(request: web.Request):
-    return web.json_response({'success': True, 'data': {'mirrors': [], 'fast_mirrors': [], 'custom_mirror': '', 'direct': True}})
+    """获取镜像列表 (含缓存的测速结果)"""
+    try:
+        updater = _get_updater()
+        cached = _load_mirror_cache()
+        return web.json_response(
+            {
+                'success': True,
+                'data': {
+                    'mirrors': list(GITHUB_FILE_MIRRORS),
+                    'fast_mirrors': cached,
+                    'custom_mirror': updater.custom_mirror,
+                },
+            }
+        )
+    except Exception as e:
+        return web.json_response({'success': False, 'message': str(e)}, status=500)
 
 
 async def handle_test_mirrors(request: web.Request):
-    return web.json_response({'success': False, 'message': '更新器只允许直连 GitHub，不提供镜像测速'})
+    """SSE 流式测速所有镜像, 每完成一个立即推送"""
+    clear_mirror_cache()
+    resp = web.StreamResponse()
+    resp.content_type = 'text/event-stream'
+    resp.headers['Cache-Control'] = 'no-cache'
+    resp.headers['X-Accel-Buffering'] = 'no'
+    await resp.prepare(request)
+
+    all_results = []
+    tasks = {asyncio.ensure_future(_test_one_mirror(m, 3)): m for m in GITHUB_FILE_MIRRORS}
+    tasks[asyncio.ensure_future(_test_one_mirror('', 3))] = ''
+
+    pending = set(tasks.keys())
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            result = task.result()
+            all_results.append(result)
+            try:
+                await resp.write(f'data: {json.dumps(result, ensure_ascii=False)}\n\n'.encode())
+            except ConnectionResetError:
+                return resp
+
+    # 保存测速结果到磁盘
+    _save_mirror_cache(sorted([r for r in all_results if r['success']], key=lambda r: r['latency']))
+
+    # 发送结束标记
+    try:
+        await resp.write(b'data: {"done": true}\n\n')
+        await resp.write_eof()
+    except Exception as e:
+        log.debug(f'SSE 结束标记发送失败: {e}')
+    return resp
 
 
 async def handle_set_custom_mirror(request: web.Request):
-    return web.json_response({'success': False, 'message': '更新器只允许直连 GitHub，不支持第三方镜像'})
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    mirror = body.get('mirror', '')
+    _get_updater().set_custom_mirror(mirror)
+    return web.json_response({'success': True, 'message': f'已设置自定义镜像: {mirror or "(自动选择)"}'})
 
 
 # ==================== 上传更新 ====================
