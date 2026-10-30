@@ -34,7 +34,6 @@ WHY = {
     'owner_required': '仅主人可以查询',
     'group_context_required': '须在群内查询',
 }
-ALLOWED = {'public': '本群公开', 'group_member': '本群成员均可查询', 'member_policy': '成员名单允许', 'role_policy': '群角色允许'}
 
 
 class Confirmations:
@@ -52,7 +51,7 @@ class Confirmations:
         self.pending = {}
 
     async def offer(self, event, prompt, *, label, state, run):
-        """``state``: async, returns a comparable snapshot; ``run``: async, receives the click event."""
+        """``state`` returns a comparable snapshot; ``run`` receives the click and snapshot."""
         plugin = self.plugin
         now = plugin.clock()
         self.pending = {key: value for key, value in self.pending.items() if value['expires_at'] > now}
@@ -107,7 +106,10 @@ class Confirmations:
         try:
             changed = await request['state']() != request['snapshot']
             if not changed:
-                await request['run'](event)
+                await request['run'](event, request['snapshot'])
+        except TargetStateChangedError:
+            await plugin.reply(event, f'目标状态已变化，请重新发送“{label} @成员”')
+            return
         except (ValueError, RuntimeError, sqlite3.Error, OSError) as error:
             log.error(f'[{event.appid}] {label}确认失败: {type(error).__name__}')
             await plugin.reply(event, f'{label}未完成：授权或群状态暂不可用，请检查后台')
@@ -116,13 +118,27 @@ class Confirmations:
             await plugin.reply(event, f'目标状态已变化，请重新发送“{label} @成员”')
 
 
+class TargetStateChangedError(Exception):
+    """The confirmation target changed before its write could start."""
+
+
 def mention_target(event):
     """The single native member mentioned besides the Bot, or None."""
-    targets = {
-        m['id']
-        for m in event.mentions
-        if isinstance(m, dict) and isinstance(m.get('id'), str) and m['id'] and not m.get('is_you') and not m.get('bot') and m.get('scope') != 'all'
-    }
+    targets = set()
+    ambiguous = False
+    for mention in event.mentions:
+        if not isinstance(mention, dict) or not isinstance(mention.get('id'), str) or not mention['id']:
+            continue
+        if mention.get('scope') == 'all' or mention.get('is_you') is True or mention.get('bot') is True:
+            continue
+        # Missing identity flags are not safe to interpret as a member: a
+        # malformed Bot mention must never become an authorization target.
+        if mention.get('is_you') is not False or mention.get('bot') is not False:
+            ambiguous = True
+            continue
+        targets.add(mention['id'])
+    if ambiguous:
+        return None
     return next(iter(targets)) if len(targets) == 1 else None
 
 
@@ -255,20 +271,47 @@ class OwnerCommands:
             return
 
         async def state():
-            snapshot = await acl.access_snapshot(bot, service.CONSUMER)
             proof = await facts.fact(bot, group, member)
-            row = proof['member'] or {}
-            return (
-                sorted(g['id'] for g in snapshot['grants'] if g['group'] == group and g['member'] == member),
-                sorted(d['id'] for d in denials(snapshot, group, member)),
-                proof['usable'],
-                proof['reason'],
-                row.get('status'),
-                row.get('cycle'),
-            )
+            decision = await acl.evaluate(bot, service.CONSUMER, service.FUNCTION, group, member, action='invoke')
+            # Keep target semantics, not the evaluation timestamp. This
+            # catches source edits, natural expiry, applicable global/group
+            # denies, membership changes and ACL revisions.
+            stable = {
+                key: decision.get(key)
+                for key in (
+                    'allowed', 'reason', 'valid_until', 'sources', 'denies',
+                    'membership', 'cycle', 'role', 'fact_kind', 'version',
+                    'generation', 'function_revision', 'shared_revision',
+                )
+            }
+            fact = proof.get('member') or {}
+            stable['proof'] = {
+                'usable': proof.get('usable'),
+                'reason': proof.get('reason'),
+                'status': fact.get('status'),
+                'cycle': fact.get('cycle'),
+                'member_role': fact.get('member_role'),
+            }
+            return stable
 
-        async def run(click):
-            await acl.manage_access(bot, service.CONSUMER, 'deny', function=service.FUNCTION, group=group, member=member)
+        async def run(click, offered_state):
+            if await state() != offered_state:
+                raise TargetStateChangedError
+            try:
+                await acl.manage_access(
+                    bot,
+                    service.CONSUMER,
+                    'deny',
+                    function=service.FUNCTION,
+                    group=group,
+                    member=member,
+                    _expected_version=offered_state['version'],
+                    _expected_valid_until=offered_state['valid_until'],
+                )
+            except ValueError as error:
+                if str(error) == '授权状态已变化':
+                    raise TargetStateChangedError from error
+                raise
             log.info(f'[{bot}] 拉黑 group={group} member={member}')
             await self.plugin.reply(click, f'已拉黑 {t["who"]}：在 {t["where"]} 不能查询忍3账号')
 
@@ -291,17 +334,16 @@ class OwnerCommands:
         opened = await self.plugin.store.get(bot, 'groups', group)
         is_open = bool(opened and opened['enabled'])
         head = f'{t["who"]}在 {t["where"]}'
-        if decision['allowed'] and is_open:
-            if decision['reason'] == 'explicit':
-                basis = '入群自动授权' if all(s.get('basis') == 'native_join' for s in decision['sources'] if s['status'] == 'active') else '主人授权'
-                until = decision['valid_until']
-                basis += '，长期有效' if until is None else '，有效至 ' + time.strftime('%Y-%m-%d %H:%M', time.localtime(until))
-            else:
-                basis = ALLOWED.get(decision['reason'], decision['reason'])
+        if decision['allowed'] and is_open and decision['reason'] == 'explicit':
+            basis = '入群自动授权' if all(s.get('basis') == 'native_join' for s in decision['sources'] if s['status'] == 'active') else '主人授权'
+            until = decision['valid_until']
+            basis += '，长期有效' if until is None else '，有效至 ' + time.strftime('%Y-%m-%d %H:%M', time.localtime(until))
             await self.plugin.reply(event, f'{head} 可以查询忍3账号：{basis}')
             return
         reasons = [] if is_open else ['本群未开放忍3账号查询']
-        if not decision['allowed'] and not (decision['reason'] == 'scope_disabled' and not is_open):
+        if is_open and decision['allowed']:
+            reasons.append(WHY['no_explicit_permission'])
+        elif not decision['allowed'] and not (decision['reason'] == 'scope_disabled' and not is_open):
             reasons.append(WHY.get(decision['reason'], decision['reason']))
         await self.plugin.reply(event, f'{head} 不能查询忍3账号：' + '；'.join(reasons))
 

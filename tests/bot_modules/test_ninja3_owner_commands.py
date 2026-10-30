@@ -1,6 +1,7 @@
 """#143 owner @-mention short commands and the reusable confirmation buttons, through the real app."""
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -11,6 +12,7 @@ from test_ninja3 import SECRET, grant
 from test_ninja3 import ninja as ninja  # noqa: F401
 
 from core.base.config import cfg
+from plugins.ninja3.owner_commands import mention_target
 
 MEMBER = '未知成员（…BERA）'
 GROUP = '未知群（…up-a）'
@@ -272,6 +274,43 @@ async def test_confirmation_rechecks_target_state(ninja, change):
     assert await click(host, ok) == ['已失效']
 
 
+async def test_confirmation_rechecks_expiry_and_global_deny(ninja):
+    host = ninja
+    await host.setup()
+    now = [1000.0]
+    host.access.clock = lambda: now[0]
+    host.ninja().clock = lambda: now[0]
+    await grant(host)
+    await host.access.manage_access('bot-a', 'ninja3', 'expiry', function='query', group='group-a', member='MEMBERA', expires_at=1050)
+    ok, _ = await offer_deny(host)
+    now[0] = 1060
+    assert await click(host, ok) == ['目标状态已变化，请重新发送“拉黑 @成员”']
+
+    ok, _ = await offer_deny(host)
+    await host.access.manage_access('bot-a', 'ninja3', 'deny', function='query', member='MEMBERA')
+    assert await click(host, ok) == ['目标状态已变化，请重新发送“拉黑 @成员”']
+
+
+async def test_confirmation_conditional_write_rechecks_after_acl_lock(ninja, monkeypatch):
+    host = ninja
+    await host.setup()
+    await grant(host)
+    ok, _ = await offer_deny(host)
+    original = host.access.manage_access
+    raced = False
+
+    async def race(*args, **kwargs):
+        nonlocal raced
+        if args[2] == 'deny' and not raced:
+            raced = True
+            await original('bot-a', 'ninja3', 'deny', function='query', member='MEMBERA')
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(host.access, 'manage_access', race)
+    assert await click(host, ok) == ['目标状态已变化，请重新发送“拉黑 @成员”']
+    assert (await acl_state(host))[1] == []
+
+
 async def test_confirmation_lost_on_reload(ninja):
     host = ninja
     await host.setup()
@@ -291,6 +330,27 @@ async def test_rejected_buttons_cancel_the_request(ninja):
         host.sender.reject_buttons = False
     assert host.ninja().confirmations.pending == {}
     assert (await acl_state(host))[1] == []
+
+
+async def test_missing_mention_flags_are_not_a_member_target():
+    assert mention_target(SimpleNamespace(mentions=[{'id': 'BOTA'}])) is None
+    assert mention_target(SimpleNamespace(mentions=[{'id': 'MEMBERA', 'is_you': False, 'bot': False}])) == 'MEMBERA'
+
+
+async def test_why_requires_the_explicit_query_qualification(ninja):
+    host = ninja
+    await host.setup()
+    await host.state.confirm_member('bot-a', 'group-a', 'MEMBERA', evidence='fake verification', member_role='member')
+    await host.access.manage_access('bot-a', 'ninja3', 'policy', function='query', policy={'kind': 'group', 'groups': ['group-a']})
+    reply = await command(host, '为什么')
+    assert '不能查询' in reply[0] and '未授权' in reply[0]
+
+
+async def test_ordinary_non_at_chat_does_not_consume_owner_command(ninja):
+    host = ninja
+    await host.setup()
+    cfg.set_bot_setting('bot-a', 'non_at_message.enabled', True)
+    assert await host.say('撤销 今天的计划', user='MEMBERA', at_bot=False, event_type='GROUP_MESSAGE_CREATE') == []
 
 
 async def test_menu_buttons_still_work_alongside_confirmations(ninja):

@@ -359,6 +359,8 @@ class Authorization(AccessControl):
     async def manage_access(self, bot, consumer, operation, *, function, group='', member='', **data):
         if operation in {'bulk_grant', 'bulk_revoke', 'bulk_expiry'}:
             return await self._bulk_access(bot, consumer, operation[5:], function, group, member, data)
+        expected_version = data.pop('_expected_version', None)
+        expected_valid_until = data.pop('_expected_valid_until', None)
         state = await self._scope(bot, consumer)
         if identifier(function) not in state['functions']:
             raise ValueError('消费方功能尚未声明')
@@ -386,6 +388,12 @@ class Authorization(AccessControl):
             if not proof['usable'] or proof['member']['status'] != 'present':
                 raise ValueError('请先通过群状态核验成员当前在群')
         async with self.scope_locks.setdefault((bot, consumer), asyncio.Lock()):
+            # Internal conditional writes let a consumer recheck its decision
+            # after waiting for this lock, closing the stale-confirmation gap.
+            if expected_version is not None and state['version'] != expected_version:
+                raise ValueError('授权状态已变化')
+            if expected_valid_until is not None and self.clock() >= expected_valid_until:
+                raise ValueError('授权状态已变化')
             result = None
             affected = {function}
             if operation == 'policy':
