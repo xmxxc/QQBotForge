@@ -35,12 +35,13 @@
   - [5.11 Markdown 图片素材](#511-markdown-图片素材)
 - [6. 群管理 API](#6-群管理-api)
   - [6.1 权限与接口概览](#61-权限与接口概览)
-  - [6.2 群资料与本地记录](#62-群资料与本地记录)
-  - [6.3 入群申请事件](#63-入群申请事件)
-  - [6.4 查询与审批入群申请](#64-查询与审批入群申请)
-  - [6.5 群成员管理](#65-群成员管理)
-  - [6.6 群禁言](#66-群禁言)
-  - [6.7 返回值与错误处理](#67-返回值与错误处理)
+  - [6.2 显示名接口](#62-显示名接口)
+  - [6.3 群资料与本地记录](#63-群资料与本地记录)
+  - [6.4 入群申请事件](#64-入群申请事件)
+  - [6.5 查询与审批入群申请](#65-查询与审批入群申请)
+  - [6.6 群成员管理](#66-群成员管理)
+  - [6.7 群禁言](#67-群禁言)
+  - [6.8 返回值与错误处理](#68-返回值与错误处理)
 - [7. Web 面板扩展](#7-web-面板扩展)
 - [8. Image Hosting 模块](#8-image-hosting-模块)
 - [9. 模块群生命周期订阅](#9-模块群生命周期订阅)
@@ -1112,7 +1113,46 @@ if not ok:
 
 平台接口有调用频率限制。
 
-### 6.2 群资料与本地记录
+### 6.2 显示名接口
+
+框架会在消息发送者和 `mentions[]` 中观察到成员名字时写入当前 Bot 的
+`data.db`，后续观察到改名会更新为最新的清洗后名字。名字在正式消息入口、
+生命周期等待和 `before_event` 异步 hook 之前按观察顺序入队，避免旧事件后完成时覆盖新名。
+生命周期准备仍先保存原生身份，名字沿用配置中的 union ID 映射；hook 仍可接管或转换事件。
+写入沿用后台 `db_queue`，不会让消息处理等待数据库提交。
+
+接口集中在 `core.display`，插件和模块不需要依赖私有的 BotManager 引用；宿主代码也可通过
+`Application.display_member` / `Application.display_group` 使用同一实现。插件或模块可直接导入以下异步只读接口：
+
+~~~python
+from core.display import display_group, display_member
+
+member = await display_member(event.appid, member_id)
+group = await display_group(event.appid, event.group_id)
+~~~
+
+成员返回 `名字（…原生 ID 后四位）`，群返回群名；没有记录时分别降级为
+`未知成员（…后四位）` 和 `未知群（…后四位）`。群名缺失时接口会按需调用一次
+`get_group_info` 尝试补齐，平台请求失败仍返回降级文本。同一 Bot 的同一群
+空名或失败会负缓存 5 分钟（每个 Bot 最多 1024 项），同时进行的补查合并为一次。
+每次显示仍先读本地记录，所以负缓存期间观察并写入的新群名立即可读；
+显式调用 `get_group_info` 不受显示接口负缓存限制。单个显示调用取消不会取消共用补查。
+
+**输出安全契约：** `format_member` / `format_group` / `display_member` / `display_group`
+返回可直接拼进 QQ Markdown 或纯文字消息的普通文本。名字先去掉换行、控制字符、
+零宽及双向控制符并限制为 64 字符，再把 ASCII 标点换成对应全角字符。
+例如 `**主人** <@123>` 显示为 `＊＊主人＊＊ ＜＠123＞`，`@全体` 显示为 `＠全体`，
+`https://example.com` 显示为 `https：／／example．com`。这同时中和 Markdown、
+提及、显式链接和裸链接，纯文字路径也不会出现反斜杠转义残留。普通名字和 ID 尾号格式保持不变。
+
+`clean_display_name` 只用于存储规范化，保留原始标点，不能代替上述安全消息接口。
+本接口没有提供额外的原始名字查询；后台页面如直接读取存储名字，必须使用模板自动 HTML
+转义或 DOM 的文本接口。消息显示文本也不应当作 HTML 插入。
+
+显示名只用于消息展示，不能用于身份、
+授权或权限判断；所有身份关联和权限逻辑必须继续使用原生 ID。
+
+### 6.3 群资料与本地记录
 
 读取 `data.db` 中已有群记录，不产生平台请求：
 
@@ -1170,7 +1210,7 @@ print(result['group_info'], result['bot_state'], result['errors'])
 
 接口识别到群无效或机器人已退群时，会同步修正本地群记录。
 
-### 6.3 入群申请事件
+### 6.4 入群申请事件
 
 监听入群申请事件：
 
@@ -1186,7 +1226,7 @@ async def on_join_request(event, match):
         print(item.get('question', ''), item.get('answer', ''))
 ~~~
 
-### 6.4 查询与审批入群申请
+### 6.5 查询与审批入群申请
 
 分页查询申请列表：
 
@@ -1228,7 +1268,7 @@ ok, response = await event.sender.review_group_join_request(
 
 `op` 仅支持 `approve` 和 `decline`。`reject_reason` 与 `add_to_member_blacklist` 只在拒绝时写入请求。
 
-### 6.5 群成员管理
+### 6.6 群成员管理
 
 分页获取群成员列表，每页由平台固定最多返回 30 条：
 
@@ -1284,7 +1324,7 @@ ok, response = await event.sender.operate_group_member_blacklist(
 )
 ~~~
 
-### 6.6 群禁言
+### 6.7 群禁言
 
 查询全员禁言规则和成员禁言列表：
 
@@ -1330,7 +1370,7 @@ members = [{'op': 'del', 'member_openid': member_openid}]
 ok, response = await event.sender.set_group_member_mute(event.group_id, members)
 ~~~
 
-### 6.7 返回值与错误处理
+### 6.8 返回值与错误处理
 
 查询方法默认失败返回 `None`。需要展示或记录具体原因时，传入 `return_error=True`：
 

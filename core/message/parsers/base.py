@@ -111,6 +111,8 @@ def _parse_common_fields(event, d):
     event.member_role = author.get('member_role', '')
     event.union_openid = author.get('union_openid', '')
     event.is_bot = author.get('bot', False)
+    mentions = d.get('mentions')
+    event.mentions = mentions if isinstance(mentions, list) else []
 
     event.group_id = d.get('group_openid') or d.get('group_id', '')
     event.guild_id = d.get('guild_id', '')
