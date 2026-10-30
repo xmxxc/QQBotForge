@@ -51,6 +51,47 @@ class _BatchQueue(Queue):
             return items
 
 
+_LOG_SLOT_TIMEOUT = 10  # 秒；预留超时后不再阻塞同类日志刷写
+_HOLD = object()
+
+
+class _LogSlot:
+    """队列中预留的一条日志：决定前刷写停在此处，排在它之后的日志不会先落库。"""
+
+    __slots__ = ('_service', '_log_type', '_deadline', '_data', '_state')
+
+    def __init__(self, service, log_type):
+        self._service = service
+        self._log_type = log_type
+        self._deadline = time.monotonic() + _LOG_SLOT_TIMEOUT
+        self._data = None
+        self._state = 'pending'
+
+    def fill(self, data):
+        """写入预留位置；预留已超时或遇到停机时退回队尾追加。"""
+        with self._service._queue_lock:
+            if self._state == 'pending':
+                self._data, self._state = data, 'filled'
+                return True
+            detached = self._state == 'detached'
+        return detached and self._service.add_sync(self._log_type, data)
+
+    def discard(self):
+        """放弃预留，不留下记录。"""
+        with self._service._queue_lock:
+            if self._state == 'pending':
+                self._state = 'discarded'
+
+    def resolve(self):
+        """刷写线程调用：返回待写数据，None 表示跳过，_HOLD 表示仍未决定。"""
+        with self._service._queue_lock:
+            if self._state == 'pending':
+                if self._service._accepting and time.monotonic() < self._deadline:
+                    return _HOLD
+                self._state = 'detached'
+            return self._data
+
+
 async def _shutdown_tasks(tasks, stop_event):
     """stop + cancel 所有后台任务"""
     stop_event.set()
@@ -221,6 +262,11 @@ class _BaseLogService:
                 counter('log_queue_rejected')
                 return False
 
+    def reserve_sync(self, log_type):
+        """按当前入队位置预留一条日志，稍后 fill 或 discard；未被接受时返回 None。"""
+        slot = _LogSlot(self, log_type)
+        return slot if self.add_sync(log_type, slot) else None
+
     def _extract_row(self, log_type, data):
         """dict → INSERT 参数元组 (子类实现)"""
         return None
@@ -384,14 +430,23 @@ class _BaseLogService:
         batch = self._unprepared_batches[log_type]
         batch.extend(self._queues[log_type].take((self._batch_size or 10000) - len(batch)))
         groups = defaultdict(list)
-        for item in batch:
+        done = len(batch)
+        for index, item in enumerate(batch):
+            if isinstance(item, _LogSlot):
+                item = item.resolve()
+                if item is _HOLD:
+                    # 未决定的预留及其后的日志留到下次刷写，保持写入顺序。
+                    done = index
+                    break
+                if item is None:
+                    continue
             ts = item['timestamp'] if 'timestamp' in item else now_str()
             row = self._extract_row(log_type, dict(item, timestamp=ts))
             if row:
                 groups[ts[:10] if log_type in DAILY_TYPES else None].append(row)
         self._pending_batches[log_type].extend(
             [(self._resolve_db_path(log_type, date), rows) for date, rows in groups.items()])
-        batch.clear()
+        del batch[:done]
 
     async def _flush_all(self):
         # 各文件独立刷写，单个库等待写锁不推迟其他队列。
