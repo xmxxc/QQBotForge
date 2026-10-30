@@ -31,7 +31,7 @@ async def ninja(account_host):
         )
         return response.status, await response.json()
 
-    async def say(text, *, user, group='group-a', bot='bot-a', mentions=(), at_bot=True, event_type='GROUP_AT_MESSAGE_CREATE'):
+    async def say(text, *, user, group='group-a', bot='bot-a', mentions=(), at_bot=True, event_type='GROUP_AT_MESSAGE_CREATE', union_id=''):
         from core.base import tasks
         from core.message.event import Event
 
@@ -42,7 +42,7 @@ async def ninja(account_host):
             bot,
             {
                 't': event_type,
-                'd': {'id': 'fake-message', 'content': content, 'group_openid': group, 'author': {'id': user, 'member_openid': user}, 'mentions': payload},
+                'd': {'id': 'fake-message', 'content': content, 'group_openid': group, 'author': {'id': user, 'member_openid': user, 'union_openid': union_id}, 'mentions': payload},
             },
         )
         before = set(tasks._background_tasks)
@@ -127,14 +127,14 @@ async def test_owner_mention_grant_covers_future_accounts_and_member_queries_pub
     assert [r['groups'] for r in snapshot['resources'].values()] == [[]]
     (source,) = grants(snapshot)
     assert (source['group'], source['mode'], source['resource_scope'], source['expires_at']) == ('group-a', 'continuous', {'kind': 'all'}, None)
-    assert (await host.say('账号列表', user='MEMBERA'))[0].startswith('本群开放账号（1/1）：\n1. 账号A\n')
+    assert (await host.say('账号列表', user='MEMBERA'))[0].startswith('本群开放账号（1/1）：\n1. 账号A')
     # Public group reply without trailing empty description/url lines; nothing private.
-    assert await host.say('账号 账号A', user='MEMBERA') == [f'名称：账号A\n账号：fake-login\n密码：{SECRET}']
+    assert await host.say('账号 账号A', user='MEMBERA') == ['名称：账号A', 'fake-login', SECRET]
     assert not [m for m in host.sender.messages if m[0] in {'push', 'group-push'}]
     assert not host.state.states['bot-a']['groups']['group-a']['roster']['complete']
     # A later account opened in this group is covered by the same grant; repeat grants add nothing.
     await host.setup(name='账号B', password='fake-b', description='说明B')
-    assert await host.say('账号 账号B', user='MEMBERA', at_bot=False) == ['名称：账号B\n账号：fake-login\n密码：fake-b\n说明：说明B']
+    assert await host.say('账号 账号B', user='MEMBERA', at_bot=False) == ['名称：账号B\n说明：说明B', 'fake-login', 'fake-b']
     assert await grant(host) == ['该成员已有本群授权']
     assert len(grants(await host.access.access_snapshot('bot-a', 'ninja3'))) == 1
     assert '账号查询 group=group-a member=MEMBERA result=sent' in caplog.text and SECRET not in caplog.text and 'fake-b' not in caplog.text
@@ -160,7 +160,7 @@ async def test_grant_requires_owner_native_single_mention_and_never_crosses_bot_
     assert not (await host.access.access_snapshot('bot-b', 'ninja3'))['grants']
     # The old account consumer gains nothing from the new plugin's grant.
     assert not (await host.access.access_snapshot('bot-a', 'account_sharing'))['grants']
-    assert await host.say('账号 账号A', user='MEMBERA') == [f'名称：账号A\n账号：fake-login\n密码：{SECRET}']
+    assert await host.say('账号 账号A', user='MEMBERA') == ['名称：账号A', 'fake-login', SECRET]
     # Group admission set from the authorization page never replaces the personal grant.
     await host.state.confirm_member('bot-a', 'group-a', 'MEMBERB', evidence='fake verified', member_role='member')
     await host.access.manage_access('bot-a', 'ninja3', 'policy', function='query', policy={'kind': 'group', 'groups': ['group-a', 'group-b']})
@@ -246,7 +246,7 @@ async def test_denial_wins_and_disable_close_rescope_delete_take_effect(ninja):
     # A repeated owner grant cannot lift the denial.
     assert await grant(host) == ['该成员已有本群授权\n该成员在拒绝名单中，拒绝优先，当前仍不能查询']
     await acl.manage_access('bot-a', 'ninja3', 'allow', function='query', group='group-a', member='MEMBERA')
-    assert SECRET in (await host.say('账号 账号A', user='MEMBERA'))[0]
+    assert SECRET in str(await host.say('账号 账号A', user='MEMBERA'))
     await host.ninja_api('PATCH', 'accounts/' + account['id'], {'enabled': False})
     assert await host.say('账号 账号A', user='MEMBERA') == ['本群没有开放名为“账号A”的账号，发送“账号列表”查看']
     assert await host.say('账号列表', user='MEMBERA') == ['本群暂无开放账号']
@@ -256,7 +256,7 @@ async def test_denial_wins_and_disable_close_rescope_delete_take_effect(ninja):
     await host.ninja_api('POST', 'groups', {'group': 'group-a', 'enabled': False})
     assert await host.say('账号 账号A', user='MEMBERA') == ['本群未开放账号查询']
     await host.ninja_api('POST', 'groups', {'group': 'group-a', 'enabled': True})
-    assert SECRET in (await host.say('账号 账号A', user='MEMBERA'))[0]
+    assert SECRET in str(await host.say('账号 账号A', user='MEMBERA'))
     await host.ninja_api('DELETE', 'accounts/' + account['id'])
     assert SECRET not in str(await host.say('账号 账号A', user='MEMBERA'))
     assert account['id'] not in (await acl.access_snapshot('bot-a', 'ninja3'))['resources']
@@ -316,7 +316,7 @@ async def test_old_account_plugin_keeps_its_own_data_and_commands(ninja):
     await host.setup(name='旧账户', password='fake-new-plugin')
     await grant(host)
     # The new commands never reach the old plugin, and the old commands never reach the new one.
-    assert (await host.say('账号列表', user='MEMBERA'))[0].startswith('本群开放账号（1/1）：\n1. 旧账户\n')
+    assert (await host.say('账号列表', user='MEMBERA'))[0].startswith('本群开放账号（1/1）：\n1. 旧账户')
     await host.event('账户管理 列表', user='owner-a')
     assert host.texts() == [f'{old["id"]} 旧账户 启用']
     status, accounts = await host.account_api()
@@ -343,7 +343,7 @@ async def test_member_queries_never_write_authorization_and_owner_narrowing_surv
         return (await host.access.access_snapshot('bot-a', 'ninja3'))['version']
 
     before = await version()
-    assert SECRET in (await host.say('账号 账号A', user='MEMBERA'))[0]
+    assert SECRET in str(await host.say('账号 账号A', user='MEMBERA'))
     assert await host.say('账号列表', user='MEMBERB') == ['你暂无查询权限，已记录给主人']
     assert await version() == before
     # The owner narrows the scope in the authenticated authorization page (and opens private for this consumer).
@@ -375,7 +375,7 @@ async def test_member_queries_never_write_authorization_and_owner_narrowing_surv
     snapshot = await host.access.access_snapshot('bot-a', 'ninja3')
     assert snapshot['functions']['query'] == {'kind': 'explicit', 'groups': ['group-a'], 'private': True}
     assert [d['member'] for d in snapshot['denies']] == ['MEMBERC'] and [g['member'] for g in snapshot['grants']] == ['MEMBERA']
-    assert await host.say('账号 账号A', user='MEMBERA') == ['名称：账号A\n账号：fake-login\n密码：fake-rotated']
+    assert await host.say('账号 账号A', user='MEMBERA') == ['名称：账号A', 'fake-login', 'fake-rotated']
     assert (await host.ninja_api('GET', 'status'))[1]['data']['restricted_by_acl'] == []
 
 
@@ -440,7 +440,7 @@ async def test_owner_resource_narrowing_in_authorization_survives_other_plugin_s
     assert not (await host.access.access_snapshot('bot-a', 'ninja3'))['resources'][a['id']]['enabled']
     assert await host.say('账号 账号A', user='MEMBERA') == ['该账号暂不可查询，请联系主人']
     assert (await host.ninja_api('GET', 'status'))[1]['data']['restricted_by_acl'] == ['账号A']
-    assert await host.say('账号 账号B', user='MEMBERA') == ['名称：账号B\n账号：fake-login\n密码：fake-b2']
+    assert await host.say('账号 账号B', user='MEMBERA') == ['名称：账号B', 'fake-login', 'fake-b2']
     # Editing other fields of that account, enablement unchanged, does not lift the restriction either.
     status, edited = await host.ninja_api('PATCH', 'accounts/' + a['id'], {'password': 'fake-a2', 'enabled': True})
     assert edited['data']['acl_sync'] == {'status': 'not_needed'}
@@ -449,7 +449,7 @@ async def test_owner_resource_narrowing_in_authorization_survives_other_plugin_s
     # Disabling and re-enabling it in the plugin is the explicit, recorded re-sync.
     status, saved = await host.ninja_api('PATCH', 'accounts/' + a['id'], {'enabled': True})
     assert (saved['data']['acl_sync']['resource_before'], saved['data']['acl_sync']['resource_after']) == (False, True)
-    assert 'fake-a2' in (await host.say('账号 账号A', user='MEMBERA'))[0]
+    assert 'fake-a2' in str(await host.say('账号 账号A', user='MEMBERA'))
 
 
 async def test_group_sync_reads_authorization_last_so_concurrent_owner_edits_are_kept(ninja):
@@ -474,3 +474,14 @@ async def test_group_sync_reads_authorization_last_so_concurrent_owner_edits_are
     finally:
         store.get = real_get
     assert (await host.access.access_snapshot('bot-a', 'ninja3'))['functions']['query'] == {'kind': 'explicit', 'groups': ['group-b'], 'private': True}
+
+
+async def test_credentials_are_three_copyable_messages_with_optional_metadata(ninja):
+    host = ninja
+    await host.setup(description='  测试说明  ', url='https://example.invalid/account')
+    await grant(host)
+    assert await host.say('账号 账号A', user='MEMBERA') == [
+        '名称：账号A\n说明：测试说明\n地址：https://example.invalid/account',
+        'fake-login',
+        SECRET,
+    ]

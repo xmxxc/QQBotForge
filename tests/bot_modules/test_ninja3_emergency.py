@@ -41,7 +41,7 @@ async def test_enter_persists_before_all_account_tasks_and_exit_restores_only_re
     assert any('紧急模式' in message for message in await private_messages(host))
     await host.event('忍3退出紧急模式', user='owner-a')
     assert (await host.ninja_api('GET', 'emergency'))[1]['data']['state'] == 'exited'
-    assert '密码：' in (await host.say('账号 账号A', user='MEMBERA'))[0]
+    assert len(await host.say('账号 账号A', user='MEMBERA')) == 3
 
 
 async def test_emergency_save_failure_is_fail_closed_until_a_later_owner_retry(changing, monkeypatch):
@@ -206,6 +206,24 @@ async def test_restart_clears_dead_runner_and_explicit_reentry_recovers_handoff(
     await restarted.exit('bot-a')
 
 
+async def test_restart_preserves_completed_emergency_phase(changing, monkeypatch):
+    host = changing
+    emergency = host.ninja().emergency
+    monkeypatch.setattr(emergency, '_start', lambda _bot: None)
+    await emergency.enter('bot-a')
+    await emergency.store.atomic(
+        lambda conn: emergency._save(
+            conn,
+            'bot-a',
+            {**emergency._read(conn, 'bot-a'), 'phase': 'complete', 'runner': 'dead-runner', 'runner_pid': os.getpid()},
+        )
+    )
+    await host.plugins.reload('ninja3')
+    restarted = host.ninja().emergency
+    assert (await restarted.status('bot-a'))['phase'] == 'complete'
+    await restarted.exit('bot-a')
+
+
 async def test_exit_cas_rechecks_a_peer_runner_inside_the_transition(changing, monkeypatch):
     host = changing
     emergency = host.ninja().emergency
@@ -228,3 +246,16 @@ async def test_exit_cas_rechecks_a_peer_runner_inside_the_transition(changing, m
 
     await emergency.store.atomic(clear_peer)
     await emergency.exit('bot-a')
+
+
+async def test_completed_emergency_stays_complete_after_real_runner_and_reload(changing):
+    host = changing
+    await host.ninja().emergency.enter('bot-a')
+    await wait_emergency(host)
+    assert (await host.ninja().emergency.status('bot-a'))['phase'] == 'complete'
+    changes = host.center.changes
+    await host.plugins.reload('ninja3')
+    state = await host.ninja().emergency.status('bot-a')
+    assert (state['state'], state['phase']) == ('active', 'complete')
+    assert host.center.changes == changes
+    assert not host.ninja().emergency.current('bot-a')

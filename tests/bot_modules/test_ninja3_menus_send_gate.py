@@ -57,7 +57,7 @@ async def test_selected_credentials_recheck_after_sender_preparation(ninja, wire
     account, clock, payload = await directory(host, wire)
     data = keyboard(payload)[0]
     token = re.search(r'忍3选择 ([0-9a-f]{32})', str(payload))[1]
-    wire.marker = SECRET
+    wire.marker = '名称：账号A'
 
     async def send():
         if entry == 'click':
@@ -66,7 +66,7 @@ async def test_selected_credentials_recheck_after_sender_preparation(ninja, wire
 
     await run(host, wire, change, account, clock, send)
     if change == 'control':
-        assert len(wire.sent) == 1 and SECRET in wire.texts()[0]
+        assert len(wire.sent) == 3 and SECRET in wire.texts()[-1]
     else:
         stale_free(wire)
 
@@ -105,6 +105,23 @@ async def test_rejected_buttons_fallback_rechecks_after_sender_preparation(ninja
         assert '按钮暂不可用' in texts[0] and '1. 账号A' in texts[0] and "'msg_type': 0" in texts[0]
     else:
         assert CHANGED in texts[0] and '账号A' not in texts[0]
+
+
+@pytest.mark.parametrize('command', ['菜单', '账号列表'])
+async def test_keyboard_menu_omits_legacy_text_selection_hint_and_fallback_keeps_it(ninja, wire, command):
+    host = ninja
+    await host.setup()
+    await grant(host)
+    wire.sent.clear()
+    await host.say(command, user='MEMBERA')
+    assert len(wire.sent) == 1
+    assert '五分钟内发送“忍3选择' not in wire.texts()[0]
+
+    wire.sent.clear()
+    wire.result = lambda payload: (False, {'code': 400, 'message': 'fake keyboard rejected'}) if 'keyboard' in payload else (True, {'id': 'fake-text'})
+    await host.say(command, user='MEMBERA')
+    assert len(wire.sent) == 2
+    assert '五分钟内发送“忍3选择' in wire.texts()[-1]
 
 
 async def test_management_prompt_rechecks_menu_after_sender_preparation(ninja, wire):

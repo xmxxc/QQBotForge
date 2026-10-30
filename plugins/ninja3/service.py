@@ -327,18 +327,18 @@ class Ninja3:
 
     @staticmethod
     def outcome(result):
-        """Sender.reply returns the platform response dict; pushes return (ok, data, payload)."""
+        """A message ID is required to confirm delivery for replies and pushes."""
         if isinstance(result, tuple) and result and isinstance(result[0], bool):
             data = result[1] if len(result) > 1 else None
-            if result[0]:
-                return 'sent'
-            return 'unknown' if isinstance(data, dict) and unknown_code(data.get('code')) else 'failed'
+            if not result[0]:
+                return 'unknown' if isinstance(data, dict) and unknown_code(data.get('code')) else 'failed'
+            result = data
         if not isinstance(result, dict):
             return 'unknown'
         code = result.get('code')
-        if code in (None, 0):
-            return 'sent'
-        return 'unknown' if unknown_code(code) else 'failed'
+        if code not in (None, 0):
+            return 'unknown' if unknown_code(code) else 'failed'
+        return 'sent' if any(isinstance(result.get(key), str) and result[key].strip() for key in ('id', 'msg_id')) else 'unknown'
 
     async def reply(self, event, content, *, gate=None, **kwargs):
         """``gate`` is a synchronous freshness check for sensitive content.
@@ -380,12 +380,12 @@ class Ninja3:
 
     @staticmethod
     def credentials(account):
-        lines = [f'名称：{account["name"]}', f'账号：{account["login"]}', f'密码：{account["password"]}']
+        first = [f'名称：{account["name"]}']
         if account.get('description', '').strip():
-            lines.append(f'说明：{account["description"].strip()}')
+            first.append(f'说明：{account["description"].strip()}')
         if account.get('url', '').strip():
-            lines.append(f'地址：{account["url"].strip()}')
-        return '\n'.join(lines)
+            first.append(f'地址：{account["url"].strip()}')
+        return ['\n'.join(first), account['login'], account['password']]
 
     # ---------- owner grant ----------
 
@@ -393,7 +393,7 @@ class Ninja3:
     def is_owner(event):
         bot = event.appid
         blocked = event.user_id in get_blacklist_map(bot, 'user') or event.group_id in get_blacklist_map(bot, 'group')
-        return not blocked and event.user_id in (cfg.get_bot_config(bot) or {}).get('owner_ids', [])
+        return not blocked and event.raw_user_id in (cfg.get_bot_config(bot) or {}).get('owner_ids', [])
 
     async def authorize(self, event):
         bot, group = event.appid, event.group_id
@@ -694,9 +694,10 @@ class Ninja3:
             if paused is None:
                 await self.reply(event, UNAVAILABLE)
                 return
-            accounts = [
-                a for a in await self.store.project(bot, 'accounts', DIRECTORY) if a['enabled'] and group in (a['open_groups'] or []) and a['id'] not in paused
+            directory = [
+                a for a in await self.store.project(bot, 'accounts', DIRECTORY) if a['enabled'] and group in (a['open_groups'] or [])
             ]
+            accounts = [a for a in directory if a['id'] not in paused]
             if name is None and resource is None:
                 available = []
                 for account in accounts:
@@ -723,9 +724,18 @@ class Ninja3:
                 title = f'本群开放账号（{page + 1}/{last + 1}）：'
                 await self.offer(event, title, items, lambda: self.current(event, revision, acl, decisions, menu, account_ids=[a['id'] for a in accounts]))
                 return
-            account = next((a for a in accounts if (a['id'] == resource if resource else a['name'] == name)), None)
+            account = next((a for a in directory if (a['id'] == resource if resource else a['name'] == name)), None)
             if account is None:
                 await self.reply(event, '该账号暂不可查询，请重新发送：账号列表' if resource else f'本群没有开放名为“{name}”的账号，发送“账号列表”查看')
+                return
+            if account['id'] in paused:
+                if self.is_owner(event):
+                    task_id = self.password_tasks.active_task_id(bot, account['id'])
+                    task_id = (await self.password_batches.batch_for_task(bot, task_id) or task_id) if task_id else '未知'
+                    message = f'该账号正在改密（批量任务 {task_id}），暂不可查询'
+                else:
+                    message = '该账号暂不可查询，请稍后再试'
+                await self.reply(event, message)
                 return
             view = await acl.evaluate(bot, CONSUMER, FUNCTION, group, member, account['id'], action='view')
             if not (view['allowed'] and view['reason'] == 'explicit'):
@@ -737,7 +747,7 @@ class Ninja3:
             if record is None:
                 await self.reply(event, CHANGED)
                 return
-            content = self.credentials(record)
+            contents = self.credentials(record)
         except BusinessError as error:
             await self.reply(event, str(error) if error.status != 503 else '账号查询暂不可用，请联系主人')
             return
@@ -749,7 +759,11 @@ class Ninja3:
             await self.reply(event, '账号查询暂不可用，请联系主人')
             return
         # Final gate: after this plugin's last await and again after Sender's preparation.
-        state = await self.reply(event, content, gate=lambda: self.current(event, revision, acl, decisions, menu, account_snapshot=[record]))
+        state = 'sent'
+        for content in contents:
+            state = await self.reply(event, content, msg_type=0, gate=lambda: self.current(event, revision, acl, decisions, menu, account_snapshot=[record]))
+            if state != 'sent':
+                break
         log.info(f'[{bot}] 账号{"列表" if name is None and resource is None else "查询"} group={group} member={member} result={state}')
 
     def current(self, event, revision, acl, decisions, menu=None, *, account_snapshot=None, account_ids=()):
@@ -813,15 +827,18 @@ class Ninja3:
             return self.menu_current(event, session) and current()
 
         content = title + '\n' + '\n'.join(f'{i}. {label}' for i, (label, _) in enumerate(items, 1))
-        content += f'\n五分钟内发送“忍3选择 {token} <编号>”'
         buttons = [{'text': label[:20], 'type': 1, 'data': f'n3:{token}:{i}', 'tips': f'发送：忍3选择 {token} {i}'} for i, (label, _) in enumerate(items, 1)]
         rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
-        if cfg.get_bot_setting(event.appid, 'message.use_markdown', True):
+        markdown = cfg.get_bot_setting(event.appid, 'message.use_markdown', True)
+        if markdown:
             state = await self.reply(event, content, buttons=rows, gate=check)
             if state != 'failed':  # sent, stale, unavailable or unknown: never duplicate.
                 return
         # Only an explicit rejection falls back; it rechecks before and after Sender's preparation.
-        await self.reply(event, content + '\n按钮暂不可用，请使用以上文字编号。', msg_type=0, gate=check)
+        fallback = content + f'\n五分钟内发送“忍3选择 {token} <编号>”'
+        if markdown:
+            fallback = content + f'\n按钮暂不可用，请使用以上文字编号。\n五分钟内发送“忍3选择 {token} <编号>”'
+        await self.reply(event, fallback, msg_type=0, gate=check)
 
     async def menu(self, event):
         bot, group = event.appid, event.group_id
@@ -1065,7 +1082,7 @@ class Ninja3:
             return
         if event.is_direct and not event.is_channel:
             await self.store.put(
-                bot, 'owners', 'observed_c2c', {'private_id': event.raw_user_id, 'authenticated_id': event.user_id, 'source': 'observed_owner_c2c'}
+                bot, 'owners', 'observed_c2c', {'private_id': event.raw_user_id, 'authenticated_id': event.raw_user_id, 'source': 'observed_owner_c2c'}
             )
         accounts = await self.store.all(bot, 'accounts')
         groups = await self.store.all(bot, 'groups')

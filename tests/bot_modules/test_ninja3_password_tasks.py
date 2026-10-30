@@ -166,12 +166,47 @@ async def test_backend_selection_confirmation_and_protected_intent_then_one_subm
     result = await task_info(host, task)
     assert (result['remote'], result['local'], result['state'], result['notification']) == ('reported_success', 'committed', 'completed', 'sent')
     assert not host.ninja().account_paused('bot-a', host.account['id'])
-    assert new in (await host.say('账号 账号A', user='MEMBERA'))[0]
+    assert new in str(await host.say('账号 账号A', user='MEMBERA'))
     assert host.center.changes == 1
     assert (await host.action(task))[1]['data']['id'] == task['id'] and host.center.changes == 1
     assert new not in str(result) + caplog.text
     pushes = [m for m in host.sender.messages if m[0] == 'push']
     assert pushes and all(new not in str(m) and OLD not in str(m) for m in pushes)
+
+
+@pytest.mark.parametrize('batch', [False, True])
+async def test_paused_account_query_uses_safe_member_message_and_owner_task_reference(changing, batch):
+    host = changing
+    host.center.block_path = CHANGE
+    if batch:
+        _, response = await host.ninja_api('POST', 'password-batches', {'accounts': [host.account['id']]})
+        task = response['data']
+        await host.ninja_api('POST', f'password-batches/{task["id"]}/confirm', {})
+    else:
+        task = await host.select()
+        await host.action(task)
+    await host.center.entered.wait()
+
+    assert await host.say('账号 账号A', user='MEMBERA') == ['该账号暂不可查询，请稍后再试']
+    await host.state.confirm_member('bot-a', 'group-a', 'owner-a', evidence='test owner query')
+    await host.access.manage_access(
+        'bot-a',
+        'ninja3',
+        'grant',
+        function='query',
+        group='group-a',
+        member='owner-a',
+        mode='continuous',
+        resource_scope={'kind': 'all'},
+        expires_at=None,
+    )
+    owner = await host.say('账号 账号A', user='owner-a')
+    assert owner == [f'该账号正在改密（批量任务 {task["id"]}），暂不可查询']
+    assert 'fake-login' not in str(owner) and OLD not in str(owner)
+    host.center.release.set()
+    if batch:
+        await asyncio.gather(*list(host.ninja().password_batches.runners.values()))
+    await host.finished()
 
 
 async def test_message_owner_confirmation_group_and_private_real_entries(changing):
@@ -253,7 +288,7 @@ async def test_rejected_unknown_pause_only_target_and_restart_never_resubmits(ch
     assert (await task_info(host, task))['remote'] == remote
     assert host.ninja().account_paused('bot-a', host.account['id'])
     assert '账号A' not in str(await host.say('账号列表', user='MEMBERA'))
-    assert 'fake-other-account' in (await host.say('账号 账号B', user='MEMBERA'))[0]
+    assert 'fake-other-account' in str(await host.say('账号 账号B', user='MEMBERA'))
     assert (await host.action(task, 'recover'))[0] == 422
     raw = await raw_task(host, task)
     await host.plugins.reload('ninja3')
@@ -615,7 +650,7 @@ async def test_rejected_retry_reuses_same_intent_and_release_restores_unchanged_
     status, released = await host.action(second, 'release')
     assert status == 200 and released['data']['state'] == 'released'
     assert not host.ninja().account_paused('bot-a', other['id'])
-    assert OLD in (await host.say('账号 账号B', user='MEMBERA'))[0]
+    assert OLD in str(await host.say('账号 账号B', user='MEMBERA'))
     assert (await host.action(second, 'retry'))[0] == 422 and host.center.changes == 3
 
 

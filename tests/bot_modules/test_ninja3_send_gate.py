@@ -105,14 +105,51 @@ async def test_text_query_rechecks_after_sender_preparation(ninja, wire, change)
     account = await host.setup()
     await grant(host)
     wire.sent.clear()
-    wire.marker = SECRET
+    wire.marker = '名称：账号A'
     await change_during(host, wire, change, account, lambda: host.say('账号 账号A', user='MEMBERA'))
     if change == 'control':
-        assert len(wire.sent) == 1 and SECRET in wire.texts()[0]
+        assert len(wire.sent) == 3 and SECRET in wire.texts()[-1]
     else:
         # Nothing stale reached the transport; one notice without credentials instead.
         assert len(wire.sent) == 1 and CHANGED in wire.texts()[0], wire.texts()
         assert SECRET not in str(wire.sent) and 'fake-login' not in str(wire.sent) and 'fake-new' not in str(wire.sent)
+
+
+@pytest.mark.parametrize(
+    ('marker', 'sent_before_block'),
+    [('名称：账号A', 0), ('fake-login', 1), (SECRET, 2)],
+)
+async def test_each_credential_message_has_its_own_final_gate(ninja, wire, marker, sent_before_block):
+    host = ninja
+    await host.setup()
+    await grant(host)
+    wire.sent.clear()
+    wire.marker = marker
+    task = asyncio.create_task(host.say('账号 账号A', user='MEMBERA'))
+    await asyncio.wait_for(wire.entered.wait(), 5)
+    await host.ninja_api('PATCH', 'accounts/' + (await host.ninja_api())[1]['data'][0]['id'], {'enabled': False})
+    wire.release.set()
+    await task
+    contents = [payload.get('content', payload.get('markdown', {}).get('content')) for payload in wire.sent]
+    assert contents == ['名称：账号A', 'fake-login', SECRET][:sent_before_block] + [CHANGED]
+
+
+@pytest.mark.parametrize('stop_at', [1, 2, 3])
+@pytest.mark.parametrize('code', [400, 500, -1])
+async def test_credential_send_failure_stops_without_sending_later_parts(ninja, wire, stop_at, code):
+    host = ninja
+    await host.setup()
+    await grant(host)
+    wire.sent.clear()
+
+    def result(payload):
+        if len(wire.sent) == stop_at:
+            return False, {'code': code, 'message': 'fake credential failure'}
+        return True, {'id': 'fake-message'}
+
+    wire.result = result
+    await host.say('账号 账号A', user='MEMBERA')
+    assert [payload['content'] for payload in wire.sent] == ['名称：账号A', 'fake-login', SECRET][:stop_at]
 
 
 @pytest.mark.parametrize('change', CHANGES)
@@ -157,7 +194,7 @@ async def test_latest_before_send_callback_cannot_outrun_check(ninja, wire):
     finally:
         release.set()
         host.application.hook_manager.unregister_owner('test-later')
-    assert len(wire.sent) == 2 and CHANGED in wire.texts()[1] and SECRET not in wire.texts()[1]
+    assert len(wire.sent) == 6 and CHANGED in wire.texts()[-1] and SECRET not in wire.texts()[-1]
 
 
 async def test_failing_check_blocks_and_unknown_result_is_not_resent(ninja, wire, monkeypatch):
@@ -183,7 +220,7 @@ async def test_failing_check_blocks_and_unknown_result_is_not_resent(ninja, wire
     wire.sent.clear()
     wire.result = (False, {'code': -1, 'message': 'fake network'})
     await host.say('账号 账号A', user='MEMBERA')
-    assert len(wire.sent) == 1 and SECRET in wire.texts()[0]
+    assert len(wire.sent) == 1 and '名称：账号A' in wire.texts()[0] and SECRET not in wire.texts()[0]
 
 
 async def test_directory_and_query_read_credentials_only_for_selected_account(ninja, wire, monkeypatch):
@@ -215,3 +252,17 @@ async def test_directory_and_query_read_credentials_only_for_selected_account(ni
     rows.clear()
     await host.say('账号 账号A', user='MEMBERB')
     assert not [r for r in rows if 'password' in r]
+
+
+async def test_copyable_credentials_have_no_markdown_suffix_and_use_three_replies(ninja, wire):
+    from core.base.config import cfg
+
+    host = ninja
+    await host.setup()
+    await grant(host)
+    cfg.set_bot_setting('bot-a', 'message.markdown_suffix', 'fake-suffix')
+    wire.sent.clear()
+    await host.say('账号 账号A', user='MEMBERA')
+    assert [payload.get('content') for payload in wire.sent] == ['名称：账号A', 'fake-login', SECRET]
+    assert all(payload['msg_type'] == 0 for payload in wire.sent)
+    assert len({payload['msg_id'] for payload in wire.sent}) == 1

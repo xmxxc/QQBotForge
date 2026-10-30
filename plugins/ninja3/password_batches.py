@@ -152,6 +152,19 @@ class PasswordBatches:
     async def get(self, bot: str, key: str) -> Record:
         return await self.view(bot, await self.store.atomic(lambda conn: self._read(conn, bot, key)))
 
+    async def batch_for_task(self, bot: str, task: str) -> str | None:
+        """Find the batch that dispatched this task, without loading sealed inputs."""
+        def read(conn: sqlite3.Connection) -> str | None:
+            row = conn.execute(
+                "SELECT b.id FROM ninja3_password_batches b, json_each(b.payload, '$.items') item "
+                "WHERE b.bot=? AND json_extract(item.value, '$.task')=? "
+                "AND json_extract(item.value, '$.status')='dispatched' LIMIT 1",
+                (bot, task),
+            ).fetchone()
+            return row[0] if row else None
+
+        return await self.store.atomic(read)
+
     # ---------- selection and confirmation ----------
 
     async def select(self, bot: str, actor: str, accounts: builtins.list[str] | None, *, new_password: str | None = None) -> Record:
@@ -324,9 +337,23 @@ class PasswordBatches:
             return
         await self._update(bot, key, runner, index, status='linked', task=child['id'])
 
+        claimed_by_batch = False
+
         def still_running(conn: sqlite3.Connection) -> None:
-            # Same transaction as the task claim: a cancelled, interrupted or stale batch starts nothing.
-            self._running(conn, bot, key, runner)
+            # Same transaction as the task claim: a cancelled, interrupted or stale batch
+            # starts nothing. Only the batch that finds no active task may record that it
+            # dispatched the child; a replaying batch is an existing-task link.
+            nonlocal claimed_by_batch
+            batch = self._running(conn, bot, key, runner)
+            active = conn.execute(
+                'SELECT 1 FROM ninja3_password_tasks WHERE bot=? AND account=? AND active=1',
+                (bot, child['account']),
+            ).fetchone()
+            if active:
+                return
+            batch['items'][index].update(status='dispatched')
+            self._save(conn, bot, batch)
+            claimed_by_batch = True
 
         try:
             started = await self.tasks.confirm(bot, child['id'], actor, new_password=new_password, expect_digest=item['digest'], guard=still_running)
@@ -341,7 +368,7 @@ class PasswordBatches:
             log.error(f'[{bot}] 批量改密单项未能开始: {key}#{index}')
             await self._update(bot, key, runner, index, status='failed')
             return
-        if started['id'] != child['id']:
+        if started['id'] != child['id'] or not claimed_by_batch:
             await self._update(bot, key, runner, index, status='existing', task=started['id'])
             return
         worker = self.tasks.workers.get((bot, child['id']))
