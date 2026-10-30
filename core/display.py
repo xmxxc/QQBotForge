@@ -1,11 +1,18 @@
 """显示名查询接口。
 
-显示名只用于消息排版。调用方必须继续使用原生 ID 做身份、权限和数据关联。
+format_member / format_group / display_* 返回可直接拼入 QQ Markdown 或纯文字消息的文本。
+名字的 ASCII 标点全角化，避免 Markdown、提及和链接被解释。身份、权限和数据关联仍用原生 ID。
 """
 
+import asyncio
+import string
 import unicodedata
+from time import monotonic
 
 DISPLAY_NAME_MAX_LENGTH = 64
+_GROUP_NAME_NEGATIVE_TTL = 300
+_GROUP_NAME_CACHE_MAX = 1024
+_MESSAGE_PUNCTUATION = str.maketrans({char: chr(ord(char) + 0xFEE0) for char in string.punctuation})
 USER_NAME_UPSERT_SQL = (
     'INSERT INTO users (user_id, name) VALUES (?, ?) '
     'ON CONFLICT(user_id) DO UPDATE SET name=excluded.name '
@@ -14,7 +21,7 @@ USER_NAME_UPSERT_SQL = (
 
 
 def clean_display_name(value, *, max_length=DISPLAY_NAME_MAX_LENGTH):
-    """清理平台返回的名字，避免控制字符改变消息排版。"""
+    """规范化存储名字；消息输出须使用 format_* / display_* 中和标点。"""
     if value is None:
         return ''
     text = str(value)
@@ -41,21 +48,21 @@ def _native_id(value):
 
 
 def _suffix(native_id):
-    return f'…{native_id[-4:]}'
+    return f'…{clean_display_name(native_id[-4:]).translate(_MESSAGE_PUNCTUATION)}'
 
 
 def format_member(member_id, name=''):
-    """格式化成员显示名；没有记录时返回稳定的未知成员降级文本。"""
+    """返回 QQ Markdown / 纯文字安全文本；没有记录时降级为未知成员。"""
     native_id = _native_id(member_id)
-    display_name = clean_display_name(name)
+    display_name = clean_display_name(name).translate(_MESSAGE_PUNCTUATION)
     label = display_name or '未知成员'
     return f'{label}（{_suffix(native_id)}）'
 
 
 def format_group(group_id, name=''):
-    """格式化群显示名；没有记录时返回稳定的未知群降级文本。"""
+    """返回 QQ Markdown / 纯文字安全文本；没有记录时降级为未知群。"""
     native_id = _native_id(group_id)
-    display_name = clean_display_name(name)
+    display_name = clean_display_name(name).translate(_MESSAGE_PUNCTUATION)
     if display_name:
         return display_name
     return f'未知群（{_suffix(native_id)}）'
@@ -95,6 +102,51 @@ async def display_member_for_bot(bot, member_id):
     return format_member(native_id, name)
 
 
+class _GroupNameLookup:
+    """每个 Bot 独有的有界负缓存；本地新名字始终优先于此缓存。"""
+
+    def __init__(self):
+        self.misses = {}
+        self.pending = {}
+
+    async def get(self, bot, group_id):
+        if self.misses.get(group_id, 0) > monotonic():
+            return ''
+        task = self.pending.get(group_id)
+        if task is None:
+            task = asyncio.create_task(self._fetch(bot, group_id))
+            self.pending[group_id] = task
+            task.add_done_callback(lambda done: self.pending.pop(group_id, None))
+        # 一个列表/页面取消，不应取消其他显示查询共用的补查。
+        return await asyncio.shield(task)
+
+    async def _fetch(self, bot, group_id):
+        name = ''
+        try:
+            result = await bot.sender.get_group_info(group_id, return_error=True)
+            data = result[0] if isinstance(result, tuple) else result
+            if isinstance(data, dict):
+                name = data.get('group_name', '')
+        except Exception:
+            pass
+        if not clean_display_name(name):
+            name = await _read_name(
+                getattr(bot, 'log_service', None),
+                'SELECT group_name FROM groups_users WHERE group_id=?',
+                group_id, 'group_name',
+            )
+        if clean_display_name(name):
+            self.misses.pop(group_id, None)
+        else:
+            now = monotonic()
+            if len(self.misses) >= _GROUP_NAME_CACHE_MAX:
+                self.misses = {key: expiry for key, expiry in self.misses.items() if expiry > now}
+                if len(self.misses) >= _GROUP_NAME_CACHE_MAX:
+                    self.misses.pop(next(iter(self.misses)))
+            self.misses[group_id] = now + _GROUP_NAME_NEGATIVE_TTL
+        return name
+
+
 async def display_group_for_bot(bot, group_id):
     """供 Application/插件宿主复用的同一查询实现。"""
     native_id = _native_id(group_id)
@@ -108,20 +160,10 @@ async def display_group_for_bot(bot, group_id):
     if clean_display_name(name) or bot is None or not native_id:
         return format_group(native_id, name)
 
-    try:
-        result = await bot.sender.get_group_info(native_id, return_error=True)
-        data = result[0] if isinstance(result, tuple) else result
-        if isinstance(data, dict):
-            name = data.get('group_name', '')
-    except Exception:
-        pass
-    if not clean_display_name(name):
-        name = await _read_name(
-            log_service,
-            'SELECT group_name FROM groups_users WHERE group_id=?',
-            native_id,
-            'group_name',
-        )
+    lookup = getattr(bot, '_display_group_lookup', None)
+    if lookup is None:
+        lookup = bot._display_group_lookup = _GroupNameLookup()
+    name = await lookup.get(bot, native_id)
     return format_group(native_id, name)
 
 

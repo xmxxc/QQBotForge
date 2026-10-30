@@ -33,6 +33,7 @@ class BotInstance:
         'union_openid',
         'robot_qq',
         'owner_ids',
+        '_display_group_lookup',
     )
 
     def __init__(self, bot_cfg, base_log_dir, *, connection_status=None):
@@ -41,6 +42,7 @@ class BotInstance:
         self.bot_generation = uuid4().hex
         self.connection_status = connection_status if connection_status is not None else ConnectionStatusManager()
         self.name = self.appid
+        self._display_group_lookup = None
         self.secret = str(bot_cfg['secret'])
 
         self.token_manager = TokenManager(
