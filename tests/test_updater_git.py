@@ -1,6 +1,7 @@
 """Public updater contracts; Git and SQLite use disposable local fixtures only."""
 
 import asyncio
+import os
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from web.tools._updater import supervisor
 from web.tools._updater.framework import FrameworkUpdater
 
 GITHUB_URL = 'https://github.com/xmxxc/QQBotForge'
@@ -15,6 +17,11 @@ GITHUB_URL = 'https://github.com/xmxxc/QQBotForge'
 
 def git(cwd, *args):
     return subprocess.run(['git', '-C', str(cwd), *args], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def github_commit(publisher, path):
+    sha = path.split('/')[2]
+    return {'sha': sha, 'commit': {'tree': {'sha': git(publisher, 'rev-parse', f'{sha}^{{tree}}')}}}
 
 
 @pytest.fixture
@@ -75,6 +82,8 @@ def deployment(tmp_path, monkeypatch):
             }
         if path.startswith('/commits?'):
             return [{'sha': target, 'commit': {'message': 'two'}, 'html_url': f'{GITHUB_URL}/commit/{target}'}]
+        if path.startswith('/commits/'):
+            return github_commit(publisher, path)
         return {'sha': target}
 
     monkeypatch.setattr(updater, '_fetch_api', api)
@@ -141,6 +150,8 @@ def test_unsafe_update_is_refused_without_changing_head(deployment, kind):
         async def ci_api(path=''):
             if '/check-runs' in path:
                 return {'total_count': 1, 'check_runs': d.checks}
+            if path.startswith('/commits/'):
+                return github_commit(d.publisher, path)
             return {
                 'workflow_runs': [
                     dict(
@@ -235,7 +246,6 @@ def test_supervisor_handles_startup_crash_timeout_and_success(deployment, tmp_pa
     data.mkdir()
     pending = data / 'update_pending.json'
     pending.write_text(json.dumps(dict(transaction='test', status='awaiting_restart', old_sha=d.old, target_sha=d.target, backup_path='data/backup/kept')))
-    (data / 'update.lock').write_text('test')
     script = tmp_path / 'candidate.py'
     script.write_text(
         """
@@ -261,8 +271,7 @@ else:
     assert git(d.work, 'rev-parse', 'HEAD') == (d.target if mode == 'confirm' else d.old)
     assert (data / 'old-started').exists() == (mode != 'confirm')
     assert state['backup_path'] == 'data/backup/kept'
-    # After a rollback the monitor releases the lock; a confirmation is released by the new process.
-    assert (data / 'update.lock').exists() == (mode == 'confirm')
+    assert not supervisor.deploy_lock_held(d.work)
 
 
 @pytest.mark.asyncio
@@ -303,9 +312,12 @@ def test_dead_supervisor_refuses_restart_and_restores_old_checkout(deployment, m
 
 def test_concurrent_updaters_cannot_switch_same_deployment_twice(deployment):
     d = deployment
-    (d.work / 'data').mkdir()
-    (d.work / 'data/update.lock').write_text('another updater')
-    result = asyncio.run(d.updater.update_to_version(d.target))
+    fd = supervisor.acquire_deploy_lock(d.work)  # another live updater
+    d.updater.claim_timeout = 0.2
+    try:
+        result = asyncio.run(d.updater.update_to_version(d.target))
+    finally:
+        os.close(fd)
     assert result['success'] is False
     assert git(d.work, 'rev-parse', 'HEAD') == d.old
     assert not d.requests
@@ -354,16 +366,15 @@ def test_corrupt_database_refuses_checkout_and_preserves_local_bytes(deployment,
     assert result['success'] is False
     assert git(d.work, 'rev-parse', 'HEAD') == d.old
     assert invalid.read_bytes() == b'not a SQLite file'
-    assert not d.updater.lock_file.exists()
+    assert not d.updater.lock_active()
 
 
-def test_git_url_rewrite_cannot_redirect_update_source(deployment):
+def test_git_url_rewrite_in_deployment_is_not_used(deployment):
     d = deployment
     git(d.work, 'config', 'url.https://mirror.example/.insteadOf', 'https://github.com/')
     result = asyncio.run(d.updater.check_for_updates())
-    assert result['can_update'] is False
-    assert 'URL' in result['error']
-    assert not d.requests
+    assert result['error'] is None
+    assert result['latest_version'] == d.target
 
 
 @pytest.mark.asyncio
@@ -398,8 +409,8 @@ def test_per_url_git_network_settings_cannot_override_direct_fetch(deployment, k
     d = deployment
     git(d.work, 'config', key, value)
     result = asyncio.run(d.updater.check_for_updates())
-    assert result['can_update'] is False
-    assert not d.requests
+    assert result['error'] is None
+    assert result['latest_version'] == d.target
 
 
 def test_supervisor_rollback_ignores_ambient_git_directory(deployment, tmp_path, monkeypatch):
@@ -418,7 +429,6 @@ def test_supervisor_rollback_ignores_ambient_git_directory(deployment, tmp_path,
     data.mkdir()
     pending = data / 'update_pending.json'
     pending.write_text(json.dumps(dict(transaction='test', status='awaiting_restart', old_sha=d.old, target_sha=d.target, backup_path='data/backup/kept')))
-    (data / 'update.lock').write_text('test')
     with monkeypatch.context() as context:
         context.setenv('GIT_DIR', str(outsider / '.git'))
         assert supervise_update(d.work, [sys.executable, '-c', 'pass'], 'test', timeout=0.2) == 0
@@ -447,11 +457,10 @@ async def test_confirmation_releases_lock_without_live_supervisor(deployment):
     git(d.work, 'checkout', '--detach', d.target)
     (d.work / 'data').mkdir()
     d.updater.pending_file.write_text(json.dumps(dict(transaction='t1', status='awaiting_ws', target_sha=d.target)))
-    d.updater.lock_file.write_text('t1')
     hook = HookManager()
     hook.connection_status._register('test-bot', 'websocket', bot_generation='new').publish('ready', reason='ready', login_kind='fresh')
     assert await d.updater.verify_startup(SimpleNamespace(hook_manager=hook)) is True
-    assert not d.updater.lock_file.exists()
+    assert not d.updater.lock_active()
 
 
 def test_startup_recovery_does_not_need_web_panel_context(tmp_path, monkeypatch):
@@ -481,6 +490,7 @@ def foreign(tmp_path):
 
 @pytest.mark.parametrize('form', ['include.path', 'includeIf.gitdir', 'includeIf.onbranch'])
 def test_included_git_config_cannot_redirect_update_source(deployment, foreign, tmp_path, form):
+    """Deployment configuration, includes and all, never takes part in the fetch."""
     d = deployment
     included = tmp_path / 'included.config'
     included.write_text(f'[url "{foreign}"]\n    insteadOf = {GITHUB_URL}.git\n')
@@ -491,9 +501,8 @@ def test_included_git_config_cannot_redirect_update_source(deployment, foreign, 
     }[form]
     git(d.work, 'config', '--local', key, str(included))
     result = asyncio.run(d.updater.check_for_updates())
-    assert result['can_update'] is False
-    assert 'insteadof' in result['error']
-    assert not d.requests
+    assert result['error'] is None
+    assert result['latest_version'] == d.target
 
 
 @pytest.mark.parametrize('scope', ['global', 'xdg', 'system'])
@@ -515,3 +524,119 @@ def test_global_and_system_git_config_are_ignored(deployment, foreign, tmp_path,
     result = asyncio.run(d.updater.check_for_updates())
     assert result['error'] is None
     assert result['latest_version'] == d.target
+
+
+def _url_named_source(d, monkeypatch):
+    """Serve the fixed source from a file:// URL; Git, like for https://, honours a remote named after it."""
+    url = f'file://{d.remote}'
+    monkeypatch.setattr('web.tools._updater.framework.GITHUB_URL', url[: -len('.git')])
+    return url
+
+
+def test_same_named_remote_cannot_redirect_the_fixed_source(deployment, foreign, monkeypatch):
+    d = deployment
+    url = _url_named_source(d, monkeypatch)
+    git(d.work, 'config', f'remote.{url}.url', str(foreign))
+    result = asyncio.run(d.updater.check_for_updates())
+    assert result['error'] is None
+    assert result['latest_version'] == d.target
+
+
+@pytest.mark.parametrize('variant', ['remote-url', 'remote-proxy'])
+def test_deployment_transport_settings_send_nothing_anywhere(deployment, monkeypatch, variant):
+    """Same-named remote URL/proxy plus an extra auth header must not produce a single request."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    received = []
+
+    class Receiver(BaseHTTPRequestHandler):
+        def do_GET(self):
+            received.append((self.path, self.headers.get('Authorization')))
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Receiver)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    d = deployment
+    url = _url_named_source(d, monkeypatch)
+    try:
+        if variant == 'remote-url':
+            git(d.work, 'config', f'remote.{url}.url', f'http://127.0.0.1:{server.server_port}/foreign.git')
+        else:
+            git(d.work, 'config', f'remote.{url}.url', 'http://review-only.invalid/foreign.git')
+            git(d.work, 'config', f'remote.{url}.proxy', f'http://127.0.0.1:{server.server_port}')
+        git(d.work, 'config', 'http.extraHeader', 'Authorization: Basic TEST_ONLY_DUMMY')
+        result = asyncio.run(d.updater.check_for_updates())
+    finally:
+        server.shutdown()
+    assert received == []
+    assert result['error'] is None
+    assert result['latest_version'] == d.target
+
+
+def test_proxy_and_git_variables_never_reach_git(monkeypatch):
+    for name in ('HTTP_PROXY', 'https_proxy', 'ALL_PROXY', 'GIT_DIR', 'GIT_CONFIG_PARAMETERS'):
+        monkeypatch.setenv(name, 'http://127.0.0.1:9')
+    env = supervisor.clean_git_env()
+    assert not {'HTTP_PROXY', 'https_proxy', 'ALL_PROXY', 'GIT_DIR', 'GIT_CONFIG_PARAMETERS'} & set(env)
+    assert env['GIT_CONFIG_NOSYSTEM'] == '1' and env['GIT_CONFIG_GLOBAL'] == os.devnull
+
+
+def _switch(d, monkeypatch):
+    app = SimpleNamespace(plugin_manager=None, _stop_event=asyncio.Event(), _restart_requested=False)
+    monkeypatch.setattr('web.tools._updater.framework.get_app', lambda: app)
+    real_popen = subprocess.Popen
+
+    def launch(command, *args, **kwargs):
+        if command[0] == 'git':
+            return real_popen(command, *args, **kwargs)
+        Path(command[1]).with_suffix('.ready').write_text(command[5])
+        return SimpleNamespace(pid=99999, poll=lambda: None)
+
+    monkeypatch.setattr(subprocess, 'Popen', launch)
+    return asyncio.run(d.updater.update_to_version(d.target))
+
+
+@pytest.mark.parametrize('surface', ['default-hook', 'hooks-path', 'fsmonitor'])
+def test_checkout_runs_no_hooks_or_fsmonitor(deployment, monkeypatch, tmp_path, surface):
+    d = deployment
+    marker = tmp_path / 'executed'
+    script = f'#!/bin/sh\necho ran >> {marker}\necho tampered > {d.work}/core.txt\n'
+    if surface == 'fsmonitor':
+        monitor = tmp_path / 'fsmonitor.sh'
+        monitor.write_text(script)
+        monitor.chmod(0o755)
+        git(d.work, 'config', 'core.fsmonitor', str(monitor))
+    else:
+        hooks = d.work / '.git/hooks' if surface == 'default-hook' else tmp_path / 'hooks'
+        hooks.mkdir(exist_ok=True)
+        for name in ('post-checkout', 'reference-transaction'):
+            (hooks / name).write_text(script)
+            (hooks / name).chmod(0o755)
+        if surface == 'hooks-path':
+            git(d.work, 'config', 'core.hooksPath', str(hooks))
+    result = _switch(d, monkeypatch)
+    assert result['success'] is True, result
+    assert not marker.exists()
+    assert (d.work / 'core.txt').read_text() == 'two'
+    assert git(d.work, 'rev-parse', 'HEAD') == d.target
+
+
+def test_github_tree_must_match_the_imported_commit(deployment, monkeypatch):
+    d = deployment
+    original = d.updater._fetch_api
+
+    async def api(path=''):
+        response = await original(path)
+        if path == f'/commits/{d.target}':
+            response['commit']['tree']['sha'] = '0' * 40
+        return response
+
+    monkeypatch.setattr(d.updater, '_fetch_api', api)
+    result = _switch(d, monkeypatch)
+    assert result['success'] is False
+    assert git(d.work, 'rev-parse', 'HEAD') == d.old

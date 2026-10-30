@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,13 +19,24 @@ import aiohttp
 
 from core.application import get_app
 from web.tools._updater.shared import GITHUB_API_URL, GITHUB_BRANCH, GITHUB_REPO, GITHUB_URL, log
-from web.tools._updater.supervisor import TERMINAL, TRANSACTION_ENV, lock_owner, read_state, release_lock, state_mutex, transition
+from web.tools._updater.supervisor import (
+    ACTIVE,
+    TRANSACTION_ENV,
+    acquire_deploy_lock,
+    clean_git_env,
+    deploy_git,
+    deploy_lock_held,
+    finish_rollback,
+    read_state,
+    state_mutex,
+    take_over,
+    transition,
+)
 
 _SHA_RE = re.compile(r'[0-9a-f]{8,40}')
 RECOVERY_REMINDER = '重启后请确认群成员并使用「群状态 恢复」重建群状态。'
 _WS_OK_PHASES = {'ready', 'recovering', 'replay_complete'}
-# Effective configuration keys that could change where or how personal is fetched.
-_SOURCE_OVERRIDE = re.compile(r'^(url\..*\.(insteadof|pushinsteadof)|http\.(.*\.)?(proxy|followredirects|sslverify|sslcainfo|sslcapath)|core\.gitproxy)$')
+_FETCH_REF = f'refs/remotes/qqbotforge-updates/{GITHUB_BRANCH}'
 
 
 def write_state(path, data):
@@ -42,12 +54,13 @@ class FrameworkUpdater:
     those guarantees. Terminal state and backup paths survive process restarts.
     """
 
-    def __init__(self, base_dir: str, *, ws_timeout: float = 90.0):
+    def __init__(self, base_dir: str, *, ws_timeout: float = 90.0, claim_timeout: float = 5.0):
         self.base_dir = Path(base_dir).resolve()
         self.version_file = self.base_dir / 'data' / 'version.json'
         self.pending_file = self.base_dir / 'data' / 'update_pending.json'
         self.lock_file = self.base_dir / 'data' / 'update.lock'
         self.ws_timeout = ws_timeout
+        self.claim_timeout = claim_timeout
         self.progress = dict(stage='idle', message='', progress=0, is_updating=False, config_diff=None)
         self._recovery_task = None
 
@@ -62,7 +75,7 @@ class FrameworkUpdater:
         if self.progress['is_updating']:
             return self.progress.copy()
         state = self._state()
-        if state.get('status') in ('awaiting_restart', 'awaiting_ws', 'switching', 'rolling_back'):
+        if state.get('status') in ACTIVE:
             return dict(
                 self.progress, stage='restarting', message=state.get('message', ''), progress=90, is_updating=True, backup_path=state.get('backup_path')
             )
@@ -106,19 +119,8 @@ class FrameworkUpdater:
         write_state(path, settings)
 
     def _run_git(self, *args):
-        # Deployment-specific Git environment must not redirect the fixed source.
-        env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
-        env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT='0')
-        try:
-            return subprocess.run(
-                ['git', '-c', 'http.followRedirects=false', '-c', 'http.proxy=', '-C', str(self.base_dir), *args],
-                capture_output=True,
-                text=True,
-                timeout=60,
-                env=env,
-            )
-        except FileNotFoundError:
-            return subprocess.CompletedProcess(args, 127, '', '未安装 git')
+        # Local commands only; the deployment repository never performs transport.
+        return deploy_git(self.base_dir, *args)
 
     def _git(self, *args):
         result = self._run_git(*args)
@@ -131,33 +133,52 @@ class FrameworkUpdater:
         return result.stdout.strip() if not result.returncode else ''
 
     def environment(self):
+        if os.name != 'posix':
+            return 'unsupported'  # the update locks rely on POSIX flock
         root = self._run_git('rev-parse', '--show-toplevel')
         return 'git' if not root.returncode and Path(root.stdout.strip()).resolve() == self.base_dir else 'non_git'
 
-    def _check_source_config(self):
-        """Reject effective settings that could redirect the fixed source.
-
-        Git cannot skip repository configuration for a command run inside the
-        repository, so the effective configuration Git itself will use is
-        expanded, including include.path and every includeIf form. System and
-        global files are already excluded by _run_git's environment.
-        """
-        listed = self._run_git('config', '--includes', '--list', '--show-scope', '-z')
-        if listed.returncode not in (0, 1):
-            raise RuntimeError('无法读取 Git 有效配置，已拒绝更新')
-        # Fields are "scope\0key\nvalue\0"; the updater's own -c overrides have scope "command".
-        fields = listed.stdout.split('\0')
-        keys = [entry.split('\n', 1)[0].lower() for scope, entry in zip(fields[::2], fields[1::2], strict=False) if scope != 'command']
-        found = sorted({k for k in keys if _SOURCE_OVERRIDE.match(k)})
-        if found:
-            raise RuntimeError('Git 配置（含 include/includeIf）中的 URL 重写或代理/重定向/证书设置可能改变更新来源，已拒绝更新: ' + ', '.join(found))
-
     def _fetch(self):
-        self._check_source_config()
-        self._git(
-            'fetch', '--no-tags', '--no-recurse-submodules', GITHUB_URL + '.git', f'+refs/heads/{GITHUB_BRANCH}:refs/remotes/qqbotforge-updates/{GITHUB_BRANCH}'
-        )
-        return self._git('rev-parse', f'refs/remotes/qqbotforge-updates/{GITHUB_BRANCH}^{{commit}}')
+        """Fetch personal in a throwaway repository, then import only its objects.
+
+        The deployment repository's configuration (remotes, URL rewrites,
+        proxies, extra headers, credential helpers, includes) never takes part
+        in transport: the fetch runs in a new bare repository with no system,
+        global or inherited Git settings and no proxy variables. Objects come
+        back through a bundle, which the deployment repository only unpacks.
+        """
+        objects = self._git('rev-parse', '--path-format=absolute', '--git-path', 'objects')
+        head = self._current_sha()
+        with tempfile.TemporaryDirectory(prefix='qqbotforge-fetch-') as scratch:
+            bare = Path(scratch, 'source.git')
+            env = clean_git_env(HOME=scratch)
+
+            def run(*args):
+                try:
+                    result = subprocess.run(['git', *args], capture_output=True, text=True, timeout=300, env=env)
+                except FileNotFoundError:
+                    raise RuntimeError('未安装 git') from None
+                if result.returncode:
+                    raise RuntimeError('Git 获取失败: ' + (result.stderr.strip() or args[0]))
+                return result.stdout.strip()
+
+            run('init', '-q', '--bare', str(bare))
+            # Reuse local objects so only new history is downloaded.
+            (bare / 'objects/info/alternates').write_text(objects + '\n', encoding='utf-8')
+            git = ('-C', str(bare), '-c', 'http.followRedirects=false', '-c', 'credential.helper=', '-c', 'core.alternateRefsCommand=exit 0')
+            if head:
+                run(*git, 'update-ref', 'refs/heads/base', head)
+            run(*git, 'fetch', '--no-tags', '--no-recurse-submodules', GITHUB_URL + '.git', f'+refs/heads/{GITHUB_BRANCH}:refs/heads/{GITHUB_BRANCH}')
+            tip = run(*git, 'rev-parse', '--verify', f'refs/heads/{GITHUB_BRANCH}^{{commit}}')
+            tree = run(*git, 'rev-parse', '--verify', f'{tip}^{{tree}}')
+            if self._run_git('cat-file', '-e', f'{tip}^{{commit}}').returncode:
+                bundle = Path(scratch, 'personal.bundle')
+                run(*git, 'bundle', 'create', str(bundle), f'refs/heads/{GITHUB_BRANCH}', *(['^refs/heads/base'] if head else []))
+                self._git('bundle', 'unbundle', str(bundle))
+        if self._git('rev-parse', '--verify', f'{tip}^{{tree}}') != tree:
+            raise RuntimeError('导入的提交与获取结果不一致')
+        self._git('update-ref', _FETCH_REF, tip)
+        return tip
 
     def _ancestor(self, old, target):
         return self._run_git('merge-base', '--is-ancestor', old, target).returncode == 0
@@ -215,7 +236,13 @@ class FrameworkUpdater:
                 status = 'success'
             else:
                 status = 'failure'
-            return {'status': status, 'checks': expected, 'run_id': run['id'] if run else None}
+            tree = None
+            if status == 'success':
+                commit = await self._fetch_api(f'/commits/{sha}')
+                if commit.get('sha') != sha:
+                    raise ValueError('GitHub 提交响应不匹配')
+                tree = commit['commit']['tree']['sha']
+            return {'status': status, 'checks': expected, 'run_id': run['id'] if run else None, 'tree': tree}
         except (AttributeError, KeyError, TypeError, ValueError, RuntimeError, aiohttp.ClientError, TimeoutError):
             return {'status': 'unknown', 'checks': []}
 
@@ -229,6 +256,8 @@ class FrameworkUpdater:
         result = dict(
             has_update=False, can_update=False, source={'repository': GITHUB_REPO, 'branch': GITHUB_BRANCH}, environment=self.environment(), error=None
         )
+        if result['environment'] == 'unsupported':
+            return dict(result, error='框架更新器仅支持 Linux/macOS 的 Git 部署')
         if result['environment'] != 'git':
             return dict(result, error='当前部署不是 Git 工作区，请拉取新镜像或重新 Git 部署')
         try:
@@ -301,38 +330,44 @@ class FrameworkUpdater:
                     shutil.rmtree(resolved)
             raise
 
-    def _stale_lock(self):
-        """A lock whose own transaction already finished, e.g. its releaser was killed."""
-        owner, state = lock_owner(self.base_dir), self._state()
-        return bool(owner) and state.get('transaction') == owner and state.get('status') in TERMINAL
-
     def lock_active(self):
-        return self.lock_file.exists() and not self._stale_lock()
+        """A live process is driving an update or verifying one."""
+        return deploy_lock_held(self.base_dir)
 
-    def _claim(self, transaction):
+    def _claim(self):
+        """Take the deployment lock, finishing any transaction a killed process left behind."""
         data_root = self.lock_file.parent.resolve()
         if not data_root.is_relative_to(self.base_dir) or data_root == self.base_dir:
             raise OSError('更新数据必须位于部署目录内部')
-        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
-        with state_mutex(self.base_dir):
-            if self._stale_lock():
-                self.lock_file.unlink()
-            with self.lock_file.open('x', encoding='utf-8') as lock:
-                lock.write(transaction)
+        fd = acquire_deploy_lock(self.base_dir, timeout=self.claim_timeout)
+        if fd is None:
+            raise FileExistsError(str(self.lock_file))
+        try:
+            take_over(self.base_dir)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+    def _local_changes(self):
+        return {p for p in self._git('diff', '--name-only', '-z', 'HEAD').split('\0') if p}
 
     async def update_to_version(self, version, skip_backup=False, auto_restart=True):
         del skip_backup, auto_restart
-        if self.environment() != 'git':
+        environment = self.environment()
+        if environment == 'unsupported':
+            return {'success': False, 'message': '框架更新器仅支持 Linux/macOS 的 Git 部署'}
+        if environment != 'git':
             return {'success': False, 'message': '当前部署不是 Git 工作区，请拉取新镜像或重新 Git 部署'}
         if not isinstance(version, str) or not _SHA_RE.fullmatch(version):
             return {'success': False, 'message': '目标版本必须是 8 至 40 位 Git SHA'}
         transaction = uuid4().hex
         try:
-            self._claim(transaction)
+            lock_fd = self._claim()
         except FileExistsError:
             return {'success': False, 'message': '已有更新或启动验证正在进行，请先查看更新结果'}
         except (OSError, TimeoutError):
-            return {'success': False, 'message': '无法创建更新锁，请检查运行目录写入权限'}
+            return {'success': False, 'message': '无法获取更新锁，请检查运行目录写入权限'}
         manager = None
         was_running = False
         switched = False
@@ -347,6 +382,9 @@ class FrameworkUpdater:
             ci = await self._ci_status(target)
             if ci['status'] != 'success':
                 raise RuntimeError(f'目标提交 CI 未成功（{ci["status"]}），拒绝更新')
+            target_tree = self._git('rev-parse', '--verify', f'{target}^{{tree}}')
+            if ci.get('tree') != target_tree:
+                raise RuntimeError('本地导入的目标提交与 GitHub 上 CI 通过的提交内容不一致')
             conflicts = self._conflicting_paths(old, target)
             if conflicts:
                 raise RuntimeError('本地改动与目标提交冲突: ' + ', '.join(conflicts))
@@ -368,6 +406,7 @@ class FrameworkUpdater:
                 created_at=datetime.now(UTC).isoformat(),
                 message='已备份数据库，正在切换版本',
                 recovery_reminder=RECOVERY_REMINDER,
+                phase='checking_out',
             )
             with state_mutex(self.base_dir):
                 write_state(self.pending_file, state)
@@ -376,12 +415,17 @@ class FrameworkUpdater:
             if manager:
                 manager.stop_watcher()
             self._report('updating', '正在切换 Git 提交', 70)
-            self._git('checkout', '--no-overwrite-ignore', '--detach', target)
+            local = self._local_changes()
             switched = True
-            state = transition(self.base_dir, transaction, ('switching',), status='awaiting_restart', message='等待重启和 WS 连接确认')
+            self._git('checkout', '--no-overwrite-ignore', '--detach', target)
+            # Hooks and fsmonitor are disabled; still prove the tracked files are the target's.
+            drift = {p for p in self._git('diff', '--name-only', '-z', target).split('\0') if p} - local
+            if self._current_sha() != target or drift:
+                raise RuntimeError('切换后工作区与目标提交不一致: ' + ', '.join(sorted(drift)[:10]))
+            state = transition(self.base_dir, transaction, ('switching',), status='awaiting_restart', message='等待重启和 WS 连接确认', phase='restarting')
             if not state:
                 raise RuntimeError('更新事务已被其他操作取代')
-            self._trigger_restart(app, guard, state)
+            self._trigger_restart(app, guard, state, lock_fd)
             self._report('completed', '已切换并安排重启；' + RECOVERY_REMINDER, 100)
             return dict(
                 success=True,
@@ -396,22 +440,21 @@ class FrameworkUpdater:
         except Exception as exc:
             message = str(exc)
             backup_path = (state or {}).get('backup_path')
-            active = ('switching', 'awaiting_restart')
             if switched:
-                try:
-                    self._git('checkout', '--no-overwrite-ignore', '--detach', old)
-                except RuntimeError:
-                    failure = '启动监护器失败且无法回退；请手动检查 Git 和数据库备份'
-                    transition(self.base_dir, transaction, active, status='rollback_failed', message=failure)
+                transition(self.base_dir, transaction, ('switching', 'awaiting_restart'), status='rolling_back', message=message, phase='checking_out')
+                if not finish_rollback(self.base_dir, transaction, message + '；已回到原提交'):
+                    failure = '更新失败且无法回退；请手动检查 Git 和数据库备份'
                     self._report('failed', failure)
                     return dict(success=False, message=failure, backup_path=backup_path)
+            elif state:
+                transition(self.base_dir, transaction, ('switching',), status='failed', message=message)
             if manager and was_running:
                 manager.start_watcher()
-            if state:
-                transition(self.base_dir, transaction, active, status='failed', message=message)
-            release_lock(self.base_dir, transaction)
             self._report('failed', message)
             return dict(success=False, message=message, backup_path=backup_path)
+        finally:
+            # The monitor holds its own inherited reference once started.
+            os.close(lock_fd)
 
     async def update_to_latest(self, skip_backup=False, auto_restart=True):
         if self.lock_active():
@@ -429,11 +472,12 @@ class FrameworkUpdater:
     def update_from_upload(self, *args, **kwargs):
         return {'success': False, 'message': '上传覆盖更新已禁用，请使用 personal Git 提交'}
 
-    def _trigger_restart(self, app, guard, state):
+    def _trigger_restart(self, app, guard, state, lock_fd):
         import psutil
 
         # The guard waits until this process exits, then owns the new process.
         # Do not use relaunch(): it would kill the guard as a descendant.
+        # It inherits the locked deployment-lock file, so the lock never lapses.
         process = subprocess.Popen(
             [
                 sys.executable,
@@ -443,11 +487,13 @@ class FrameworkUpdater:
                 str(psutil.Process().create_time()),
                 state['transaction'],
                 str(self.ws_timeout),
+                str(lock_fd),
                 sys.executable,
                 *sys.argv,
             ],
             cwd=self.base_dir,
             start_new_session=True,
+            pass_fds=(lock_fd,),
         )
         ready = guard.with_suffix('.ready')
         deadline = time.monotonic() + 5
@@ -467,41 +513,70 @@ class FrameworkUpdater:
         if not self._recovery_task or self._recovery_task.done():
             self._recovery_task = asyncio.create_task(self.verify_startup(app))
 
-    def _own_transaction(self, state):
-        """The transaction this process was started to verify.
-
-        The monitor passes it in the environment. A process started by hand
-        after its monitor died may adopt the waiting transaction instead,
-        since nobody else can act on it any more.
-        """
-        transaction = os.environ.get(TRANSACTION_ENV)
-        if transaction:
-            return transaction
-        import psutil
-
-        try:
-            monitor = psutil.Process(int(state['supervisor_pid']))
-            if abs(monitor.create_time() - float(state['supervisor_created'])) < 0.01 and monitor.is_running():
-                return None
-        except (KeyError, TypeError, ValueError, psutil.Error):
-            pass
-        return state.get('transaction')
-
-    async def verify_startup(self, app):
-        """Only real ready/recovering WS facts may acknowledge this process's own transaction."""
-        state = self._state()
-        transaction = self._own_transaction(state) if state.get('status') == 'awaiting_ws' else None
-        if not transaction or state.get('transaction') != transaction or self._current_sha() != state.get('target_sha'):
-            return False
-        while (current := self._state()).get('transaction') == transaction and current.get('status') == 'awaiting_ws':
+    async def _await_ws(self, app, transaction, deadline=None):
+        """Confirm the transaction once a real WebSocket is ready; False if it stops being ours."""
+        while (state := self._state()).get('transaction') == transaction and state.get('status') == 'awaiting_ws':
             statuses = app.hook_manager.connection_status.statuses
             if any(s.transport == 'websocket' and s.phase in _WS_OK_PHASES for s in statuses):
-                confirmed = transition(
-                    self.base_dir, transaction, ('awaiting_ws',), status='confirmed', message='新版本 WS 已连接，更新已确认；' + RECOVERY_REMINDER
-                )
-                if not confirmed:
-                    return False
-                release_lock(self.base_dir, transaction)
-                return True
+                message = '新版本 WS 已连接，更新已确认；' + RECOVERY_REMINDER
+                return bool(transition(self.base_dir, transaction, ('awaiting_ws',), status='confirmed', message=message, phase='done'))
+            if deadline is not None and time.monotonic() > deadline:
+                return False
+            if deadline is None and not deploy_lock_held(self.base_dir):
+                return None  # the monitor died: the caller takes over
             await asyncio.sleep(0.2)
         return False
+
+    async def verify_startup(self, app):
+        """Confirm this process's own update, or take over one whose driver was killed.
+
+        A process started by the monitor confirms the transaction named in its
+        environment while the monitor holds the deployment lock. Any other
+        start (manual restart, or the monitor died) takes the lock: switched
+        but unverified targets verify themselves within ws_timeout, everything
+        else is rolled back to the original commit.
+        """
+        state = self._state()
+        if state.get('status') not in ACTIVE:
+            return False
+        transaction = state.get('transaction')
+        if os.environ.get(TRANSACTION_ENV) == transaction and state.get('status') == 'awaiting_ws':
+            confirmed = await self._await_ws(app, transaction)
+            if confirmed is not None:
+                return confirmed
+        fd = await asyncio.to_thread(acquire_deploy_lock, self.base_dir, 1.0)
+        if fd is None:
+            return False
+        try:
+            head = self._current_sha()
+            outcome = {}
+
+            def adopt(current):
+                if head != current.get('target_sha'):
+                    return False
+                outcome['adopted'] = bool(
+                    transition(
+                        self.base_dir,
+                        current['transaction'],
+                        ('awaiting_restart', 'awaiting_ws'),
+                        status='awaiting_ws',
+                        phase='verifying',
+                        supervisor_pid=os.getpid(),
+                    )
+                )
+                return outcome['adopted']
+
+            await asyncio.to_thread(take_over, self.base_dir, adopt)
+            if outcome.get('adopted'):
+                if await self._await_ws(app, transaction, time.monotonic() + self.ws_timeout):
+                    return True
+                transition(self.base_dir, transaction, ('awaiting_ws',), status='rolling_back', message='WS 验证超时，正在回滚', phase='checking_out')
+                await asyncio.to_thread(finish_rollback, self.base_dir, transaction, '接管验证超时，已回滚原提交并重启；数据库备份已保留')
+            if self._current_sha() != head:
+                # The code on disk changed under this process: restart into it.
+                app._restart_requested = True
+                if app._stop_event:
+                    app._stop_event.set()
+            return False
+        finally:
+            os.close(fd)

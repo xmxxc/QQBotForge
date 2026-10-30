@@ -80,11 +80,25 @@ async def test_market_mirror_speed_test_streams_sse(market, monkeypatch):
 @pytest.mark.asyncio
 async def test_framework_fetch_ignores_market_mirror(market, monkeypatch):
     """The market preference must never reach the updater's Git fetch."""
+    import subprocess
+
     commands = []
-    updater = handlers.get_updater()
-    monkeypatch.setattr(updater, '_check_source_config', lambda: None, raising=False)
-    monkeypatch.setattr(updater, '_git', lambda *args: commands.append(args) or 'f' * 40)
-    updater._fetch()
-    fetch = next(c for c in commands if c[0] == 'fetch')
+    real_run = subprocess.run
+
+    class StopFetchError(Exception):
+        pass
+
+    def run(command, *args, **kwargs):
+        commands.append(command)
+        if 'fetch' in command:
+            raise StopFetchError
+        if 'init' in command:
+            return real_run(command, *args, **kwargs)
+        return subprocess.CompletedProcess(command, 0, 'f' * 40, '')
+
+    monkeypatch.setattr(subprocess, 'run', run)
+    with pytest.raises(StopFetchError):
+        handlers.get_updater()._fetch()
+    fetch = next(c for c in commands if 'fetch' in c)
     assert 'https://github.com/xmxxc/QQBotForge.git' in fetch
-    assert not any('old-mirror' in part for c in commands for part in c)
+    assert not any('old-mirror' in str(part) for c in commands for part in c)
