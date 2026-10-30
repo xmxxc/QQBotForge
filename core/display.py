@@ -48,7 +48,7 @@ def _native_id(value):
 
 
 def _suffix(native_id):
-    return f'…{clean_display_name(native_id[-4:]).translate(_MESSAGE_PUNCTUATION)}'
+    return f'…{native_id[-4:]}'
 
 
 def format_member(member_id, name=''):
