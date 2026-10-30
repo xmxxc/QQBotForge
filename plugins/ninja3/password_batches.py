@@ -158,7 +158,7 @@ class PasswordBatches:
             row = conn.execute(
                 "SELECT b.id FROM ninja3_password_batches b, json_each(b.payload, '$.items') item "
                 "WHERE b.bot=? AND json_extract(item.value, '$.task')=? "
-                "AND json_extract(item.value, '$.status') IN ('linked', 'dispatched') LIMIT 1",
+                "AND json_extract(item.value, '$.status')='dispatched' LIMIT 1",
                 (bot, task),
             ).fetchone()
             return row[0] if row else None
@@ -337,9 +337,23 @@ class PasswordBatches:
             return
         await self._update(bot, key, runner, index, status='linked', task=child['id'])
 
+        claimed_by_batch = False
+
         def still_running(conn: sqlite3.Connection) -> None:
-            # Same transaction as the task claim: a cancelled, interrupted or stale batch starts nothing.
-            self._running(conn, bot, key, runner)
+            # Same transaction as the task claim: a cancelled, interrupted or stale batch
+            # starts nothing. Only the batch that finds no active task may record that it
+            # dispatched the child; a replaying batch is an existing-task link.
+            nonlocal claimed_by_batch
+            batch = self._running(conn, bot, key, runner)
+            active = conn.execute(
+                'SELECT 1 FROM ninja3_password_tasks WHERE bot=? AND account=? AND active=1',
+                (bot, child['account']),
+            ).fetchone()
+            if active:
+                return
+            batch['items'][index].update(status='dispatched')
+            self._save(conn, bot, batch)
+            claimed_by_batch = True
 
         try:
             started = await self.tasks.confirm(bot, child['id'], actor, new_password=new_password, expect_digest=item['digest'], guard=still_running)
@@ -354,7 +368,7 @@ class PasswordBatches:
             log.error(f'[{bot}] 批量改密单项未能开始: {key}#{index}')
             await self._update(bot, key, runner, index, status='failed')
             return
-        if started['id'] != child['id']:
+        if started['id'] != child['id'] or not claimed_by_batch:
             await self._update(bot, key, runner, index, status='existing', task=started['id'])
             return
         worker = self.tasks.workers.get((bot, child['id']))

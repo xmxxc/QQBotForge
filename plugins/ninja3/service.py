@@ -327,18 +327,18 @@ class Ninja3:
 
     @staticmethod
     def outcome(result):
-        """Sender.reply returns the platform response dict; pushes return (ok, data, payload)."""
+        """A message ID is required to confirm delivery for replies and pushes."""
         if isinstance(result, tuple) and result and isinstance(result[0], bool):
             data = result[1] if len(result) > 1 else None
-            if result[0]:
-                return 'sent'
-            return 'unknown' if isinstance(data, dict) and unknown_code(data.get('code')) else 'failed'
+            if not result[0]:
+                return 'unknown' if isinstance(data, dict) and unknown_code(data.get('code')) else 'failed'
+            result = data
         if not isinstance(result, dict):
             return 'unknown'
         code = result.get('code')
-        if code in (None, 0):
-            return 'sent'
-        return 'unknown' if unknown_code(code) else 'failed'
+        if code not in (None, 0):
+            return 'unknown' if unknown_code(code) else 'failed'
+        return 'sent' if any(isinstance(result.get(key), str) and result[key].strip() for key in ('id', 'msg_id')) else 'unknown'
 
     async def reply(self, event, content, *, gate=None, **kwargs):
         """``gate`` is a synchronous freshness check for sensitive content.
@@ -393,7 +393,7 @@ class Ninja3:
     def is_owner(event):
         bot = event.appid
         blocked = event.user_id in get_blacklist_map(bot, 'user') or event.group_id in get_blacklist_map(bot, 'group')
-        return not blocked and event.user_id in (cfg.get_bot_config(bot) or {}).get('owner_ids', [])
+        return not blocked and event.raw_user_id in (cfg.get_bot_config(bot) or {}).get('owner_ids', [])
 
     async def authorize(self, event):
         bot, group = event.appid, event.group_id
@@ -1082,7 +1082,7 @@ class Ninja3:
             return
         if event.is_direct and not event.is_channel:
             await self.store.put(
-                bot, 'owners', 'observed_c2c', {'private_id': event.raw_user_id, 'authenticated_id': event.user_id, 'source': 'observed_owner_c2c'}
+                bot, 'owners', 'observed_c2c', {'private_id': event.raw_user_id, 'authenticated_id': event.raw_user_id, 'source': 'observed_owner_c2c'}
             )
         accounts = await self.store.all(bot, 'accounts')
         groups = await self.store.all(bot, 'groups')

@@ -31,7 +31,7 @@ async def ninja(account_host):
         )
         return response.status, await response.json()
 
-    async def say(text, *, user, group='group-a', bot='bot-a', mentions=(), at_bot=True, event_type='GROUP_AT_MESSAGE_CREATE'):
+    async def say(text, *, user, group='group-a', bot='bot-a', mentions=(), at_bot=True, event_type='GROUP_AT_MESSAGE_CREATE', union_id=''):
         from core.base import tasks
         from core.message.event import Event
 
@@ -42,7 +42,7 @@ async def ninja(account_host):
             bot,
             {
                 't': event_type,
-                'd': {'id': 'fake-message', 'content': content, 'group_openid': group, 'author': {'id': user, 'member_openid': user}, 'mentions': payload},
+                'd': {'id': 'fake-message', 'content': content, 'group_openid': group, 'author': {'id': user, 'member_openid': user, 'union_openid': union_id}, 'mentions': payload},
             },
         )
         before = set(tasks._background_tasks)
