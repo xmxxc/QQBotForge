@@ -8,6 +8,7 @@ from core.bot.event import EventHandlerMixin
 from core.display import display_group, display_member
 from core.message.event import GROUP_MESSAGE_CREATE, Event
 from core.message.parsers.channel import ChannelMessageParser
+from core.message.sender import MessageSender
 from core.storage.log import LogService
 
 
@@ -281,3 +282,188 @@ async def test_display_lookup_preserves_owner_only_dispatch(stored_names, api_co
             assert await asyncio.wait_for(replies.get(), timeout=1) == expected
             assert event.user_id == member_id
     await manager.unload('display_permission')
+
+
+@pytest.mark.parametrize('msg_type', [0, 2])
+@pytest.mark.parametrize(('name', 'literal'), [
+    ('**系统提示** <@member>', '＊＊系统提示＊＊ ＜＠member＞'),
+    ('@全体 @all @everyone <@!123>', '＠全体 ＠all ＠everyone ＜＠！123＞'),
+    ('[确认](https://example.invalid)', '［确认］（https：／／example．invalid）'),
+    ('![图片](//example.invalid/a)', '！［图片］（／／example．invalid／a）'),
+    ('https://x.invalid www.x.invalid a@x.invalid', 'https：／／x．invalid www．x．invalid a＠x．invalid'),
+    ('_*~`[]()#>|\\+-=!', '＿＊～｀［］（）＃＞｜＼＋－＝！'),
+])
+@pytest.mark.asyncio
+async def test_display_names_are_literal_text_in_real_message_payloads(stored_names, monkeypatch, msg_type, name, literal):
+    from core.display import format_member
+
+    _, _, service = stored_names
+    await service.db_execute('INSERT INTO users(user_id,name) VALUES(?,?)', ('member-81CB', name))
+    await service.db_execute('INSERT INTO groups_users(group_id,group_name) VALUES(?,?)', ('group', name))
+    monkeypatch.setattr('core.message.sender.cfg.get_bot_setting', lambda appid, key, default=None: default)
+    sender = MessageSender(SimpleNamespace(appid='app'))
+    labels = [format_member('member-81CB', name), await display_member('app', 'member-81CB'), await display_group('app', 'group')]
+    for label, expected in zip(labels, (literal + '（…81CB）', literal + '（…81CB）', literal), strict=True):
+        payload = sender._build_core_payload('成员：' + label, None, None, msg_type)
+        text = payload['markdown']['content'] if msg_type == 2 else payload['content']
+        assert payload['msg_type'] == msg_type
+        assert text == '成员：' + expected
+
+
+@pytest.mark.parametrize('use_union_id', [False, True])
+@pytest.mark.asyncio
+async def test_application_observes_names_before_async_hooks_reorder_events(stored_names, api_config_dir, monkeypatch, use_union_id):
+    from core.base.config import cfg
+
+    cfg._ready = False
+    cfg.init(f'{api_config_dir}/config')
+    app, bot, service = stored_names
+    bot.name = '测试 Bot'
+    bot.appid = 'app'
+    entered, release = asyncio.Event(), asyncio.Event()
+    seen_ids = []
+
+    async def delay_old(event):
+        seen_ids.append(event.user_id)
+        if event.username == '旧名':
+            entered.set()
+            await release.wait()
+        return event
+
+    app._hook_manager.register('before_event', delay_old, owner='test-module')
+    monkeypatch.setattr('core.bot.event.cfg.get_bot_setting',
+                        lambda appid, key, default=None: use_union_id if key == 'identity.use_union_id_for_group' else default)
+
+    def make_event(name):
+        event = Event()
+        event.appid = 'app'
+        event.event_type = 'C2C_MESSAGE_CREATE'
+        event.user_id = event.raw_user_id = 'native'
+        event.union_openid = 'union'
+        event.username = name
+        event.mentions = [{'id': 'mentioned', 'username': name}]
+        return event
+
+    old_event, new_event = make_event('旧名'), make_event('新名')
+    old_task = asyncio.create_task(app._on_event(old_event))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        await app._on_event(new_event)
+    finally:
+        release.set()
+        await old_task
+    await app._track_queue.join()
+    await service._flush_data_queue()
+    effective_id = 'union' if use_union_id else 'native'
+    assert await display_member('app', effective_id) == '新名（…' + effective_id[-4:] + '）'
+    assert await display_member('app', 'mentioned') == '新名（…oned）'
+    assert seen_ids == [effective_id, effective_id]
+    assert old_event.user_id == new_event.user_id == effective_id
+    assert old_event.raw_user_id == new_event.raw_user_id == 'native'
+    assert old_event.union_openid == new_event.union_openid == ('native' if use_union_id else 'union')
+
+
+@pytest.mark.parametrize('mode', ['empty', 'error', 'exception'])
+@pytest.mark.asyncio
+async def test_missing_group_name_retries_only_after_negative_cache_expires(stored_names, monkeypatch, mode):
+    app, bot, service = stored_names
+    bot.sender = MessageSender(SimpleNamespace(appid='app'))
+    bot.sender.bind_instance(log_service=service)
+    calls = []
+    clock = [1000.0]
+    monkeypatch.setattr('core.display.monotonic', lambda: clock[0], raising=False)
+
+    async def request_group(sender, group_id, endpoint, **kwargs):
+        calls.append(group_id)
+        if mode == 'exception':
+            raise RuntimeError('platform unavailable')
+        if mode == 'error':
+            return False, {'message': 'platform unavailable'}
+        return True, {'group_name': ''}
+
+    monkeypatch.setattr(MessageSender, '_request_group', request_group)
+    for _ in range(20):
+        assert await app.display_group('app', 'group') == '未知群（…roup）'
+    assert calls == ['group']
+    clock[0] += 299
+    assert await display_group('app', 'group') == '未知群（…roup）'
+    assert calls == ['group']
+    clock[0] += 2
+    assert await display_group('app', 'group') == '未知群（…roup）'
+    assert calls == ['group', 'group']
+
+
+@pytest.mark.asyncio
+async def test_cancelled_group_name_waiter_does_not_cancel_shared_lookup(stored_names, monkeypatch):
+    _, bot, service = stored_names
+    bot.sender = MessageSender(SimpleNamespace(appid='app'))
+    bot.sender.bind_instance(log_service=service)
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def request_group(sender, group_id, endpoint, **kwargs):
+        calls.append(group_id)
+        entered.set()
+        await release.wait()
+        return True, {'group_name': '群名'}
+
+    monkeypatch.setattr(MessageSender, '_request_group', request_group)
+    first = asyncio.create_task(display_group('app', 'group'))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        remaining = asyncio.create_task(display_group('app', 'group'))
+    finally:
+        release.set()
+    assert await remaining == '群名'
+    assert calls == ['group']
+
+
+@pytest.mark.asyncio
+async def test_concurrent_group_name_misses_share_one_request_and_are_bot_scoped(stored_names, monkeypatch):
+    from core.display import display_group_for_bot
+
+    _, bot, service = stored_names
+    bot.sender = MessageSender(SimpleNamespace(appid='app'))
+    bot.sender.bind_instance(log_service=service)
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def request_group(sender, group_id, endpoint, **kwargs):
+        calls.append((sender._appid, group_id))
+        entered.set()
+        await release.wait()
+        return True, {'group_name': ''}
+
+    monkeypatch.setattr(MessageSender, '_request_group', request_group)
+    queries = [asyncio.create_task(display_group('app', 'group')) for _ in range(20)]
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+    finally:
+        release.set()
+    assert await asyncio.gather(*queries) == ['未知群（…roup）'] * 20
+    assert calls == [('app', 'group')]
+    other = SimpleNamespace(log_service=_FakeLogService(), sender=MessageSender(SimpleNamespace(appid='other-app')))
+    assert await display_group_for_bot(other, 'group') == '未知群（…roup）'
+    assert calls == [('app', 'group'), ('other-app', 'group')]
+
+
+@pytest.mark.asyncio
+async def test_group_name_observed_during_negative_cache_is_immediately_readable(stored_names, monkeypatch):
+    _, bot, service = stored_names
+    bot.sender = MessageSender(SimpleNamespace(appid='app'))
+    bot.sender.bind_instance(log_service=service)
+    names = iter(('', '新群名'))
+    calls = []
+
+    async def request_group(sender, group_id, endpoint, **kwargs):
+        calls.append(group_id)
+        return True, {'group_name': next(names)}
+
+    monkeypatch.setattr(MessageSender, '_request_group', request_group)
+    assert await display_group('app', 'group') == '未知群（…roup）'
+    await bot.sender.get_group_info('group')
+    assert await display_group('app', 'group') == '新群名'
+    assert calls == ['group', 'group']
