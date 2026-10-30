@@ -1,0 +1,108 @@
+name: Check upstream and propose sync
+
+on:
+  schedule:
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  propose:
+    if: github.repository == 'xmxxc/QQBotForge'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      pr: ${{ steps.proposal.outputs.pr_number }}
+      upstream: ${{ steps.proposal.outputs.upstream_sha }}
+      base: ${{ steps.proposal.outputs.base_sha }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: main
+          persist-credentials: false
+      - id: proposal
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/sync-upstream.py
+
+  check:
+    needs: propose
+    if: needs.propose.outputs.pr != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CI_ASSETS_REPOSITORY: xmxxc/QQBotForge
+      CI_ASSETS_SHA: 5fd275ee4621e6a4bfc90f45b198a0084acfbb4a
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: refs/pull/${{ needs.propose.outputs.pr }}/merge
+          path: source
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify the proposed parents and record the merge tree
+        env:
+          EXPECTED_BASE: ${{ needs.propose.outputs.base }}
+          EXPECTED_UPSTREAM: ${{ needs.propose.outputs.upstream }}
+        run: |
+          test "$(git -C source rev-parse HEAD^1)" = "$EXPECTED_BASE"
+          test "$(git -C source rev-parse HEAD^2)" = "$EXPECTED_UPSTREAM"
+          git -C source show -s --format='source %H tree %T parents %P'
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ env.CI_ASSETS_REPOSITORY }}
+          ref: ${{ env.CI_ASSETS_SHA }}
+          path: ci-assets
+          sparse-checkout: tests
+          persist-credentials: false
+      - name: Stage pinned test assets
+        run: |
+          test "$(git -C ci-assets rev-parse HEAD)" = "$CI_ASSETS_SHA"
+          bash source/.github/scripts/stage-ci-assets.sh source ci-assets
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - name: Install dependencies
+        working-directory: source
+        run: |
+          pip install -r requirements.txt
+          pip install "pytest>=9.1,<10.0" pytest-asyncio pytest-cov "mypy>=2.2,<3.0" "ruff>=0.15,<0.16" types-PyYAML
+      - name: Ruff
+        working-directory: source
+        run: ruff check .
+      - name: Mypy
+        working-directory: source
+        run: mypy core web main.py
+      - name: Pytest
+        working-directory: source
+        run: pytest -q -rs
+
+  report:
+    needs: [propose, check]
+    if: always() && needs.propose.outputs.pr != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Link the exact upstream candidate and CI result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: xmxxc/QQBotForge
+          PR: ${{ needs.propose.outputs.pr }}
+          UPSTREAM: ${{ needs.propose.outputs.upstream }}
+          BASE: ${{ needs.propose.outputs.base }}
+          RESULT: ${{ needs.check.result }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          printf '上游同步只读 CI：%s\n\n上游 `%s`；main `%s`。\n\n验证日志：%s\n\n本结果不是 PR 必需检查的替代；待主人审查与决定合并。\n' "$RESULT" "$UPSTREAM" "$BASE" "$RUN_URL" > "$RUNNER_TEMP/sync-result.md"
+          gh pr comment "$PR" --body-file "$RUNNER_TEMP/sync-result.md"

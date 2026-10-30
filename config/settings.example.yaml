@@ -28,12 +28,10 @@ statistics:
   schedule_hour: 4                           # 每日聚合时间 - 小时(默认凌晨4点)
   schedule_minute: 0                         # 每日聚合时间 - 分钟
 
-# 框架自动更新（默认开启，更新源为 ElainaCore/ElainaBot_v2）
-# 开启后每 10 分钟检查一次；更新前自动备份，更新成功后自动重启。
-# 更新内容、更新结果和重启完成通知会主动私聊第一个机器人的第一个主人。
+# 框架更新仅支持后台或主人菜单手动触发，更新源固定为本仓库 personal。
+# 非 Git 部署请拉取新的 Docker 镜像；不会解压覆盖运行目录。
 auto_update:
-  enabled: true
-  interval_seconds: 600
+  enabled: false
 
 logging:
   dir: "log"                                 # 日志根目录(相对框架目录)

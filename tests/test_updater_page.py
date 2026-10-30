@@ -1,0 +1,52 @@
+"""Render the shipped ES module with Vue stubs and verify its visible contract."""
+
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+
+@pytest.mark.skipif(not shutil.which('node'), reason='Node unavailable')
+def test_update_page_shows_commit_ci_gap_and_manual_action(tmp_path):
+    asset = Path(__file__).parents[1] / 'web/dist/assets/Update.js'
+    source = asset.read_text()
+    import re
+
+    source = re.sub(r'import[^;]+;', '', source)
+    module = tmp_path / 'Update.mjs'
+    module.write_text(
+        """
+const callbacks = [];
+const ref = value => ({value});
+const onMounted = cb => callbacks.push(cb);
+const onUnmounted = () => {};
+const h = (tag, props, children) => ({tag, props, children});
+const unwrap = response => response.data;
+const api = {get: async path => ({data: path.endsWith('/check') ? {
+    source: {repository: 'xmxxc/QQBotForge', branch: 'personal'}, current_version: 'abc12345',
+    latest_version: 'def67890', gap: 3, ci_status: 'pending', can_update: false, has_update: true
+} : path.endsWith('/version') ? {version: 'abc12345'} : []})};
+"""
+        + source
+        + """
+const render = Update.setup();
+await Promise.all(callbacks.map(cb => cb()));
+const tree = render();
+const text = JSON.stringify(tree);
+for (const expected of ['personal', 'def67890', 'pending', '差距', '3', '检查更新', '更新到最新']) {
+    if (!text.includes(expected)) throw new Error('missing ' + expected);
+}
+if (text.includes('镜像选择') || text.includes('上传更新包') || text.includes('跳过备份')) throw new Error('obsolete controls');
+function visit(node) {
+    if (!node || typeof node !== 'object') return;
+    if (node.tag === 'button' && node.children === '更新到最新' && node.props.disabled !== true) throw new Error('unsafe enabled update');
+    for (const value of Object.values(node)) {
+        if (Array.isArray(value)) value.forEach(visit); else visit(value);
+    }
+}
+visit(tree);
+"""
+    )
+    result = subprocess.run(['node', str(module)], capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr

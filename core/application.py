@@ -22,7 +22,6 @@ from core.module.hook import HookManager
 from core.module.manager import ModuleManager
 from core.plugin.manager import PluginManager
 from core.server.http_server import HttpServer
-from core.services.auto_update import AutoUpdateService
 from core.services.config_watcher import ConfigWatcherService
 from core.services.health_watch import HealthWatchService
 from core.services.media_cleanup import MediaCleanupService
@@ -129,7 +128,7 @@ class Application(EventHandlerMixin):
         # 服务
         self._config_watcher: ConfigWatcherService | None = None
         self._media_cleanup: MediaCleanupService | None = None
-        self._auto_update: AutoUpdateService | None = None
+        self._auto_update = None  # compatibility slot; scheduled updates are removed
         self._restart_scheduler: RestartScheduler | None = None
         self._health_watch: HealthWatchService | None = None
 
@@ -298,13 +297,18 @@ class Application(EventHandlerMixin):
         # 10) 后台服务
         self._config_watcher = ConfigWatcherService(interval=5.0)
         self._media_cleanup = MediaCleanupService(media_dir=self._media_dir, max_age_days=3, interval=3600)
-        self._auto_update = AutoUpdateService(self._base_dir, self)
         self._restart_scheduler = RestartScheduler(on_restart=self._trigger_restart)
         self._health_watch = HealthWatchService(self)
 
-        for svc in (self._config_watcher, self._media_cleanup, self._auto_update,
-                    self._restart_scheduler, self._health_watch):
+        for svc in (self._config_watcher, self._media_cleanup, self._restart_scheduler, self._health_watch):
             svc.start()
+
+        try:
+            from web.tools._updater.handlers import get_updater
+
+            get_updater(self._base_dir).schedule_startup_recovery(self)
+        except Exception:
+            log.debug('更新启动恢复未启用', exc_info=True)
 
         _tune_gc()
 
@@ -355,8 +359,7 @@ class Application(EventHandlerMixin):
             self._plugin_manager.stop_watcher()
 
         # 停止后台服务
-        for svc in (self._config_watcher, self._media_cleanup, self._auto_update,
-                    self._restart_scheduler, self._health_watch):
+        for svc in (self._config_watcher, self._media_cleanup, self._restart_scheduler, self._health_watch):
             if svc:
                 svc.stop()
 
