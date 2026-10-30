@@ -119,7 +119,7 @@ async def test_owner_mention_grant_covers_future_accounts_and_member_queries_pub
     host = ninja
     await host.setup(description='', url='')
     # The member was never verified, rostered or bound: the owner's command is the in-group evidence.
-    assert await grant(host) == ['已授权该成员查询本群开放账号，长期有效']
+    assert await grant(host) == ['已授权 未知成员（…BERA）在 未知群（…up-a） 查询忍3开放账号，长期有效']
     fact = await host.state.fact('bot-a', 'group-a', 'MEMBERA')
     assert fact['usable'] and fact['member']['source'] == 'owner_confirmed' and '授权 @成员' in fact['member']['evidence']
     snapshot = await host.access.access_snapshot('bot-a', 'ninja3')
@@ -135,7 +135,7 @@ async def test_owner_mention_grant_covers_future_accounts_and_member_queries_pub
     # A later account opened in this group is covered by the same grant; repeat grants add nothing.
     await host.setup(name='账号B', password='fake-b', description='说明B')
     assert await host.say('账号 账号B', user='MEMBERA', at_bot=False) == ['名称：账号B\n说明：说明B', 'fake-login', 'fake-b']
-    assert await grant(host) == ['该成员已有本群授权']
+    assert await grant(host) == ['未知成员（…BERA）已有 未知群（…up-a） 的忍3查询授权']
     assert len(grants(await host.access.access_snapshot('bot-a', 'ninja3'))) == 1
     assert '账号查询 group=group-a member=MEMBERA result=sent' in caplog.text and SECRET not in caplog.text and 'fake-b' not in caplog.text
 
@@ -244,7 +244,7 @@ async def test_denial_wins_and_disable_close_rescope_delete_take_effect(ninja):
     assert await host.say('账号 账号A', user='MEMBERA') == ['你暂无查询权限']
     assert not [m for m in host.sender.messages if m[0] == 'push'] and not (await host.ninja_api('GET', 'notices'))[1]['data']
     # A repeated owner grant cannot lift the denial.
-    assert await grant(host) == ['该成员已有本群授权\n该成员在拒绝名单中，拒绝优先，当前仍不能查询']
+    assert await grant(host) == ['未知成员（…BERA）已有 未知群（…up-a） 的忍3查询授权\n该成员在拒绝名单中，拒绝优先，当前仍不能查询']
     await acl.manage_access('bot-a', 'ninja3', 'allow', function='query', group='group-a', member='MEMBERA')
     assert SECRET in str(await host.say('账号 账号A', user='MEMBERA'))
     await host.ninja_api('PATCH', 'accounts/' + account['id'], {'enabled': False})

@@ -53,7 +53,7 @@ async def test_owner_entry_points_use_native_identity(changing, union_mode, nati
     cfg.set_bot_setting('bot-a', 'identity.use_union_id_for_group', union_mode)
     reply = await host.say(command, user=native_id, union_id=union_id, mentions=['MEMBERB'] if command == '授权' else [])
     if command == '授权':
-        assert reply == ['已授权该成员查询本群开放账号，长期有效'] if owner else reply == ['仅主人可以授权']
+        assert reply == ['已授权 未知成员（…BERB）在 未知群（…up-a） 查询忍3开放账号，长期有效'] if owner else reply == ['仅主人可以授权']
     elif command.startswith('忍3') and command.endswith('改密'):
         assert ('尚未选择账号' in str(reply)) == owner
         assert ('仅主人可以操作改密任务' in str(reply)) == (not owner)

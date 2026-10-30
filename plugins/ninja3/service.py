@@ -22,6 +22,7 @@ from core.base.config import cfg
 from core.base.logger import PLUGIN, get_logger
 from core.plugin._blacklist import get_blacklist_map
 
+from . import owner_commands
 from .emergency import EmergencyError, EmergencyMode
 from .password_batches import OUTCOMES, PasswordBatches
 from .password_tasks import PasswordTasks, TaskError
@@ -97,6 +98,8 @@ class Ninja3:
         self.writes = {}
         self.notice_locks = {}
         self.menus = {}  # Process-local references: reload invalidates every old menu.
+        self.confirmations = owner_commands.Confirmations(self)  # Process-local too: reload invalidates pending buttons.
+        self.owner_commands = owner_commands.OwnerCommands(self)
         self.password_tasks = PasswordTasks(self.store, notify=self.password_receipt, on_change=self._task_changed, clock=clock)
         self.password_batches = PasswordBatches(self.store, self.password_tasks, notify=self.password_batch_receipt, clock=clock)
         self.emergency = EmergencyMode(self.store, self.password_tasks, notify=self.emergency_receipt, clock=clock)
@@ -395,85 +398,9 @@ class Ninja3:
         blocked = event.user_id in get_blacklist_map(bot, 'user') or event.group_id in get_blacklist_map(bot, 'group')
         return not blocked and event.raw_user_id in (cfg.get_bot_config(bot) or {}).get('owner_ids', [])
 
-    async def authorize(self, event):
-        bot, group = event.appid, event.group_id
-        if self.emergency.active(bot):
-            if event.is_group and self.is_owner(event):
-                await self.owner_private(bot, '紧急模式已开启，成员查询与授权操作暂停')
-            return
-        if not event.is_group or event.is_channel or not group:
-            await self.reply(event, '请在要开放的群内发送：授权 @成员')
-            return
-        if not self.is_owner(event):
-            await self.reply(event, '仅主人可以授权')
-            return
-        targets = {
-            m['id']
-            for m in event.mentions
-            if isinstance(m, dict) and isinstance(m.get('id'), str) and m['id'] and not m.get('is_you') and not m.get('bot') and m.get('scope') != 'all'
-        }
-        if (event.content or '').strip() != '授权' or len(targets) != 1:
-            # Display names and typed IDs are never identities; only the native mention payload is.
-            await self.reply(event, '请发送“授权”并 @ 一位要授权的成员')
-            return
-        member = targets.pop()
-        try:
-            acl = self.access()
-            # The owner's grant; declaration never touches an existing policy scope.
-            await self.declare(acl, bot)
-            facts = acl.group_state()
-            if facts is None:
-                await self.reply(event, '授权待处理：群状态模块未启用')
-                return
-            proof = await facts.fact(bot, group, member)
-            if proof['reason'] in PAUSED:
-                await self.reply(event, '授权待处理：群状态恢复未完成，请先发送“群状态 恢复”，完成后重新授权')
-                return
-            if not proof['usable'] or (proof['member'] or {}).get('status') != 'present':
-                # The owner's explicit command in this group is the evidence; a member's message never is.
-                evidence = f'主人在本群发送“授权 @成员”（消息 {event.message_id or "未知"}）'
-                confirmed = await facts.confirm_member(bot, group, member, evidence=evidence[:1000])
-                if not confirmed.get('reliable'):
-                    await self.reply(event, '授权待处理：成员在群事实未能确认，请稍后重试')
-                    return
-                proof = await facts.fact(bot, group, member)
-            cycle = (proof['member'] or {}).get('cycle')
-            snapshot = await acl.access_snapshot(bot, CONSUMER)
-            existing = next(
-                (
-                    g
-                    for g in snapshot['grants']
-                    if g['group'] == group
-                    and g['member'] == member
-                    and g['cycle'] == cycle
-                    and g.get('mode') == 'continuous'
-                    and g.get('resource_scope') == GRANT['resource_scope']
-                    and g['expires_at'] is None
-                    # An automatic join source lapses with its join basis; the owner's grant stands alone.
-                    and g.get('basis') != 'native_join'
-                ),
-                None,
-            )
-            source = existing or await acl.manage_access(bot, CONSUMER, 'grant', function=FUNCTION, group=group, member=member, **GRANT)
-            decision = await acl.evaluate(bot, CONSUMER, FUNCTION, group, member, action='invoke')
-            opened = await self.store.get(bot, 'groups', group)
-        except BusinessError as error:
-            await self.reply(event, f'授权待处理：{error}')
-            return
-        except ValueError as error:
-            await self.reply(event, f'授权未完成：{error}')
-            return
-        except (RuntimeError, sqlite3.Error, OSError) as error:
-            log.error(f'[{bot}] 授权失败: {type(error).__name__}')
-            await self.reply(event, '授权未完成：授权或群状态存储暂不可用，请检查后台')
-            return
-        log.info(f'[{bot}] 授权 group={group} member={member} source={source["id"]} existing={existing is not None}')
-        lines = ['该成员已有本群授权' if existing else '已授权该成员查询本群开放账号，长期有效']
-        if decision['reason'] in {'denied', 'framework_denied'}:
-            lines.append('该成员在拒绝名单中，拒绝优先，当前仍不能查询')
-        if not (opened and opened['enabled']):
-            lines.append('本群尚未开放，请在后台开放本群及账号后生效')
-        await self.reply(event, '\n'.join(lines))
+    async def owner_command(self, event, name):
+        """``@Bot <命令> @成员`` short commands; see owner_commands."""
+        await self.owner_commands.run(event, name)
 
     def account_paused(self, bot, account):
         """Current durable task pause; future emergency checks must be ORed, never reset here."""
@@ -998,6 +925,10 @@ class Ninja3:
             and event.raw_user_id not in get_blacklist_map(event.appid, 'user')
             and event.group_id not in get_blacklist_map(event.appid, 'group')
         ):
+            return
+        confirm = re.fullmatch(r'n3:(ok|no):([0-9a-f]{32})', event.content or '')
+        if confirm:
+            await self.confirmations.click(event, confirm[1] == 'ok', confirm[2])
             return
         match = re.fullmatch(r'n3:([0-9a-f]{32}):([1-9][0-9]?)', event.content or '')
         if match:

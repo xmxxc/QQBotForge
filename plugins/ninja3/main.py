@@ -8,6 +8,7 @@ from core.plugin import context
 from core.plugin.decorators import handler, interceptor, on_load, on_unload
 from core.plugin.web_pages import register_page, register_route, unregister_page, unregister_route
 
+from .owner_commands import COMMANDS as OWNER_COMMANDS
 from .service import PREFIX, UNAVAILABLE, Ninja3
 
 __plugin_meta__ = {'name': '忍者必须死3', 'description': '主人维护账号，授权成员在开放群内查询', 'version': '1.0.0'}
@@ -54,7 +55,7 @@ async def unload():
 
 
 @handler(
-    r'^(?:忍3(?:批量(?:改密|确认|任务|取消)|改密|确认|重试|任务|取消|恢复|核验|放弃|紧急模式|退出紧急模式|紧急状态)(?:\s.*)?|授权(?:\s.*)?|账号列表|账号\s+\S.*|忍3)$',
+    r'^(?:忍3(?:批量(?:改密|确认|任务|取消)|改密|确认|重试|任务|取消|恢复|核验|放弃|紧急模式|退出紧急模式|紧急状态)(?:\s.*)?|(?:授权|撤销|拉黑|解除拉黑|确认在群)(?:\s.*)?|为什么|账号列表|账号\s+\S.*|忍3)$',
     name='忍者必须死3',
     priority=20,
     block=True,
@@ -69,8 +70,8 @@ async def entry(event, _match):
         await _instance.emergency_command(event)
     elif content.startswith(('忍3批量', '忍3改密', '忍3确认', '忍3重试', '忍3任务', '忍3取消', '忍3恢复', '忍3核验', '忍3放弃')):
         await _instance.password_command(event)
-    elif content.startswith('授权'):
-        await _instance.authorize(event)
+    elif content.split(maxsplit=1)[0] in OWNER_COMMANDS:
+        await _instance.owner_command(event, content.split(maxsplit=1)[0])
     elif content == '账号列表':
         await _instance.query(event)
     elif content == '忍3':
