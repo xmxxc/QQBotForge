@@ -12,6 +12,7 @@ from itertools import islice
 from core.base.config import cfg
 from core.base.logger import FRAMEWORK, get_logger, report_error
 from core.base.tasks import spawn
+from core.display import clean_display_name, queue_member_name
 from core.message.event import (
     FRIEND_ADD,
     FRIEND_DEL,
@@ -151,6 +152,28 @@ class EventHandlerMixin:
 
     # ==================== 用户追踪后台队列 ====================
 
+    @staticmethod
+    def _mention_names(event):
+        """提取非机器人 @成员的最新名字，供后台写入 users 表。"""
+        result = []
+        for mention in getattr(event, 'mentions', ()) or ():
+            if not isinstance(mention, dict):
+                continue
+            if mention.get('bot') or mention.get('is_you'):
+                continue
+            user_id = next(
+                (
+                    mention.get(key)
+                    for key in ('member_openid', 'id', 'user_id', 'openid')
+                    if mention.get(key)
+                ),
+                '',
+            )
+            name = clean_display_name(mention.get('username', ''))
+            if user_id and name:
+                result.append((str(user_id), name))
+        return tuple(result)
+
     def _ensure_track_workers(self):
         """惰性创建用户追踪队列与 worker (需在事件循环内调用)"""
         if self._track_queue is not None:
@@ -158,15 +181,23 @@ class EventHandlerMixin:
         self._track_queue = asyncio.Queue(maxsize=_TRACK_QUEUE_MAX)
         self._track_workers = [asyncio.create_task(self._track_worker()) for _ in range(_TRACK_WORKERS)]
 
-    def _enqueue_track(self, bot, event, appid):
+    def _queue_event_names(self, bot, event):
+        log_service = getattr(bot, 'log_service', None)
+        for member_id, name in (*self._mention_names(event), (event.user_id, getattr(event, 'username', ''))):
+            queue_member_name(log_service, member_id, name)
+
+    def _enqueue_track(self, bot, event, appid, *, observe_names=True):
         """投递用户追踪任务: 群消息同键短时去重削峰; 队列满时转入合并缓冲, 不丢弃"""
         self._ensure_track_workers()
         uid = str(event.user_id or '')
         gid = event.group_id or ''
+        username = clean_display_name(getattr(event, 'username', '') or '')
+        if observe_names:
+            self._queue_event_names(bot, event)
         if event.is_group and gid:
             # 追踪对同(用户/群/角色/当天)幂等, 同键短时重复无新信息, 跳过以削减洪峰任务量
             key = (appid, event.user_id, gid, event.member_role or '',
-                   bool(getattr(event, 'username', '')), bool(getattr(event, 'is_bot', False)))
+                   bool(username), bool(getattr(event, 'is_bot', False)))
             now = time.time()
             if now > self._track_recent_purge:
                 self._track_recent_purge = now + _CACHE_PRUNE_INTERVAL
@@ -182,7 +213,7 @@ class EventHandlerMixin:
             appid=str(appid),
             uid=uid,
             gid=gid,
-            username=getattr(event, 'username', '') or '',
+            username=username,
             member_role=event.member_role or '',
             is_bot=bool(getattr(event, 'is_bot', False)),
             is_direct=bool(event.is_direct),
@@ -338,13 +369,6 @@ class EventHandlerMixin:
 
         # 内置传输在调度前登记顺序；此处为自定义适配器保留回退。
         self._prepare_event(event)
-        await self._hook_manager.group_lifecycle.wait(event)
-
-        # 去重
-        if cfg.get_bot_setting(appid, 'dedup.enabled', False):
-            dedup = self._dedup.setdefault(appid, _EventDedup())
-            if dedup.is_dup(event.message_id, event.event_id):
-                return
 
         # union_id 交换
         if event.user_id and event.union_openid:
@@ -357,6 +381,19 @@ class EventHandlerMixin:
             )
             if need_swap:
                 event.user_id, event.union_openid, _ = IdentityHelper.swap_ids(event.raw_user_id, event.union_openid, True)
+
+        # 名字按入口观察顺序入队：生命周期等待和 before_event 都可能让事件重排。
+        # prepare 已保留原生身份；此处沿用既有 union_id 映射，且不等待数据库。
+        if event.event_type in MESSAGE_TYPES or event.event_type == INTERACTION_CREATE:
+            self._queue_event_names(bot, event)
+
+        await self._hook_manager.group_lifecycle.wait(event)
+
+        # 去重
+        if cfg.get_bot_setting(appid, 'dedup.enabled', False):
+            dedup = self._dedup.setdefault(appid, _EventDedup())
+            if dedup.is_dup(event.message_id, event.event_id):
+                return
 
         # 模块可接管或转换事件；返回 None 表示已经处理，不再进入内置分发。
         if self._hook_manager.has('before_event'):
@@ -424,7 +461,7 @@ class EventHandlerMixin:
         if et in MESSAGE_TYPES or et == INTERACTION_CREATE:
             self._record_message_event(bot, event, appid)
             if event.user_id:
-                self._enqueue_track(bot, event, appid)
+                self._enqueue_track(bot, event, appid, observe_names=False)
 
 
         if et == GROUP_MESSAGE_CREATE and event.group_id:
@@ -713,14 +750,6 @@ class EventHandlerMixin:
         now = time.time()
 
         self._prune_event_caches(now)
-
-        if item.username:
-            bot.log_service.db_queue(
-                'INSERT INTO users (user_id, name) VALUES (?, ?) '
-                'ON CONFLICT(user_id) DO UPDATE SET name=excluded.name '
-                "WHERE users.name = '' OR users.name IS NULL",
-                (uid, item.username),
-            )
 
         # 已知用户: 跳过 DB 查询
         if uid in self._known_users:

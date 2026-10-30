@@ -184,6 +184,18 @@ class Application(EventHandlerMixin):
     def get_bot(self, appid):
         return self._bot_registry.get(appid) if self._bot_registry is not None else None
 
+    async def display_member(self, appid, member_id):
+        """读取成员显示名；显示名不参与身份或权限判断。"""
+        from core.display import display_member_for_bot
+
+        return await display_member_for_bot(self.get_bot(appid), member_id)
+
+    async def display_group(self, appid, group_id):
+        """读取群显示名；本地缺失时按需补查群资料。"""
+        from core.display import display_group_for_bot
+
+        return await display_group_for_bot(self.get_bot(appid), group_id)
+
     def _path(self, *parts):
         return os.path.join(self._base_dir, *parts)
 
