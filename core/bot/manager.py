@@ -34,6 +34,12 @@ class BotManager:
     def get_bot(self, appid):
         return self._app.get_bot(appid)
 
+    async def display_member(self, appid, member_id):
+        return await self._app.display_member(appid, member_id)
+
+    async def display_group(self, appid, group_id):
+        return await self._app.display_group(appid, group_id)
+
     @property
     def bot_registry(self):
         return self._app.bot_registry

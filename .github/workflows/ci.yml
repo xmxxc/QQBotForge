@@ -13,7 +13,7 @@ env:
   # Pinned test assets (ci-assets branch of this repository). Bump the SHA
   # to take new assets.
   CI_ASSETS_REPOSITORY: xmxxc/QQBotForge
-  CI_ASSETS_SHA: 5fd275ee4621e6a4bfc90f45b198a0084acfbb4a
+  CI_ASSETS_SHA: 323a3ca18807157c3362b6156f557282e3acefa9
 
 jobs:
   check:
