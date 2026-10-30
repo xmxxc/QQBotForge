@@ -14,6 +14,7 @@ from aiohttp import web
 
 from core.base.config import cfg
 from core.base.logger import EXTENSION, get_logger
+from core.display import display_group, display_member
 from core.plugin._blacklist import get_blacklist_map
 
 from .lifecycle import LIFECYCLE, event_time
@@ -27,6 +28,21 @@ PREFIX = '/api/ext/group-state/'
 MESSAGE_TYPES = {'GROUP_AT_MESSAGE_CREATE', 'GROUP_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE'}
 REJECTED_TRANSITIONS = {'late_event', 'same_time_conflict', 'conflicting_duplicate', 'incomplete_event', 'missing_native_group'}
 log = get_logger(EXTENSION, '群状态')
+NAMES_MAX = 200
+
+
+async def display_names(bot, result):
+    """Display text for the groups and members an owner reply or page shows; data keeps native IDs."""
+    result = result if isinstance(result, dict) else {}
+    listed = result.get('members') if isinstance(result.get('members'), list) else []
+    groups = {result.get('group'), *(g.get('group') for g in result.get('groups') or [] if isinstance(g, dict))}
+    members = {result.get('member'), result.get('self_member'), *(result.get('missing_known_members') or [])}
+    members |= {m.get('member') for m in listed if isinstance(m, dict)}
+    groups = sorted(g for g in groups if isinstance(g, str) and g)[:NAMES_MAX]
+    members = sorted(m for m in members if isinstance(m, str) and m)[:NAMES_MAX]
+    shown = await asyncio.gather(*(display_group(bot, g) for g in groups), *(display_member(bot, m) for m in members))
+    split = len(groups)
+    return {'groups': dict(zip(groups, shown[:split], strict=True)), 'members': dict(zip(members, shown[split:], strict=True))}
 
 
 def identifier(value):
@@ -1010,7 +1026,8 @@ class GroupState:
                 result = await self.refresh(bot, identifier(data['group']))
             else:
                 return web.json_response({'success': False, 'error': '方法或入口不存在'}, status=404)
-            return web.json_response({'success': True, 'data': result}, headers={'Cache-Control': 'no-store'})
+            body = {'success': True, 'data': result, 'names': await display_names(bot, result)}
+            return web.json_response(body, headers={'Cache-Control': 'no-store'})
         except ValueError as error:
             return web.json_response({'success': False, 'error': str(error)}, status=422)
         except (RuntimeError, sqlite3.Error, OSError):
@@ -1061,7 +1078,11 @@ class GroupState:
                 operation, result = 'overview', await self.snapshot(event.appid)
             else:
                 raise ValueError('群状态 / 群状态 刷新或名册 <群ID> / 群状态 核验 <群ID> <成员ID> / 群状态 确认 <JSON>')
-            content = short_reply(operation) if event.is_group else owner_reply(operation, result, pause=self._pause_reason(event.appid))
+            if event.is_group:
+                content = short_reply(operation)
+            else:
+                pause = self._pause_reason(event.appid)
+                content = owner_reply(operation, result, pause=pause, names=await display_names(event.appid, result))
         except ValueError as error:
             content = str(error)
         except (RuntimeError, sqlite3.Error, OSError):

@@ -31,12 +31,12 @@ async def test_each_owner_command_has_its_own_title_and_chinese_summary(group_ho
     overview = await reply(host, '群状态')
     assert overview.startswith('群状态概览（仅已知群，不代表全部群）')
     assert '恢复基线：已就绪' in overview and '已知群 1 个' in overview
-    assert 'group-a：历史（收到新群事件，需刷新）' in overview and 'Bot 在群状态未知' in overview
+    assert '未知群（…up-a）：历史（收到新群事件，需刷新）' in overview and 'Bot 在群状态未知' in overview
     assert '已知成员 1 人，可靠 0 人' in overview
     assert_readable(overview)
 
     refreshed = await reply(host, '群状态 刷新 group-a')
-    assert refreshed.startswith('群刷新结果\n群 group-a：可靠（已核验）')
+    assert refreshed.startswith('群刷新结果\n群 未知群（…up-a）：可靠（已核验）')
     # allow_proactive_msg=False is a known false, unlike a missing value.
     assert 'Bot 在群（管理员），不允许主动消息' in refreshed and '最近查询 未查询' not in refreshed
     assert_readable(refreshed)
@@ -44,17 +44,17 @@ async def test_each_owner_command_has_its_own_title_and_chinese_summary(group_ho
     assert await reply(host, '群状态 恢复') == '恢复基线重建：已完成，事实恢复可用'
 
     roster = await reply(host, '群状态 名册 group-a')
-    assert roster.startswith('群名册核验\n群 group-a：名册完整')
+    assert roster.startswith('群名册核验\n群 未知群（…up-a）：名册完整')
     assert '本轮读到 3 人（可作全群名单）' in roster
-    assert 'this-bot：管理员，本 Bot' in roster and 'other-bot：成员，Bot' in roster and 'member-a：成员' in roster
+    assert '未知成员（…-bot）：管理员，本 Bot' in roster and '未知成员（…-bot）：成员，Bot' in roster and '未知成员（…er-a）：成员' in roster
     assert_readable(roster)
 
     verified = await reply(host, '群状态 核验 group-a member-a')
-    assert verified.startswith('成员核验结果\n群 group-a 成员 member-a：可靠（已核验），群主')
+    assert verified.startswith('成员核验结果\n群 未知群（…up-a） 成员 未知成员（…er-a）：可靠（已核验），群主')
     assert_readable(verified)
 
     confirmed = await reply(host, '群状态 确认 {"group":"group-a","member":"member-z","evidence":"主人已核对"}')
-    assert confirmed.startswith('成员人工确认\n群 group-a 成员 member-z：可靠（已核验），角色未知')
+    assert confirmed.startswith('成员人工确认\n群 未知群（…up-a） 成员 未知成员（…er-z）：可靠（已核验），角色未知')
     assert_readable(confirmed)
 
     # The JSON machine API keeps its fields and types.
@@ -76,7 +76,7 @@ async def test_failed_refresh_is_not_reported_as_success_or_absence(group_host, 
     await host.event('群状态 刷新 group-a')
     host.sender.response = response
     text = await reply(host, '群状态 刷新 group-a')
-    assert text.startswith('群刷新结果\n群 group-a：' + expected)
+    assert text.startswith('群刷新结果\n群 未知群（…up-a）：' + expected)
     assert '可靠' not in text and '已完成' not in text
     # History is labelled as history; a failed query never says the Bot left.
     assert '历史记录：Bot 在群（管理员）' in text and '离群' not in text
@@ -85,10 +85,10 @@ async def test_failed_refresh_is_not_reported_as_success_or_absence(group_host, 
 async def test_failed_roster_and_member_verification_name_the_reason(group_host):
     host = group_host
     roster = await reply(host, '群状态 名册 group-a')
-    assert roster.startswith('群名册核验\n群 group-a：名册不完整，原因：平台无权限')
+    assert roster.startswith('群名册核验\n群 未知群（…up-a）：名册不完整，原因：平台无权限')
     assert '仅本轮观察，不能作全群名单' in roster and '本轮读到 0 人' in roster
     member = await reply(host, '群状态 核验 group-a member-a')
-    assert member.startswith('成员核验结果\n群 group-a 成员 member-a：无权限（平台无权限），角色未知，是否 Bot 未知')
+    assert member.startswith('成员核验结果\n群 未知群（…up-a） 成员 未知成员（…er-a）：无权限（平台无权限），角色未知，是否 Bot 未知')
 
 
 async def test_recovery_barrier_is_never_reported_as_success(group_host):
@@ -226,7 +226,7 @@ async def test_busy_consumer_notification_reads_as_processing_in_qq_and_api(grou
         assert_recovery_contract(line)
         # The group fact stays paused while the notification is unconfirmed.
         assert data['groups'][0]['reliable'] is False and data['groups'][0]['continuity_reason'] == 'recovery_pending'
-        assert 'group-a：暂停使用（恢复基线未完成）' in text and 'group-a：可靠' not in text
+        assert '未知群（…up-a）：暂停使用（恢复基线未完成）' in text and '未知群（…up-a）：可靠' not in text
         assert not (await state.fact('bot-a', 'group-a'))['usable']
     finally:
         release.set()
@@ -255,7 +255,7 @@ async def test_unfinished_write_reads_as_processing_in_qq_and_api(group_host, mo
         assert data['recovery'] == RECOVERY['write_pending'][0]
         text, line = await overview_recovery(host)
         assert line == qq_line('write_pending')
-        assert 'group-a：处理中（正在保存）' in text and 'group-a：可靠' not in text
+        assert '未知群（…up-a）：处理中（正在保存）' in text and '未知群（…up-a）：可靠' not in text
         assert not (await state.fact('bot-a', 'group-a'))['usable']
     finally:
         release.set()

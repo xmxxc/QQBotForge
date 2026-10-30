@@ -20,6 +20,7 @@ from aiohttp import web
 
 from core.base.config import cfg
 from core.base.logger import PLUGIN, get_logger
+from core.display import display_group, display_member, format_member
 from core.plugin._blacklist import get_blacklist_map
 
 from .emergency import EmergencyError, EmergencyMode
@@ -61,6 +62,37 @@ REASONS = {
 CHANGED = '账号或授权刚刚变化，请重新发送查询'
 # Directory rows: SQLite projects these fields, so login/password never reach the plugin.
 DIRECTORY = ('id', 'name', 'enabled', 'open_groups')
+# Owner page fields holding native QQ IDs; names are looked up for display only.
+GROUP_KEYS = {'group', 'groups', 'open_groups', 'policy_before', 'policy_after'}
+MEMBER_KEYS = {'member'}
+NAMES_MAX = 200
+
+
+def native_ids(value, groups, members):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            target = groups if key in GROUP_KEYS else members if key in MEMBER_KEYS else None
+            if target is not None:
+                target.update(v for v in (item if isinstance(item, list) else [item]) if isinstance(v, str) and v)
+            native_ids(item, groups, members)
+    elif isinstance(value, list):
+        for item in value:
+            native_ids(item, groups, members)
+
+
+async def display_names(bot, value):
+    """Display text for the IDs on an owner page; the response data keeps the native IDs."""
+    groups, members = set(), set()
+    native_ids(value, groups, members)
+    groups, members = sorted(groups)[:NAMES_MAX], sorted(members)[:NAMES_MAX]
+    shown = await asyncio.gather(*(display_group(bot, g) for g in groups), *(display_member(bot, m) for m in members))
+    split = len(groups)
+    return {'groups': dict(zip(groups, shown[:split], strict=True)), 'members': dict(zip(members, shown[split:], strict=True))}
+
+
+async def member_label(bot, member, name=''):
+    # A name carried by the triggering event is newer than the queued data.db write.
+    return format_member(member, name) if (name or '').strip() else await display_member(bot, member)
 
 
 def unknown_code(code):
@@ -408,7 +440,7 @@ class Ninja3:
             await self.reply(event, '仅主人可以授权')
             return
         targets = {
-            m['id']
+            m['id']: m.get('username') or ''
             for m in event.mentions
             if isinstance(m, dict) and isinstance(m.get('id'), str) and m['id'] and not m.get('is_you') and not m.get('bot') and m.get('scope') != 'all'
         }
@@ -416,7 +448,7 @@ class Ninja3:
             # Display names and typed IDs are never identities; only the native mention payload is.
             await self.reply(event, '请发送“授权”并 @ 一位要授权的成员')
             return
-        member = targets.pop()
+        member, name = targets.popitem()
         try:
             acl = self.access()
             # The owner's grant; declaration never touches an existing policy scope.
@@ -468,7 +500,8 @@ class Ninja3:
             await self.reply(event, '授权未完成：授权或群状态存储暂不可用，请检查后台')
             return
         log.info(f'[{bot}] 授权 group={group} member={member} source={source["id"]} existing={existing is not None}')
-        lines = ['该成员已有本群授权' if existing else '已授权该成员查询本群开放账号，长期有效']
+        who = await member_label(bot, member, name)
+        lines = [f'{who} 已有本群授权' if existing else f'已授权 {who} 查询本群开放账号，长期有效']
         if decision['reason'] in {'denied', 'framework_denied'}:
             lines.append('该成员在拒绝名单中，拒绝优先，当前仍不能查询')
         if not (opened and opened['enabled']):
@@ -1023,7 +1056,7 @@ class Ninja3:
         if reason == 'resource_disabled':
             await self.reply(event, '该账号暂不可查询，请联系主人')
             return
-        record = await self.notice(bot, group, member, action, reason)
+        record = await self.notice(bot, group, member, action, reason, name=event.username)
         # Claim a notice only when this attempt actually reached the owner.
         sent = record['count'] == 1 and record['notification'] == 'sent'
         told = '已通知主人' if sent else '已记录给主人'
@@ -1033,7 +1066,7 @@ class Ninja3:
 
     # ---------- owner notices ----------
 
-    async def notice(self, bot, group, member, action, reason):
+    async def notice(self, bot, group, member, action, reason, *, name=''):
         key = json.dumps([group, member], ensure_ascii=False)
         async with self.notice_locks.setdefault((bot, key), asyncio.Lock()):
             now = self.clock()
@@ -1044,9 +1077,9 @@ class Ninja3:
                 await self.store.put(bot, 'notices', key, record)
                 return record
             record = {'id': key, 'group': group, 'member': member, 'action': action, 'reason': reason, 'first_at': now, 'last_at': now, 'count': 1}
-            return await self.deliver_notice(bot, record)
+            return await self.deliver_notice(bot, record, name=name)
 
-    async def deliver_notice(self, bot, record):
+    async def deliver_notice(self, bot, record, *, name=''):
         owner = await self.store.get(bot, 'owners', 'observed_c2c')
         sender = self.sender_provider(bot)
         owner_ids = (cfg.get_bot_config(bot) or {}).get('owner_ids', [])
@@ -1054,8 +1087,9 @@ class Ninja3:
             record['notification'] = 'unavailable'
         else:
             what = '查看账号列表' if record['action'] == 'list' else '查询账号'
+            group, member = await display_group(bot, record['group']), await member_label(bot, record['member'], name)
             content = (
-                f'忍者必须死3：群 {record["group"]} 的成员 {record["member"]} 尝试{what}，{REASONS.get(record["reason"], record["reason"])}。\n'
+                f'忍者必须死3：群 {group} 的成员 {member} 尝试{what}，{REASONS.get(record["reason"], record["reason"])}。\n'
                 '如需授权，请在该群发送“授权 @该成员”；十分钟内同一成员的后续尝试合并记录，可在后台查看。'
             )
             try:
@@ -1205,10 +1239,11 @@ class Ninja3:
                 return web.json_response({'success': True, 'data': result})
             if parts in (['status'], ['operations']) and request.method == 'GET':
                 data = await self.status(bot) if parts == ['status'] else await self.store.all(bot, 'operations')
-                return web.json_response({'success': True, 'data': data})
+                return web.json_response({'success': True, 'data': data, 'names': await display_names(bot, data)})
             if parts == ['notices']:
                 if request.method == 'GET':
-                    return web.json_response({'success': True, 'data': await self.store.all(bot, 'notices')})
+                    data = await self.store.all(bot, 'notices')
+                    return web.json_response({'success': True, 'data': data, 'names': await display_names(bot, data)})
                 if request.method == 'POST':
                     return web.json_response({'success': True, 'data': await self.notice_action(bot, await request.json())})
                 raise BusinessError('方法不适用', 405)
@@ -1225,7 +1260,10 @@ class Ninja3:
                 data = await request.json() if request.method in {'POST', 'PATCH'} else None
                 manage = self.manage_account if parts[0] == 'accounts' else self.manage_group
                 result = await manage(bot, operation, data, key)
-                return web.json_response({'success': True, 'data': result}, status=201 if operation == 'create' else 200)
+                body = {'success': True, 'data': result}
+                if operation == 'list':
+                    body['names'] = await display_names(bot, result)
+                return web.json_response(body, status=201 if operation == 'create' else 200)
             raise BusinessError('入口不存在', 404)
         except (BusinessError, TaskError, EmergencyError, json.JSONDecodeError) as error:
             return web.json_response({'success': False, 'error': str(error)}, status=getattr(error, 'status', 422))
