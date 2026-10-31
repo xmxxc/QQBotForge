@@ -58,9 +58,14 @@ async def unload():
     name='忍者必须死3主人命令',
     priority=20,
     block=True,
-    event_types=['GROUP_AT_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE'],
+    event_types=['GROUP_AT_MESSAGE_CREATE', 'GROUP_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE'],
 )
 async def owner_entry(event, _match):
+    if event.event_type == 'GROUP_MESSAGE_CREATE' and not any(
+        isinstance(mention, dict) and mention.get('is_you') is True and mention.get('bot') is True
+        for mention in event.mentions
+    ):
+        return
     if _instance is not None:
         await _instance.owner_command(event, (event.content or '').strip().split(maxsplit=1)[0])
 

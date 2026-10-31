@@ -485,3 +485,13 @@ async def test_credentials_are_three_copyable_messages_with_optional_metadata(ni
         'fake-login',
         SECRET,
     ]
+
+async def test_owner_short_commands_accept_full_group_message_event(ninja):
+    host = ninja
+    await host.setup()
+    assert await host.say('为什么', user='owner-a', mentions=['MEMBERA'], event_type='GROUP_MESSAGE_CREATE') == [
+        '显示名（…BERA）在 未知群（…up-a） 不能查询忍3账号：成员在群事实待核验，可发送“确认在群 @成员”'
+    ]
+    assert await host.say('授权', user='owner-a', mentions=['MEMBERB'], event_type='GROUP_MESSAGE_CREATE') == [
+        '已授权 显示名（…BERB）在 未知群（…up-a） 查询忍3开放账号，长期有效'
+    ]
