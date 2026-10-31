@@ -285,7 +285,7 @@ async def test_untrusted_or_unordered_joins_never_grant(ninja, case):
 
 
 @pytest.mark.parametrize('path', ['online', 'resume_replay'])
-async def test_slow_consumer_holds_ready_until_the_written_source_is_usable(ninja, path):
+async def test_slow_consumer_holds_ready_until_the_written_source_is_usable(ninja, monkeypatch, path):
     host, frames = ninja, Frames(ninja)
     await host.setup()
     await auto(host)
@@ -317,12 +317,71 @@ async def test_slow_consumer_holds_ready_until_the_written_source_is_usable(ninj
     decision = await host.access.evaluate('bot-a', 'ninja3', 'query', 'group-a', 'MEMBERJ', action='invoke')
     assert (decision['allowed'], decision['reason'], decision['retryable']) == (False, 'group_facts_processing', True)
     # The member's query in this group waits behind the same-group lifecycle barrier.
+    prepared = asyncio.Event()
+    original_prepare = host.application._prepare_event
+
+    def prepare(event):
+        original_prepare(event)
+        prepared.set()
+
+    monkeypatch.setattr(host.application, '_prepare_event', prepare)
     query = asyncio.create_task(host.say('账号 账号A', user='MEMBERJ'))
-    await asyncio.sleep(0.05)
+    await until(prepared.is_set)
     assert not query.done()
     release.set()
-    assert await query == CREDENTIALS
+    # Lifecycle completion does not drain the separate connection-status queue.
+    assert await query in (CREDENTIALS, RETRY)
+    await until(lambda: host.state._ready('bot-a') and not host.state.pending_writes.get('bot-a'))
+    assert await host.say('账号 账号A', user='MEMBERJ') == CREDENTIALS
     assert host.state._ready('bot-a') and not (await host.ninja_api('GET', 'notices'))[1]['data']
+
+
+@pytest.mark.parametrize('path', ['online', 'resume_replay'])
+async def test_query_retries_until_replay_connection_consumers_finish(ninja, monkeypatch, path):
+    host, frames = ninja, Frames(ninja)
+    await host.setup()
+    await auto(host)
+    entered, release = asyncio.Event(), asyncio.Event()
+    subscription = host.state.connection_subscription
+    original = subscription._callback
+
+    async def consume(status):
+        if status.appid == 'bot-a' and status.phase == 'replay_complete':
+            entered.set()
+            await release.wait()
+        await original(status)
+
+    monkeypatch.setattr(subscription, '_callback', consume)
+    try:
+        if path == 'online':
+            sequence = frames.feed('GROUP_MEMBER_ADD', 'MEMBERJ')
+        else:
+            host.connecting_bot[0] = 'bot-a'
+            host.sockets['bot-a'].frames.put_nowait(OSError('fake disconnect'))
+            socket = host.sockets['bot-a'] = host.gateways['bot-a'].add()
+            socket.feed(10, d={'heartbeat_interval': 45000})
+            await until(lambda: any(frame['op'] == 6 for frame in socket.sent))
+            sequence = frames.feed('GROUP_MEMBER_ADD', 'MEMBERJ')
+            socket.feed(0, t='RESUMED', s=sequence, d='')
+            await until(entered.is_set)
+        await settle(host, sequence)
+        (source,) = await autos(host)
+        assert source['join']['session_id'] == 'session-bot-a'
+        status = host.state.recovery.get_status('bot-a')
+        assert status.ready and not status.pending
+        assert not host.state.notifications.busy('bot-a') and not host.state.pending_writes.get('bot-a')
+        if path == 'resume_replay':
+            assert host.state._connection_pending('bot-a')
+            assert not host.state._ready('bot-a')
+            decision = await host.access.evaluate('bot-a', 'ninja3', 'query', 'group-a', 'MEMBERJ', action='invoke')
+            assert (decision['allowed'], decision['reason'], decision['retryable']) == (False, 'group_facts_processing', True)
+            assert await host.say('账号 账号A', user='MEMBERJ') == RETRY
+        release.set()
+        await until(lambda: host.state._ready('bot-a') and not host.state.pending_writes.get('bot-a'))
+        assert await host.say('账号 账号A', user='MEMBERJ') == CREDENTIALS
+        assert not (await host.ninja_api('GET', 'notices'))[1]['data']
+    finally:
+        release.set()
 
 
 @pytest.mark.parametrize('fault', ['write_failure', 'reload_access', 'reload_group_state'])

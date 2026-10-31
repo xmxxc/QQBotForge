@@ -82,10 +82,12 @@ const Update = {
           h('span', {class: 'upd-title'}, 'personal 更新日志'),
           h('a', {href: 'https://github.com/xmxxc/QQBotForge/tree/personal', target: '_blank', rel: 'noopener noreferrer'}, 'GitHub')
         ]),
-        h('div', {class: 'upd-log-list'}, changes.value.map(commit => h('div', {class: 'upd-log-item', key: commit.full_sha || commit.sha}, [
+        h('div', {class: 'upd-log-wrap'}, [
+          h('div', {class: 'upd-log-list'}, changes.value.map(commit => h('div', {class: 'upd-log-item', key: commit.full_sha || commit.sha}, [
           h('code', null, commit.sha), h('div', {class: 'upd-log-msg'}, commit.message),
           h('div', {class: 'upd-log-date'}, commit.date)
-        ])))
+          ])))
+        ])
       ])
     ]);
   }
