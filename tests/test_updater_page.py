@@ -38,6 +38,9 @@ for (const expected of ['personal', 'def67890', 'pending', '差距', '3', '检�
     if (!text.includes(expected)) throw new Error('missing ' + expected);
 }
 if (text.includes('镜像选择') || text.includes('上传更新包') || text.includes('跳过备份')) throw new Error('obsolete controls');
+const logCard = tree.children.find(node => node && node.props && node.props.class === 'upd-card' && JSON.stringify(node).includes('personal 更新日志'));
+const logWrap = logCard && logCard.children.find(node => node && node.props && node.props.class === 'upd-log-wrap');
+if (!logWrap || !logWrap.children || logWrap.children[0].props.class !== 'upd-log-list') throw new Error('log list is not scoped by wrapper');
 function visit(node) {
     if (!node || typeof node !== 'object') return;
     if (node.tag === 'button' && node.children === '更新到最新' && node.props.disabled !== true) throw new Error('unsafe enabled update');
