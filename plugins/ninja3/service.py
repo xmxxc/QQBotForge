@@ -832,7 +832,7 @@ class Ninja3:
 
             items = [('账号列表', {'kind': 'list'})]
             if self.is_owner(event):
-                items += [('修改密码', {'manage': '修改密码'}), ('紧急模式', {'manage': '紧急模式'})]
+                items += [('修改密码', {'manage': '修改密码'}), ('紧急模式', {'manage': '紧急模式'}), ('主人菜单', {'manage': '主人菜单'})]
             await self.offer(event, '忍者必须死3 菜单', items, current)
             return True
         except (BusinessError, RuntimeError, ValueError, sqlite3.Error, OSError):
@@ -850,7 +850,16 @@ class Ninja3:
         action = menu['actions'][number - 1]
         if 'manage' in action:
             if not self.is_owner(event):
-                await self.reply(event, '仅主人可以管理')
+                await self.reply(event, '仅主人可用' if action['manage'] == '主人菜单' else '仅主人可以管理')
+                return
+            if action['manage'] == '主人菜单':
+                from core.application import get_app
+                app = get_app()
+                menu = app.module_manager.get('owner_menu') if app and app.module_manager else None
+                if menu:
+                    await menu.open(event)
+                else:
+                    await self.reply(event, '主人菜单模块未启用')
                 return
             # Validate current plugin/ACL group scope even for unimplemented actions.
             if not await self.scope_open(event):
