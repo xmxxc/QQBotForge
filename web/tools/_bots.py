@@ -6,6 +6,10 @@ _WS_RECONNECTING = frozenset({'connecting', 'disconnected', 'reconnecting', 'res
 _WS_STATUS_TEXT = {'connected': '已连接', 'reconnecting': '断线重连中', 'disconnected': '未连接'}
 
 
+def connection_status_text(state):
+    return _WS_STATUS_TEXT[state]
+
+
 def iter_bots(bot_manager, appid_filter=''):
     if not bot_manager:
         return []
@@ -35,7 +39,7 @@ def running_bot_payload(appid, inst):
     robot_qq = getattr(inst, 'robot_qq', '') or ''
     ws_state = ws_connection_state(inst) if inst.ws_client else 'disconnected'
     ws_connected = bool(inst.ws_client) and ws_state == 'connected'
-    connection_status = '等待接收中' if not inst.ws_client else _WS_STATUS_TEXT[ws_state]
+    connection_status = '等待接收中' if not inst.ws_client else connection_status_text(ws_state)
     return {
         'appid': appid,
         'name': getattr(inst, 'name', '') or appid,
