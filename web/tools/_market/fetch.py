@@ -7,13 +7,13 @@ import time
 
 import aiohttp as _aiohttp
 
+from web.tools._market.mirror import get_fast_mirrors
+from web.tools._market.mirrors import _build_mirror_url
 from web.tools._market.shared import (
     MARKET_MANIFESTS,
     PLUGIN_REPO,
     _ranked_mirror_urls,
 )
-from web.tools._updater.mirror import get_fast_mirrors
-from web.tools._updater.shared import _build_mirror_url
 
 log = logging.getLogger('ElainaBot.web.market')
 

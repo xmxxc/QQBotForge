@@ -1,1 +1,93 @@
-var he=Object.defineProperty,fe=Object.defineProperties;var be=Object.getOwnPropertyDescriptors;var X=Object.getOwnPropertySymbols;var ye=Object.prototype.hasOwnProperty,ke=Object.prototype.propertyIsEnumerable;var Y=(v,c,i)=>c in v?he(v,c,{enumerable:!0,configurable:!0,writable:!0,value:i}):v[c]=i,Z=(v,c)=>{for(var i in c||(c={}))ye.call(c,i)&&Y(v,i,c[i]);if(X)for(var i of X(c))ke.call(c,i)&&Y(v,i,c[i]);return v},ee=(v,c)=>fe(v,be(c));var b=(v,c,i)=>new Promise((r,M)=>{var x=p=>{try{d(i.next(p))}catch(h){M(h)}},S=p=>{try{d(i.throw(p))}catch(h){M(h)}},d=p=>p.done?r(p.value):Promise.resolve(p.value).then(x,S);d((i=i.apply(v,c)).next())});import{o as we,ag as Ce,aG as l,aH as s,F as P,aQ as $,aA as k,k as V,aL as u,aP as g,_ as Q,aT as se,aj as H,aR as xe,aM as ae,aU as te,q as B,r as n,ay as o}from"./vendor.js";import{r as T,i as w,b as Me,c as N}from"./index.js";import{u as le}from"./format.js";import{S as C}from"./SvgIcon.js";import{_ as ze}from"./_plugin-vue_export-helper.js";import{C as Ue}from"./naive-ui.js";const Ve={class:"upd-page"},Se={class:"ui-stat-grid upd-stats"},Ge={class:"ui-stat-top"},He={class:"ui-stat-ic"},Te={class:"ui-stat-label"},qe={class:"ui-stat-val upd-stat-val"},Ee={key:0,class:"upd-card"},Fe={class:"upd-card-header"},Le={class:"upd-title"},Pe={key:0,class:"upd-ver"},Qe={key:0,class:"upd-card-actions"},Be=["disabled"],Ne={class:"upd-check"},Ae={key:1,class:"upd-error"},De={key:1,class:"upd-card"},Ie={class:"upd-card-header"},Re={class:"upd-progress-bar"},$e={class:"upd-progress-msg"},Oe={class:"upd-cols"},je={class:"upd-card upd-col-log"},Je={class:"upd-card-header"},Ke={class:"upd-title"},We={class:"upd-community-links"},Xe={href:"https://qm.qq.com/q/pQ3sp0xTyg",target:"_blank",rel:"noopener noreferrer",class:"upd-icon-action",title:"QQ 交流群","aria-label":"QQ 交流群"},Ye={href:"https://github.com/ElainaCore/ElainaBot_v2",target:"_blank",rel:"noopener",title:"GitHub","aria-label":"GitHub",class:"upd-icon-action upd-github"},Ze=["disabled"],es={class:"upd-log-wrap"},ss={class:"upd-log-list"},as={class:"upd-log-sha"},ts=["href","title"],ls={key:1},os={class:"upd-log-date"},us={class:"upd-log-msg"},is={class:"upd-log-author"},ns={class:"upd-log-actions"},rs=["onClick","disabled"],ds={key:0,class:"upd-error"},cs={key:1,class:"upd-empty"},ps={class:"upd-col-right"},vs={class:"upd-card"},_s={class:"upd-card-header"},ms={class:"upd-title"},gs={key:0,class:"upd-cur-mirror"},hs=["disabled"],fs={class:"upd-mirror-custom"},bs={class:"upd-mirror-list"},ys={class:"upd-mirror-rank"},ks=["title"],ws={key:1,class:"upd-mirror-testing"},Cs=["onClick"],xs={class:"upd-card"},Ms={class:"upd-card-header"},zs={class:"upd-title"},Us={class:"upd-upload-body"},Vs={class:"upd-check"},Ss=["disabled"],Gs={__name:"Update",setup(v){const c=Ue(),i=n({}),r=n(null),M=n(!1),x=n(!1),S=n(!1),d=n({stage:"idle",message:"",progress:0,is_updating:!1}),p=n([]),h=n(!1),G=n(""),A=n([]),z=n([]),y=n(!1),m=n(""),q=n(null),oe=n(null),E=n(""),D=n(!1),F=n(!1),U=n(""),I=n(!1),ue={checking:"检查中",downloading:"下载中",backing_up:"备份中",updating:"更新中",completed:"完成",failed:"失败",preparing:"准备中"},ie=B(()=>ue[d.value.stage]||d.value.stage),ne=B(()=>M.value?"检查中":r.value?r.value.has_update?"有新版本":"已是最新":"未检查"),re=B(()=>{var a,e;return[{label:"当前版本",value:i.value.version||"unknown",icon:"cloud-download",color:"c-blue"},{label:"最新版本",value:((a=r.value)==null?void 0:a.latest_version)||"—",icon:"rocket",color:"c-purple"},{label:"更新状态",value:ne.value,icon:"alert-circle",color:(e=r.value)!=null&&e.has_update?"c-orange":"c-green"},{label:"更新时间",value:i.value.update_time||"—",icon:"time",color:"c-teal"}]}),de=B(()=>{if(z.value.length){const e=new Set(z.value.map(_=>_.mirror)),f=y.value?A.value.filter(_=>!e.has(_)).map(_=>({mirror:_,latency:0,success:!1,_tested:!1})):[];return!e.has("")&&y.value&&f.push({mirror:"",latency:0,success:!1,_tested:!1}),[...z.value,...f]}const a=A.value.map(e=>({mirror:e,latency:0,success:!1,_tested:!1}));return a.push({mirror:"",latency:0,success:!1,_tested:!1}),a});function O(){return b(this,null,function*(){try{i.value=T(yield w.get("/api/update/version")),m.value=i.value.custom_mirror||""}catch(a){}})}function ce(){return b(this,null,function*(){M.value=!0;try{r.value=T(yield w.get("/api/update/check"))}catch(a){r.value={has_update:!1,error:a.normalizedMessage||a.message}}finally{M.value=!1}})}function j(){return b(this,null,function*(){h.value=!0,G.value="";try{const a=yield w.get("/api/update/changelog");Me(a)?p.value=T(a)||[]:(G.value=N(a,"API 请求失败"),p.value=[])}catch(a){G.value=a.normalizedMessage||N(a.response,a.message||"获取失败"),p.value=[]}finally{h.value=!1}})}function J(a){return b(this,null,function*(){x.value=!0,d.value={stage:"preparing",message:"准备中...",progress:0,is_updating:!0};try{const e={skip_backup:S.value};a?e.version=a:e.force=!0,yield w.post("/api/update/start",e),K()}catch(e){d.value={stage:"failed",message:e.normalizedMessage||e.message,progress:0,is_updating:!1},x.value=!1}})}let L=0;function K(){return b(this,null,function*(){const a=++L;for(;a===L;){try{const e=T(yield w.get("/api/update/progress"));if(a!==L)return;if(e&&(d.value=e),!(e!=null&&e.is_updating)){x.value=!1,(e==null?void 0:e.stage)==="completed"&&(O(),pe());return}}catch(e){}yield new Promise(e=>setTimeout(e,1e3))}})}function pe(){c.success({title:"更新完成",content:"更新完成，请重启框架和清理浏览器缓存，防止出现异常现象。",positiveText:"知道了"})}function ve(){return b(this,null,function*(){try{const a=T(yield w.get("/api/update/mirrors"));A.value=(a==null?void 0:a.mirrors)||[],a!=null&&a.custom_mirror&&(m.value=a.custom_mirror)}catch(a){}})}function R(){return b(this,null,function*(){try{yield w.post("/api/update/mirror",{mirror:m.value})}catch(a){}})}function _e(){y.value=!0,z.value=[];const a=new EventSource("/api/update/test-mirrors");a.onmessage=e=>{try{const f=JSON.parse(e.data);if(f.done){a.close(),y.value=!1;return}z.value=[...z.value,ee(Z({},f),{_tested:!0})].sort((_,t)=>_.success===t.success?_.latency-t.latency:_.success?-1:1)}catch(f){}},a.onerror=()=>{a.close(),y.value=!1}}function me(a){var e;q.value=((e=a.target.files)==null?void 0:e[0])||null,U.value=""}function ge(){return b(this,null,function*(){if(q.value){F.value=!0,U.value="",I.value=!1;try{const a=new FormData;a.append("file",q.value),E.value&&a.append("version_name",E.value),a.append("skip_backup",D.value?"true":"false");const e=yield w.post("/api/update/upload",a,{timeout:12e4});U.value=N(e,"上传成功"),K()}catch(a){U.value=a.normalizedMessage||N(a.response,a.message||"上传失败"),I.value=!0}finally{F.value=!1}}})}return we(()=>{O(),ce(),j(),ve()}),Ce(()=>{L++}),(a,e)=>{var f,_;return o(),l("div",Ve,[s("div",Se,[(o(!0),l(P,null,$(re.value,t=>(o(),l("div",{key:t.label,class:H(["ui-stat",t.color])},[s("div",Ge,[s("div",He,[k(C,{name:t.icon,size:17},null,8,["name"])]),s("div",Te,u(t.label),1)]),s("div",qe,u(t.value),1),k(C,{name:t.icon,size:68,class:"ui-stat-bg"},null,8,["name"])],2))),128))]),(f=r.value)!=null&&f.has_update||(_=r.value)!=null&&_.error?(o(),l("div",Ee,[s("div",Fe,[s("span",Le,[k(C,{name:"refresh",size:15,class:"upd-title-ic"}),V(u(r.value.has_update?"发现新版本":"更新检查失败"),1)]),r.value.has_update?(o(),l(P,{key:0},[e[6]||(e[6]=s("span",{class:"upd-badge upd-badge-new"},"有新版本",-1)),r.value.latest_version?(o(),l("span",Pe,"最新: "+u(r.value.latest_version),1)):g("",!0)],64)):g("",!0)]),r.value.has_update?(o(),l("div",Qe,[s("button",{class:"btn btn-primary",onClick:e[0]||(e[0]=t=>J()),disabled:x.value},"一键更新到最新",8,Be),s("label",Ne,[Q(s("input",{type:"checkbox","onUpdate:modelValue":e[1]||(e[1]=t=>S.value=t)},null,512),[[se,S.value]]),e[7]||(e[7]=V(" 跳过备份",-1))])])):g("",!0),r.value.error?(o(),l("div",Ae,u(r.value.error),1)):g("",!0)])):g("",!0),d.value.is_updating||d.value.stage==="completed"||d.value.stage==="failed"?(o(),l("div",De,[s("div",Ie,[s("span",{class:H(["upd-badge",{"upd-badge-new":d.value.is_updating,"upd-badge-ok":d.value.stage==="completed","upd-badge-err":d.value.stage==="failed"}])},u(ie.value),3)]),s("div",Re,[s("div",{class:"upd-progress-fill",style:xe({width:d.value.progress+"%"})},null,4)]),s("div",$e,u(d.value.message),1)])):g("",!0),s("div",Oe,[s("div",je,[s("div",Je,[s("span",Ke,[k(C,{name:"document-text",size:15,class:"upd-title-ic"}),e[8]||(e[8]=V("更新日志",-1))]),e[9]||(e[9]=s("span",{class:"upd-spacer"},null,-1)),s("div",We,[s("a",Xe,[k(C,{name:"qq",size:18})]),s("a",Ye,[k(C,{name:"github",size:16})])]),s("button",{class:"btn btn-xs",onClick:j,disabled:h.value},u(h.value?"加载...":"刷新"),9,Ze)]),s("div",es,[s("div",ss,[(o(!0),l(P,null,$(p.value,t=>(o(),l("div",{key:t.sha,class:"upd-log-item"},[s("div",as,[t.url?(o(),l("a",{key:0,href:t.url,target:"_blank",class:"upd-log-link",title:"在 GitHub 上查看 "+t.sha},[s("code",null,u(t.sha),1)],8,ts)):(o(),l("code",ls,u(t.sha),1)),s("span",os,u(t.date),1)]),s("div",us,u(t.message),1),s("div",is,u(t.author),1),s("div",ns,[s("button",{class:"btn btn-xs",onClick:W=>J(t.full_sha),disabled:x.value,title:"更新到此版本"},"更新到此版本",8,rs)])]))),128)),G.value?(o(),l("div",ds,u(G.value),1)):!p.value.length&&!h.value?(o(),l("div",cs,"暂无更新日志")):g("",!0)])])]),s("div",ps,[s("div",vs,[s("div",_s,[s("span",ms,[k(C,{name:"globe",size:15,class:"upd-title-ic"}),e[10]||(e[10]=V("镜像选择",-1))]),m.value?(o(),l("span",gs,"当前: "+u(ae(le)(m.value,"GitHub 直连")),1)):g("",!0),e[11]||(e[11]=s("span",{class:"upd-spacer"},null,-1)),s("button",{class:"btn btn-xs",onClick:_e,disabled:y.value},u(y.value?"测速中...":"测速"),9,hs)]),s("div",fs,[Q(s("input",{"onUpdate:modelValue":e[2]||(e[2]=t=>m.value=t),placeholder:"自定义镜像 URL (留空=自动选择最快)",class:"upd-input"},null,512),[[te,m.value]]),s("button",{class:"btn btn-xs",onClick:R},"保存"),m.value?(o(),l("button",{key:0,class:"btn btn-xs",onClick:e[3]||(e[3]=t=>{m.value="",R()})},"清除")):g("",!0)]),s("div",bs,[(o(!0),l(P,null,$(de.value,(t,W)=>(o(),l("div",{key:t.mirror||"direct",class:H(["upd-mirror-item",{"upd-mirror-active":m.value===t.mirror}])},[s("span",ys,u(W+1),1),s("span",{class:"upd-mirror-name",title:t.mirror||"GitHub 直连"},u(ae(le)(t.mirror,"GitHub 直连")),9,ks),t._tested?(o(),l("span",{key:0,class:H(["upd-mirror-latency",{ok:t.success,fail:!t.success}])},u(t.success?t.latency+"s":"超时"),3)):y.value?(o(),l("span",ws,"测速中...")):g("",!0),s("button",{class:"btn btn-xs",onClick:Hs=>{m.value=t.mirror,R()}},"使用",8,Cs)],2))),128))])]),s("div",xs,[s("div",Ms,[s("span",zs,[k(C,{name:"upload",size:15,class:"upd-title-ic"}),e[12]||(e[12]=V("上传更新包",-1))])]),s("div",Us,[s("input",{type:"file",ref_key:"uploadFileRef",ref:oe,accept:".zip",onChange:me,class:"upd-file-input"},null,544),Q(s("input",{"onUpdate:modelValue":e[4]||(e[4]=t=>E.value=t),placeholder:"版本名 (可选)",class:"upd-input"},null,512),[[te,E.value]]),s("label",Vs,[Q(s("input",{type:"checkbox","onUpdate:modelValue":e[5]||(e[5]=t=>D.value=t)},null,512),[[se,D.value]]),e[13]||(e[13]=V(" 跳过备份",-1))]),s("button",{class:"btn btn-primary btn-sm",onClick:ge,disabled:!q.value||F.value},u(F.value?"上传中...":"上传并更新"),9,Ss),U.value?(o(),l("div",{key:0,class:H(["upd-upload-msg",{err:I.value}])},u(U.value),3)):g("",!0)])])])])])}}},Bs=ze(Gs,[["__scopeId","data-v-0f90cad8"]]);export{Bs as default};
+// Shipped ES module maintained directly: this repository contains no frontend build sources.
+import {aA as h, r as ref, o as onMounted, ag as onUnmounted} from './vendor.js';
+import {r as unwrap, i as api} from './index.js';
+
+const Update = {
+  __name: 'Update',
+  __scopeId: 'data-v-0f90cad8',
+  setup() {
+    const version = ref({}), check = ref({}), changes = ref([]), progress = ref({});
+    const busy = ref(false), error = ref('');
+    let disposed = false;
+    const reminder = '重启后请确认群成员并使用「群状态 恢复」重建群状态。';
+    async function checkUpdate() {
+      error.value = '';
+      try {
+        check.value = unwrap(await api.get('/api/update/check')) || {};
+        error.value = check.value.error || '';
+      } catch (e) { error.value = e.normalizedMessage || e.message; }
+    }
+    async function refreshProgress() {
+      try { progress.value = unwrap(await api.get('/api/update/progress')) || {}; }
+      catch (e) { if (!busy.value) error.value = e.normalizedMessage || e.message; }
+    }
+    async function pollUpdate() {
+      busy.value = true;
+      try {
+        do {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          if (disposed) return;
+          await refreshProgress();
+        } while (progress.value.is_updating || !['completed', 'failed'].includes(progress.value.stage));
+        version.value = unwrap(await api.get('/api/update/version')) || {};
+        await checkUpdate();
+      } catch (e) { error.value = e.normalizedMessage || e.message; }
+      finally { busy.value = false; }
+    }
+    async function startUpdate() {
+      if (busy.value || !check.value.can_update) return;
+      busy.value = true;
+      error.value = '';
+      try {
+        await api.post('/api/update/start', {version: check.value.latest_version});
+        await pollUpdate();
+      } catch (e) { error.value = e.normalizedMessage || e.message; busy.value = false; }
+    }
+    onMounted(async () => {
+      await Promise.all([
+        checkUpdate(), refreshProgress(),
+        (async () => { try { version.value = unwrap(await api.get('/api/update/version')) || {}; } catch (e) { error.value = e.message; } })(),
+        (async () => { try { changes.value = unwrap(await api.get('/api/update/changelog')) || []; } catch (e) { error.value = e.message; } })()
+      ]);
+      if (progress.value.is_updating) pollUpdate();
+    });
+    onUnmounted(() => { disposed = true; });
+    const stat = (label, value) => h('div', {class: 'ui-stat c-blue'}, [
+      h('div', {class: 'ui-stat-label'}, label), h('div', {class: 'ui-stat-val', style: 'overflow-wrap:anywhere;font-size:15px'}, String(value))
+    ]);
+    return () => h('div', {class: 'upd-page'}, [
+      h('div', {class: 'ui-stat-grid upd-stats'}, [
+        stat('更新源', 'xmxxc/QQBotForge · personal'),
+        stat('当前提交', check.value.current_version || version.value.version || 'unknown'),
+        stat('personal 提交', check.value.latest_version || '—'),
+        stat('CI 状态', check.value.ci_status || 'unknown'),
+        stat('提交差距', check.value.gap == null ? '无法比较' : `${check.value.gap} 个提交`)
+      ]),
+      h('div', {class: 'upd-card'}, [
+        h('div', {class: 'upd-card-header'}, '手动更新'),
+        h('div', {class: 'upd-card-actions'}, [
+          h('button', {class: 'btn', onClick: checkUpdate, disabled: busy.value || !!progress.value.is_updating}, '检查更新'),
+          h('button', {class: 'btn btn-primary', onClick: startUpdate,
+            disabled: busy.value || !!progress.value.is_updating || !check.value.can_update}, '更新到最新')
+        ]),
+        h('p', null, '更新前自动备份 SQLite 数据库，切换后自动重启；WS 验证失败会回滚。'),
+        h('p', null, check.value.relation === 'diverged' ? '当前提交与 personal 无后续关系，无法更新。' : ''),
+        h('p', null, reminder),
+        error.value ? h('div', {class: 'upd-error'}, error.value) : null,
+        progress.value.message ? h('div', {class: 'upd-progress-msg'}, progress.value.message) : null,
+        progress.value.backup_path ? h('p', null, `数据库备份：${progress.value.backup_path}`) : null
+      ]),
+      h('div', {class: 'upd-card'}, [
+        h('div', {class: 'upd-card-header'}, [
+          h('span', {class: 'upd-title'}, 'personal 更新日志'),
+          h('a', {href: 'https://github.com/xmxxc/QQBotForge/tree/personal', target: '_blank', rel: 'noopener noreferrer'}, 'GitHub')
+        ]),
+        h('div', {class: 'upd-log-list'}, changes.value.map(commit => h('div', {class: 'upd-log-item', key: commit.full_sha || commit.sha}, [
+          h('code', null, commit.sha), h('div', {class: 'upd-log-msg'}, commit.message),
+          h('div', {class: 'upd-log-date'}, commit.date)
+        ])))
+      ])
+    ]);
+  }
+};
+export default Update;

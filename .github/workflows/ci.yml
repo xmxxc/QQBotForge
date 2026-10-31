@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - personal
   pull_request:
 
 permissions:
@@ -20,13 +21,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source revision
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.sha }}
           path: source
 
       - name: Checkout test assets
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           repository: ${{ env.CI_ASSETS_REPOSITORY }}
           ref: ${{ env.CI_ASSETS_SHA }}
@@ -57,7 +58,7 @@ jobs:
       - name: Stage tests with the source revision
         run: bash source/.github/scripts/stage-ci-assets.sh source ci-assets
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.13"
 
