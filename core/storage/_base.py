@@ -51,6 +51,54 @@ class _BatchQueue(Queue):
             return items
 
 
+_LOG_SLOT_TIMEOUT = 10  # 秒；期限在后续刷写时检查
+_HOLD = object()
+
+
+def _message_conversation(data):
+    """与现有消息日志一致：群按 group_id，私聊按 user_id 分开排序。"""
+    group_id = data.get('group_id') or ''
+    return ('group', group_id) if group_id else ('user', data.get('user_id') or '')
+
+
+class _LogSlot:
+    """队列中预留的一条日志：决定前只保留同会话的后续日志。"""
+
+    __slots__ = ('_service', '_log_type', '_deadline', '_data', '_state', '_conversation')
+
+    def __init__(self, service, log_type, conversation):
+        self._service = service
+        self._log_type = log_type
+        self._conversation = conversation
+        self._deadline = time.monotonic() + _LOG_SLOT_TIMEOUT
+        self._data = None
+        self._state = 'pending'
+
+    def fill(self, data):
+        """写入预留位置；预留已超时或遇到停机时退回队尾追加。"""
+        with self._service._queue_lock:
+            if self._state == 'pending':
+                self._data, self._state = data, 'filled'
+                return True
+            detached = self._state == 'detached'
+        return detached and self._service.add_sync(self._log_type, data)
+
+    def discard(self):
+        """放弃预留，不留下记录。"""
+        with self._service._queue_lock:
+            if self._state == 'pending':
+                self._state = 'discarded'
+
+    def resolve(self):
+        """刷写线程调用：返回待写数据，None 表示跳过，_HOLD 表示仍未决定。"""
+        with self._service._queue_lock:
+            if self._state == 'pending':
+                if self._service._accepting and time.monotonic() < self._deadline:
+                    return _HOLD
+                self._state = 'detached'
+            return self._data
+
+
 async def _shutdown_tasks(tasks, stop_event):
     """stop + cancel 所有后台任务"""
     stop_event.set()
@@ -215,11 +263,21 @@ class _BaseLogService:
             if not self._accepting:
                 return False
             try:
-                self._queues[log_type].put_nowait(data)
+                queue = self._queues[log_type]
+                # 允许扫描越过慢会话，但保留项也计入容量，避免无界积压。
+                limit = queue.maxsize + (self._batch_size or 10000)
+                if queue.qsize() + len(self._unprepared_batches[log_type]) >= limit:
+                    raise Full
+                queue.put_nowait(data)
                 return True
             except Full:
                 counter('log_queue_rejected')
                 return False
+
+    def reserve_sync(self, log_type, *, user_id='', group_id=''):
+        """按当前入队位置预留一条日志，稍后 fill 或 discard；未被接受时返回 None。"""
+        slot = _LogSlot(self, log_type, _message_conversation({'user_id': user_id, 'group_id': group_id}))
+        return slot if self.add_sync(log_type, slot) else None
 
     def _extract_row(self, log_type, data):
         """dict → INSERT 参数元组 (子类实现)"""
@@ -382,16 +440,28 @@ class _BaseLogService:
 
     def _prepare_batch(self, log_type):
         batch = self._unprepared_batches[log_type]
-        batch.extend(self._queues[log_type].take((self._batch_size or 10000) - len(batch)))
+        with self._queue_lock:
+            batch.extend(self._queues[log_type].take(self._batch_size or 10000))
         groups = defaultdict(list)
-        for item in batch:
+        held = []
+        blocked = set()
+        for entry in batch:
+            conversation = entry._conversation if isinstance(entry, _LogSlot) else _message_conversation(entry)
+            item = entry.resolve() if isinstance(entry, _LogSlot) else entry
+            if item is None:
+                continue
+            if item is _HOLD or conversation in blocked:
+                blocked.add(conversation)
+                held.append(entry)
+                continue
             ts = item['timestamp'] if 'timestamp' in item else now_str()
             row = self._extract_row(log_type, dict(item, timestamp=ts))
             if row:
                 groups[ts[:10] if log_type in DAILY_TYPES else None].append(row)
         self._pending_batches[log_type].extend(
             [(self._resolve_db_path(log_type, date), rows) for date, rows in groups.items()])
-        batch.clear()
+        with self._queue_lock:
+            batch[:] = held
 
     async def _flush_all(self):
         # 各文件独立刷写，单个库等待写锁不推迟其他队列。

@@ -312,25 +312,33 @@ class EventHandlerMixin:
             },
         )
 
-    def _record_consumed_event(self, bot, event, appid, owner):
+    def _reserve_receive_slot(self, bot, event):
+        """before_event 运行前按到达顺序预留接收记录位置，模块回复不会排到它前面。"""
+        if event.event_type not in MESSAGE_TYPES and event.event_type != INTERACTION_CREATE:
+            return None
+        reserve = getattr(bot.log_service, 'reserve_sync', None)
+        return reserve('message', user_id=event.user_id or '', group_id=event.group_id or '') if reserve else None
+
+    def _record_consumed_event(self, bot, event, appid, owner, slot=None):
         """before_event 接管的事件只记元信息 (类型/来源/接管模块)，不落正文与原始报文。"""
         et = event.event_type
         consumed = {'event_type': et, 'consumed_by': owner or ''}
         if et in MESSAGE_TYPES or et == INTERACTION_CREATE:
             at_bot = event.is_at_self if et == GROUP_MESSAGE_CREATE else True
-            bot.log_service.add_sync(
-                'message',
-                {
-                    'message_id': event.message_id or '',
-                    'user_id': event.user_id or '',
-                    'group_id': event.group_id or '',
-                    'content': '',
-                    'raw_message': '',
-                    'direction': 'receive',
-                    'at_bot': at_bot,
-                    'context': {'consumed': consumed},
-                },
-            )
+            data = {
+                'message_id': event.message_id or '',
+                'user_id': event.user_id or '',
+                'group_id': event.group_id or '',
+                'content': '',
+                'raw_message': '',
+                'direction': 'receive',
+                'at_bot': at_bot,
+                'context': {'consumed': consumed},
+            }
+            if slot is not None:
+                slot.fill(data)
+            else:
+                bot.log_service.add_sync('message', data)
         else:
             bot.log_service.add_sync(
                 'lifecycle',
@@ -398,10 +406,16 @@ class EventHandlerMixin:
         # 模块可接管或转换事件；返回 None 表示已经处理，不再进入内置分发。
         if self._hook_manager.has('before_event'):
             original = event
-            event, owner = await self._hook_manager.pipeline_with_owner('before_event', event)
-            if event is None:
-                self._record_consumed_event(bot, original, appid, owner)
-                return
+            # 放行、hook 取消或异常都放弃预留；放行的事件仍按下方原路径写普通接收日志。
+            slot = self._reserve_receive_slot(bot, event)
+            try:
+                event, owner = await self._hook_manager.pipeline_with_owner('before_event', event)
+                if event is None:
+                    self._record_consumed_event(bot, original, appid, owner, slot)
+                    return
+            finally:
+                if slot is not None:
+                    slot.discard()
             if event.appid != appid:
                 raise ValueError('before_event hook must preserve appid')
         et = event.event_type
