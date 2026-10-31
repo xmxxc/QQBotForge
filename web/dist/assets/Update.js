@@ -10,46 +10,86 @@ const Update = {
     const busy = ref(false), error = ref('');
     let disposed = false;
     const reminder = '重启后请确认群成员并使用「群状态 恢复」重建群状态。';
-    async function checkUpdate() {
+    const messageOf = e => e.normalizedMessage || e.message;
+    async function refreshStatus() {
+      const [nextVersion, nextCheck] = await Promise.all([
+        api.get('/api/update/version'), api.get('/api/update/check')
+      ]);
+      if (disposed) return;
+      const result = unwrap(nextCheck) || {};
+      version.value = unwrap(nextVersion) || {};
+      check.value = result.error ? {...result, can_update: false} : result;
+      if (result.error) throw new Error(result.error);
       error.value = '';
-      try {
-        check.value = unwrap(await api.get('/api/update/check')) || {};
-        error.value = check.value.error || '';
-      } catch (e) { error.value = e.normalizedMessage || e.message; }
     }
     async function refreshProgress() {
-      try { progress.value = unwrap(await api.get('/api/update/progress')) || {}; }
-      catch (e) { if (!busy.value) error.value = e.normalizedMessage || e.message; }
+      const result = unwrap(await api.get('/api/update/progress')) || {};
+      if (!disposed) progress.value = result;
+      return result;
+    }
+    function unavailable(e) {
+      if (disposed) return;
+      error.value = messageOf(e);
+      check.value = {...check.value, can_update: false};
+      // An unreachable service is unknown, not evidence of an active update.
+      progress.value = {...progress.value, is_updating: false};
     }
     async function pollUpdate() {
-      busy.value = true;
+      let failures = 0, settled = false;
       try {
-        do {
+        while (!disposed) {
           await new Promise(resolve => setTimeout(resolve, 1000));
           if (disposed) return;
-          await refreshProgress();
-        } while (progress.value.is_updating || !['completed', 'failed'].includes(progress.value.stage));
-        version.value = unwrap(await api.get('/api/update/version')) || {};
-        await checkUpdate();
-      } catch (e) { error.value = e.normalizedMessage || e.message; }
-      finally { busy.value = false; }
+          try {
+            const current = settled ? progress.value : await refreshProgress();
+            if (disposed) return;
+            if (!current.is_updating && ['idle', 'completed', 'failed'].includes(current.stage)) {
+              settled = true;
+              await refreshStatus();
+              return;
+            }
+            failures = 0;
+          } catch (e) {
+            if (disposed) return;
+            error.value = messageOf(e);
+            // Bound consecutive transport/status failures; manual check can recover.
+            if (++failures >= 60) { unavailable(e); return; }
+          }
+        }
+      } finally { if (!disposed) busy.value = false; }
+    }
+    async function checkUpdate() {
+      if (disposed || busy.value) return;
+      busy.value = true;
+      error.value = '';
+      try {
+        const current = await refreshProgress();
+        if (disposed) return;
+        if (current.is_updating) { await pollUpdate(); return; }
+        await refreshStatus();
+      } catch (e) { unavailable(e); }
+      finally { if (!disposed) busy.value = false; }
     }
     async function startUpdate() {
-      if (busy.value || !check.value.can_update) return;
+      if (disposed || busy.value || !check.value.can_update) return;
       busy.value = true;
       error.value = '';
       try {
         await api.post('/api/update/start', {version: check.value.latest_version});
-        await pollUpdate();
-      } catch (e) { error.value = e.normalizedMessage || e.message; busy.value = false; }
+        if (!disposed) await pollUpdate();
+      } catch (e) { unavailable(e); }
+      finally { if (!disposed) busy.value = false; }
     }
     onMounted(async () => {
       await Promise.all([
-        checkUpdate(), refreshProgress(),
-        (async () => { try { version.value = unwrap(await api.get('/api/update/version')) || {}; } catch (e) { error.value = e.message; } })(),
-        (async () => { try { changes.value = unwrap(await api.get('/api/update/changelog')) || []; } catch (e) { error.value = e.message; } })()
+        checkUpdate(),
+        (async () => {
+          try {
+            const result = unwrap(await api.get('/api/update/changelog')) || [];
+            if (!disposed) changes.value = result;
+          } catch (e) { if (!disposed) error.value = messageOf(e); }
+        })()
       ]);
-      if (progress.value.is_updating) pollUpdate();
     });
     onUnmounted(() => { disposed = true; });
     const stat = (label, value) => h('div', {class: 'ui-stat c-blue'}, [
@@ -74,7 +114,7 @@ const Update = {
         h('p', null, check.value.relation === 'diverged' ? '当前提交与 personal 无后续关系，无法更新。' : ''),
         h('p', null, reminder),
         error.value ? h('div', {class: 'upd-error'}, error.value) : null,
-        progress.value.message ? h('div', {class: 'upd-progress-msg'}, progress.value.message) : null,
+        progress.value.message ? h('div', {class: 'upd-progress-msg'}, progress.value.message.split(reminder).join('').trim()) : null,
         progress.value.backup_path ? h('p', null, `数据库备份：${progress.value.backup_path}`) : null
       ]),
       h('div', {class: 'upd-card'}, [
