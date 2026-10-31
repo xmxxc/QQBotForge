@@ -408,6 +408,26 @@ async def test_bot_join_or_removal_pauses_explicit_sources_until_verified(access
     assert (await acl.evaluate('bot-a', 'reports', 'read', 'group-a', 'member-c', 'report-r'))['allowed']
 
 
+async def rejected_event_done(host, **options):
+    """Observe this delivery's real callback completion, including an acknowledged duplicate."""
+    state = host.state
+    completed = asyncio.Event()
+    callback = state.recovery._callback
+
+    async def observed(delivery):
+        await callback(delivery)
+        if delivery.event.appid == 'bot-a' and delivery.event.sequence == 4:
+            completed.set()
+
+    state.recovery._callback = observed
+    try:
+        host.lifecycle('GROUP_MEMBER_REMOVE', member='member-a', sequence=4, **options)
+        await until(completed.is_set)
+        await until(lambda: not state.recovery.get_status('bot-a').pending and not state.notifications.busy('bot-a'))
+    finally:
+        state.recovery._callback = callback
+
+
 @pytest.mark.parametrize('stale', ['late', 'same_time', 'conflict', 'incomplete', 'replay'])
 async def test_rejected_native_event_cannot_revoke_new_cycle_grant(access_host, stale):
     host = access_host
@@ -433,9 +453,7 @@ async def test_rejected_native_event_cannot_revoke_new_cycle_grant(access_host, 
         'incomplete': {'event_id': None, 'timestamp': 1002},
         'replay': {'event_id': 'event-2', 'timestamp': 1000},
     }[stale]
-    host.lifecycle('GROUP_MEMBER_REMOVE', member='member-a', sequence=4, **options)
-    await until(lambda: not state.recovery.get_status('bot-a').pending)
-    await asyncio.sleep(0.05)
+    await rejected_event_done(host, **options)
     for consumer, grant in renewed.items():
         assert [g['id'] for g in (await acl.access_snapshot('bot-a', consumer))['grants']] == [grant['id']]
     if stale != 'replay':
@@ -452,6 +470,49 @@ async def test_rejected_native_event_cannot_revoke_new_cycle_grant(access_host, 
         assert not snapshot['grants'] and snapshot['revocations'][-1]['id'] == grant['id']
     left = await acl.evaluate('bot-a', 'reports', 'read', 'group-a', 'member-a', 'report-r')
     assert not left['allowed'] and left['reason'] == 'member_left'
+
+
+async def test_late_event_rebuild_waits_for_real_consumer_completion(access_host, monkeypatch):
+    host, entered, release, waiting = access_host, asyncio.Event(), asyncio.Event(), asyncio.Event()
+    state = host.state
+
+    async def held(change):
+        if change['reason'] == 'late_event':
+            entered.set()
+            await release.wait()
+
+    state.subscribe(held)
+    synchronize = rejected_event_done
+
+    async def observed_wait(host, **options):
+        waiting.set()
+        await synchronize(host, **options)
+
+    monkeypatch.setitem(globals(), 'rejected_event_done', observed_wait)
+    scenario = asyncio.create_task(test_rejected_native_event_cannot_revoke_new_cycle_grant(host, 'late'))
+    wait_started = asyncio.create_task(waiting.wait())
+    try:
+        await until(entered.is_set)
+        await asyncio.wait((scenario, wait_started), return_when=asyncio.FIRST_COMPLETED)
+        # The scenario must wait for the actual held consumer, rather than reach rebuild early.
+        assert not scenario.done()
+        assert state.notifications.busy('bot-a') and state.recovery.get_status('bot-a').pending
+        assert not await state.rebuild('bot-a')
+        for consumer in ('reports', 'other'):
+            snapshot = await host.access.access_snapshot('bot-a', consumer)
+            assert len(snapshot['grants']) == 1
+            decision = await host.access.evaluate('bot-a', consumer, 'read', 'group-a', 'member-a', 'report-r')
+            assert not decision['allowed'] and decision['reason'] == 'group_facts_recovery_required'
+        release.set()
+        # The original scenario now checks restored eligibility, then a real leave revokes both sources.
+        await scenario
+    finally:
+        release.set()
+        if not scenario.done():
+            scenario.cancel()
+        await asyncio.gather(scenario, return_exceptions=True)
+        wait_started.cancel()
+        await asyncio.gather(wait_started, return_exceptions=True)
 
 
 async def test_unaffected_member_keeps_grant_after_trusted_member_events(access_host):

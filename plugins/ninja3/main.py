@@ -54,7 +54,19 @@ async def unload():
 
 
 @handler(
-    r'^(?:忍3(?:批量(?:改密|确认|任务|取消)|改密|确认|重试|任务|取消|恢复|核验|放弃|紧急模式|退出紧急模式|紧急状态)(?:\s.*)?|授权(?:\s.*)?|账号列表|账号\s+\S.*|忍3)$',
+    r'^(?:授权|撤销|拉黑|解除拉黑|确认在群|为什么)(?:\s.*)?$',
+    name='忍者必须死3主人命令',
+    priority=20,
+    block=True,
+    event_types=['GROUP_AT_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE'],
+)
+async def owner_entry(event, _match):
+    if _instance is not None:
+        await _instance.owner_command(event, (event.content or '').strip().split(maxsplit=1)[0])
+
+
+@handler(
+    r'^(?:忍3(?:批量(?:改密|确认|任务|取消)|改密|确认|重试|任务|取消|恢复|核验|放弃|紧急模式|退出紧急模式|紧急状态)(?:\s.*)?|账号列表|账号\s+\S.*|忍3)$',
     name='忍者必须死3',
     priority=20,
     block=True,
@@ -69,8 +81,6 @@ async def entry(event, _match):
         await _instance.emergency_command(event)
     elif content.startswith(('忍3批量', '忍3改密', '忍3确认', '忍3重试', '忍3任务', '忍3取消', '忍3恢复', '忍3核验', '忍3放弃')):
         await _instance.password_command(event)
-    elif content.startswith('授权'):
-        await _instance.authorize(event)
     elif content == '账号列表':
         await _instance.query(event)
     elif content == '忍3':

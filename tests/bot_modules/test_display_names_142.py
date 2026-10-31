@@ -65,8 +65,8 @@ async def test_authorize_reply_names_the_mentioned_member(ninja):
     host = ninja
     await host.setup()
     # The mention carries the member's latest name; the framework's write may still be queued.
-    assert await grant(host) == ['已授权 显示名（…BERA） 查询本群开放账号，长期有效']
-    assert await grant(host) == ['显示名（…BERA） 已有本群授权']
+    assert await grant(host) == ['已授权 显示名（…BERA）在 未知群（…up-a） 查询忍3开放账号，长期有效']
+    assert await grant(host) == ['显示名（…BERA）已有 未知群（…up-a） 的忍3查询授权']
 
 
 async def test_ninja3_owner_page_api_returns_names_beside_unchanged_data(ninja):

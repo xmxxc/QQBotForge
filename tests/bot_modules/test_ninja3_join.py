@@ -511,7 +511,7 @@ async def test_reloads_restart_and_new_session_never_revive_an_automatic_source(
     assert proof['usable'] and proof['member']['cycle'] == source['cycle'] and proof['join'] is None
     assert await autos(host) == [source] and await host.say('账号列表', user='MEMBERJ') == REFUSED
     # Only the owner's own grant restores access, as a separate owner source.
-    assert await host.say('授权', user='owner-a', mentions=['MEMBERJ']) == ['已授权 显示名（…BERJ） 查询本群开放账号，长期有效']
+    assert await host.say('授权', user='owner-a', mentions=['MEMBERJ']) == ['已授权 显示名（…BERJ）在 未知群（…up-a） 查询忍3开放账号，长期有效']
     assert_listed(await host.say('账号列表', user='MEMBERJ'))
 
 
