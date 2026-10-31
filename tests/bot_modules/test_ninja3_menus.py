@@ -78,8 +78,9 @@ async def test_owner_menu_is_shared_but_management_rechecks_owner(ninja):
     assert not (await h.ninja_api('GET', 'notices'))[1]['data']
     await h.say('菜单', user='owner-a')
     management = buttons(h)[1:]
-    assert [b['text'] for b in management] == ['主人菜单', '修改密码', '紧急模式']
+    assert [b['text'] for b in management] == ['修改密码', '紧急模式', '主人菜单']
     for b in management:
+        h.texts()
         await h.click(b['data'], user='MEMBERA', group='group-a')
         assert h.texts() == ['仅主人可用' if b['text'] == '主人菜单' else '仅主人可以管理']
         await h.click(b['data'], user='owner-a', group='group-a')

@@ -832,7 +832,7 @@ class Ninja3:
 
             items = [('账号列表', {'kind': 'list'})]
             if self.is_owner(event):
-                items += [('主人菜单', {'manage': '主人菜单'}), ('修改密码', {'manage': '修改密码'}), ('紧急模式', {'manage': '紧急模式'})]
+                items += [('修改密码', {'manage': '修改密码'}), ('紧急模式', {'manage': '紧急模式'}), ('主人菜单', {'manage': '主人菜单'})]
             await self.offer(event, '忍者必须死3 菜单', items, current)
             return True
         except (BusinessError, RuntimeError, ValueError, sqlite3.Error, OSError):
