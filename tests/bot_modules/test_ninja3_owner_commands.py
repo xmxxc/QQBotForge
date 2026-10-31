@@ -16,7 +16,7 @@ from core.base.config import cfg
 from core.message.event import Event
 from plugins.ninja3.owner_commands import mention_target
 
-MEMBER = '未知成员（…BERA）'
+MEMBER = '显示名（…BERA）'
 GROUP = '未知群（…up-a）'
 COMMANDS = ['授权', '撤销', '拉黑', '解除拉黑', '为什么', '确认在群']
 
@@ -70,7 +70,7 @@ async def test_known_names_are_displayed(ninja):
     log = host.application.get_bot('bot-a').log_service
     log.db_fetch_one = AsyncMock(side_effect=lambda sql, params: names.get(params[0]))
     await grant(host)
-    assert await command(host, '撤销') == ['已撤销 chair（…BERA）在 白子 的忍3查询授权']
+    assert await command(host, '撤销') == ['已撤销 显示名（…BERA）在 白子 的忍3查询授权']
 
 
 async def test_revoke_removes_this_group_grant_only(ninja):
@@ -458,4 +458,27 @@ async def test_json_commands_keep_working(ninja):
     assert json.loads(host.texts()[-1])['version']
     assert len((await acl_state(host))[1]) == 1
     await host.event('群状态 确认 {"group":"group-a","member":"MEMBERB","evidence":"主人已核对"}', user='owner-a')
-    assert host.texts()[-1].startswith('成员人工确认\n群 group-a 成员 MEMBERB：可靠（已核验）')
+    assert host.texts()[-1].startswith('成员人工确认\n群 未知群（…up-a） 成员 未知成员（…BERB）：可靠（已核验）')
+
+
+@pytest.mark.parametrize('name', ['授权', '为什么', '确认在群', '拉黑'])
+async def test_mention_name_precedes_cache_and_is_neutralised(ninja, name):
+    host = ninja
+    await host.setup()
+    log = host.application.get_bot('bot-a').log_service
+    log.db_fetch_one = AsyncMock(return_value={'name': '旧缓存', 'group_name': '测试群'})
+    reply = await command(host, name, mention_name='**最新** <@all>')
+    assert '＊＊最新＊＊ ＜＠all＞（…BERA）' in str(reply)
+    assert '<@all>' not in str(reply) and '旧缓存' not in str(reply)
+    assert await command(host, name, user='MEMBERB') == [
+        '仅主人可以授权' if name == '授权' else f'仅主人可以使用“{name} @成员”'
+    ]
+
+
+@pytest.mark.parametrize('cached, expected', [('缓存名', '缓存名（…BERA）'), ('', '未知成员（…BERA）')])
+async def test_empty_mention_name_uses_cached_then_unknown_label(ninja, cached, expected):
+    host = ninja
+    await host.setup()
+    log = host.application.get_bot('bot-a').log_service
+    log.db_fetch_one = AsyncMock(return_value={'name': cached})
+    assert expected in str(await command(host, '为什么', mention_name=''))

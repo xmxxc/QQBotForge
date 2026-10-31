@@ -92,6 +92,11 @@ TITLES = {
 MAX_MEMBERS = 50
 
 
+def shown(names, kind, native):
+    """Display text resolved by the caller (see GroupState.display_names); the raw ID when absent."""
+    return (names or {}).get(kind, {}).get(native) or native
+
+
 def reason_text(code):
     return REASONS.get(code, f'其他原因（{code}）') if code else ''
 
@@ -174,33 +179,36 @@ def bot_state(group):
     return f'{prefix}Bot 在群（{role(state.get("member_role"))}），{proactive}'
 
 
-def group_line(group):
+def group_line(group, names=None):
     members = [m for m in (group.get('members') or {}).values() if m.get('status') != 'left']
     reliable = sum(m.get('reliable') is True for m in members)
     return (
-        f'{group.get("group")}：{label(group)}{paused(group)}；{bot_state(group)}；最近查询 {when(group.get("checked_at"))}；'
+        f'{shown(names, "groups", group.get("group"))}：{label(group)}{paused(group)}；{bot_state(group)}；最近查询 {when(group.get("checked_at"))}；'
         f'名册{label(group.get("roster"))}；已知成员 {len(members)} 人，可靠 {reliable} 人'
     )
 
 
-def roster_lines(result):
+def roster_lines(result, names=None):
     complete = result.get('complete') is True
     members = result.get('members') or []
     state = '完整' if complete else '不完整，原因：' + (reason_text(result.get('reason') or result.get('continuity_reason')) or '未知')
-    lines = [f'群 {result.get("group")}：名册{state}', f'本轮读到 {len(members)} 人（{"可作全群名单" if complete else "仅本轮观察，不能作全群名单"}）']
+    lines = [
+        f'群 {shown(names, "groups", result.get("group"))}：名册{state}',
+        f'本轮读到 {len(members)} 人（{"可作全群名单" if complete else "仅本轮观察，不能作全群名单"}）',
+    ]
     for record in members[:MAX_MEMBERS]:
         lines.append(
-            f'{record.get("member")}：{role(record.get("member_role"))}{bot_mark(record.get("bot"), record.get("member") == result.get("self_member"))}'
+            f'{shown(names, "members", record.get("member"))}：{role(record.get("member_role"))}{bot_mark(record.get("bot"), record.get("member") == result.get("self_member"))}'
         )
     if len(members) > MAX_MEMBERS:
         lines.append(f'另有 {len(members) - MAX_MEMBERS} 人，请在后台查看')
     if result.get('missing_known_members'):
-        lines.append('名册缺少的已知成员：' + '、'.join(result['missing_known_members']))
+        lines.append('名册缺少的已知成员：' + '、'.join(shown(names, 'members', m) for m in result['missing_known_members']))
     return lines
 
 
-def owner_reply(operation, result, *, pause=''):
-    """Owner private reply; detail (members, native IDs) never goes to group chats, see short_reply."""
+def owner_reply(operation, result, *, pause='', names=None):
+    """Owner private reply; detail (members, names) never goes to group chats, see short_reply."""
     title = TITLES[operation]
     if operation == 'rebuild':
         if result.get('ready') is True:
@@ -209,15 +217,21 @@ def owner_reply(operation, result, *, pause=''):
         return f'{title}：未完成，事实仍暂停使用。请查看“群状态”中未就绪或待核验的群／成员，处理后再发“群状态 恢复”'
     if operation == 'overview':
         groups = result.get('groups') or []
-        lines = [recovery_line(result.get('recovery') or {}, pause), f'已知群 {len(groups)} 个', *map(group_line, groups)]
+        lines = [recovery_line(result.get('recovery') or {}, pause), f'已知群 {len(groups)} 个', *(group_line(g, names) for g in groups)]
         return '\n'.join([f'{title}（仅已知群，不代表全部群）', *lines])
     if operation == 'refresh':
-        lines = [f'群 {result.get("group")}：{label(result)}{paused(result)}', bot_state(result), f'最近查询 {when(result.get("checked_at"))}']
+        lines = [
+            f'群 {shown(names, "groups", result.get("group"))}：{label(result)}{paused(result)}',
+            bot_state(result),
+            f'最近查询 {when(result.get("checked_at"))}',
+        ]
     elif operation == 'roster':
-        lines = roster_lines(result)
+        lines = roster_lines(result, names)
     else:
-        member = f'{result.get("member")}：{label(result)}{paused(result)}，{role(result.get("member_role"))}{bot_mark(result.get("bot"))}'
-        lines = [f'群 {result.get("group")} 成员 {member}', f'最近查询 {when(result.get("checked_at"))}']
+        member = (
+            f'{shown(names, "members", result.get("member"))}：{label(result)}{paused(result)}，{role(result.get("member_role"))}{bot_mark(result.get("bot"))}'
+        )
+        lines = [f'群 {shown(names, "groups", result.get("group"))} 成员 {member}', f'最近查询 {when(result.get("checked_at"))}']
     return '\n'.join([title, *lines])
 
 

@@ -53,7 +53,7 @@ async def test_owner_syncs_complete_pages_roles_and_verifies_one_member(group_ho
     assert not (await host.state.snapshot('bot-a'))['groups'][0]['roster']['complete']
     assert (await host.state.snapshot('bot-b'))['groups'] == []
     await host.event('群状态 名册 group-a')
-    assert 'other-bot' in host.sender.messages[-1][2]
+    assert '未知成员（…-bot）：成员，Bot' in host.sender.messages[-1][2]
 
 
 @pytest.mark.parametrize(

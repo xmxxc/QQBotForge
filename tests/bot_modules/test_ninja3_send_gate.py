@@ -130,7 +130,8 @@ async def test_each_credential_message_has_its_own_final_gate(ninja, wire, marke
     await host.ninja_api('PATCH', 'accounts/' + (await host.ninja_api())[1]['data'][0]['id'], {'enabled': False})
     wire.release.set()
     await task
-    contents = [payload.get('content', payload.get('markdown', {}).get('content')) for payload in wire.sent]
+    # The page's group name lookup is a GET without payload (#142); only messages count here.
+    contents = [payload.get('content', payload.get('markdown', {}).get('content')) for payload in wire.sent if payload is not None]
     assert contents == ['名称：账号A', 'fake-login', SECRET][:sent_before_block] + [CHANGED]
 
 

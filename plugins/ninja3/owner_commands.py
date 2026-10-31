@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from core.base.config import cfg
 from core.base.logger import PLUGIN, get_logger
-from core.display import display_group, display_member
+from core.display import display_group
 
 from . import service
 
@@ -193,7 +193,7 @@ class OwnerCommands:
                 'facts': facts,
                 'proof': proof,
                 'member': member,
-                'who': await display_member(bot, member),
+                'who': await service.member_label(bot, member, next((m.get('username') or '' for m in event.mentions if isinstance(m, dict) and m.get('id') == member), '')),
                 'where': await display_group(bot, group),
             }
             await getattr(self, METHODS[name])(target)

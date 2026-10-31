@@ -31,12 +31,12 @@ async def ninja(account_host):
         )
         return response.status, await response.json()
 
-    async def say(text, *, user, group='group-a', bot='bot-a', mentions=(), at_bot=True, event_type='GROUP_AT_MESSAGE_CREATE', union_id=''):
+    async def say(text, *, user, group='group-a', bot='bot-a', mentions=(), at_bot=True, event_type='GROUP_AT_MESSAGE_CREATE', union_id='', mention_name='显示名'):
         from core.base import tasks
         from core.message.event import Event
 
         payload = [{'id': 'BOT' + bot[-1].upper(), 'is_you': True, 'bot': True}] if at_bot else []
-        payload += [{'id': m, 'member_openid': m, 'is_you': False, 'bot': False, 'username': '显示名'} for m in mentions]
+        payload += [{'id': m, 'member_openid': m, 'is_you': False, 'bot': False, 'username': mention_name} for m in mentions]
         content = ('<@BOT> ' if at_bot else '') + text + ''.join(f' <@{m}>' for m in mentions)
         event = Event.from_websocket(
             bot,
@@ -119,7 +119,7 @@ async def test_owner_mention_grant_covers_future_accounts_and_member_queries_pub
     host = ninja
     await host.setup(description='', url='')
     # The member was never verified, rostered or bound: the owner's command is the in-group evidence.
-    assert await grant(host) == ['已授权 未知成员（…BERA）在 未知群（…up-a） 查询忍3开放账号，长期有效']
+    assert await grant(host) == ['已授权 显示名（…BERA）在 未知群（…up-a） 查询忍3开放账号，长期有效']
     fact = await host.state.fact('bot-a', 'group-a', 'MEMBERA')
     assert fact['usable'] and fact['member']['source'] == 'owner_confirmed' and '授权 @成员' in fact['member']['evidence']
     snapshot = await host.access.access_snapshot('bot-a', 'ninja3')
@@ -135,7 +135,7 @@ async def test_owner_mention_grant_covers_future_accounts_and_member_queries_pub
     # A later account opened in this group is covered by the same grant; repeat grants add nothing.
     await host.setup(name='账号B', password='fake-b', description='说明B')
     assert await host.say('账号 账号B', user='MEMBERA', at_bot=False) == ['名称：账号B\n说明：说明B', 'fake-login', 'fake-b']
-    assert await grant(host) == ['未知成员（…BERA）已有 未知群（…up-a） 的忍3查询授权']
+    assert await grant(host) == ['显示名（…BERA）已有 未知群（…up-a） 的忍3查询授权']
     assert len(grants(await host.access.access_snapshot('bot-a', 'ninja3'))) == 1
     assert '账号查询 group=group-a member=MEMBERA result=sent' in caplog.text and SECRET not in caplog.text and 'fake-b' not in caplog.text
 
@@ -205,7 +205,7 @@ async def test_unauthorized_attempts_notify_owner_once_per_ten_minutes_and_keep_
     assert 'accounts' not in read  # an ungranted caller never loads account rows
     store.all = real_all
     pushes = [m for m in host.sender.messages if m[0] == 'push']
-    assert len(pushes) == 1 and pushes[0][1] == 'owner-a' and 'MEMBERA' in pushes[0][2] and '授权 @该成员' in pushes[0][2]
+    assert len(pushes) == 1 and pushes[0][1] == 'owner-a' and '未知成员（…BERA）' in pushes[0][2] and '授权 @该成员' in pushes[0][2]
     host.sender.messages.clear()
     now[0] += 599
     assert await host.say('账号 账号A', user='MEMBERA') == ['你暂无查询权限，已记录给主人']
@@ -215,7 +215,7 @@ async def test_unauthorized_attempts_notify_owner_once_per_ten_minutes_and_keep_
     await host.say('账号列表', user='MEMBERB')
     now[0] += 2
     await host.say('账号列表', user='MEMBERA')
-    assert [m[2].split('的成员 ')[1][:7] for m in host.sender.messages if m[0] == 'push'] == ['MEMBERB', 'MEMBERA']
+    assert [m[2].split('的成员 ')[1].split(' 尝试')[0] for m in host.sender.messages if m[0] == 'push'] == ['未知成员（…BERB）', '未知成员（…BERA）']
     assert all(SECRET not in str(m) for m in host.sender.messages)
     # Unreachable owner (bot-b never chatted privately): the notice stays as an authenticated todo.
     host.sender.messages.clear()
@@ -244,7 +244,7 @@ async def test_denial_wins_and_disable_close_rescope_delete_take_effect(ninja):
     assert await host.say('账号 账号A', user='MEMBERA') == ['你暂无查询权限']
     assert not [m for m in host.sender.messages if m[0] == 'push'] and not (await host.ninja_api('GET', 'notices'))[1]['data']
     # A repeated owner grant cannot lift the denial.
-    assert await grant(host) == ['未知成员（…BERA）已有 未知群（…up-a） 的忍3查询授权\n该成员在拒绝名单中，拒绝优先，当前仍不能查询']
+    assert await grant(host) == ['显示名（…BERA）已有 未知群（…up-a） 的忍3查询授权\n该成员在拒绝名单中，拒绝优先，当前仍不能查询']
     await acl.manage_access('bot-a', 'ninja3', 'allow', function='query', group='group-a', member='MEMBERA')
     assert SECRET in str(await host.say('账号 账号A', user='MEMBERA'))
     await host.ninja_api('PATCH', 'accounts/' + account['id'], {'enabled': False})
