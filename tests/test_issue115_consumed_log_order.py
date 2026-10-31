@@ -215,3 +215,76 @@ async def test_shutdown_does_not_wait_for_undecided_receive(log_app):
     with sqlite3.connect(log_app.service._resolve_db_path('message')) as conn:
         rows = conn.execute('SELECT direction, message_id FROM log ORDER BY id').fetchall()
     assert rows == [('send', 'reply-m-8')]
+
+
+async def test_slow_hook_only_holds_its_conversation(log_app):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def slow(event):
+        if event.message_id == 'slow':
+            _reply(log_app, event)
+            entered.set()
+            await release.wait()
+            return None
+        return event
+
+    log_app.app.hook_manager.register('before_event', slow, owner=CONSUMED_BY)
+    task = asyncio.create_task(log_app.app._on_event(_c2c('slow', 'private')))
+    await asyncio.wait_for(entered.wait(), 1)
+    try:
+        await log_app.app._on_event(_group_at('other-group', 'ordinary'))
+        other_user = _c2c('other-user', 'ordinary')
+        other_user.user_id = 'owner-2'
+        await log_app.app._on_event(other_user)
+        await log_app.app._on_event(_c2c('same-user', 'ordinary'))
+        assert [r['message_id'] for r in await _rows(log_app)] == ['other-group', 'other-user']
+        release.set()
+        await task
+        assert [r['message_id'] for r in await _rows(log_app)] == [
+            'other-group', 'other-user', 'slow', 'reply-slow', 'same-user',
+        ]
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_consumed_in_place_type_conversion_releases_message_slot(log_app):
+    async def transform(event):
+        event.event_type = 'CUSTOM_TASK_COMPLETE'
+        return event
+
+    async def consume(event):
+        return None
+
+    log_app.app.hook_manager.register('before_event', transform, owner='transform', priority=0)
+    log_app.app.hook_manager.register('before_event', consume, owner=CONSUMED_BY, priority=1)
+    event = _c2c('converted', 'sensitive input')
+    await log_app.app._on_event(event)
+    _reply(log_app, event)
+    assert [r['message_id'] for r in await _rows(log_app)] == ['reply-converted']
+    await log_app.service._flush_type('lifecycle')
+    rows = log_app.service.query('lifecycle', 'SELECT type, extra FROM log')
+    assert rows == [{'type': 'CUSTOM_TASK_COMPLETE', 'extra': _consumed_context('CUSTOM_TASK_COMPLETE')}]
+
+
+async def test_full_held_batch_does_not_starve_other_conversation(tmp_path):
+    service = LogService(str(tmp_path), APPID, batch_size=2)
+    slot = service.reserve_sync('message', user_id='slow')
+    try:
+        for index in range(5):
+            assert service.add_sync('message', {
+                'message_id': f'slow-{index}', 'user_id': 'slow', 'direction': 'send',
+            })
+        assert service.add_sync('message', {
+            'message_id': 'fast', 'user_id': 'fast', 'direction': 'send',
+        })
+        for _ in range(4):
+            await service._flush_type('message')
+        assert service.query('message', 'SELECT message_id FROM log') == [{'message_id': 'fast'}]
+        slot.fill({'message_id': 'slow-receive', 'user_id': 'slow', 'direction': 'receive'})
+        await service._flush_type('message')
+        assert [r['message_id'] for r in service.query('message', 'SELECT message_id FROM log ORDER BY id')] == [
+            'fast', 'slow-receive', 'slow-0', 'slow-1', 'slow-2', 'slow-3', 'slow-4',
+        ]
+    finally:
+        await service.shutdown()

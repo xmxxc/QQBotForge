@@ -317,7 +317,7 @@ class EventHandlerMixin:
         if event.event_type not in MESSAGE_TYPES and event.event_type != INTERACTION_CREATE:
             return None
         reserve = getattr(bot.log_service, 'reserve_sync', None)
-        return reserve('message') if reserve else None
+        return reserve('message', user_id=event.user_id or '', group_id=event.group_id or '') if reserve else None
 
     def _record_consumed_event(self, bot, event, appid, owner, slot=None):
         """before_event 接管的事件只记元信息 (类型/来源/接管模块)，不落正文与原始报文。"""
@@ -410,15 +410,12 @@ class EventHandlerMixin:
             slot = self._reserve_receive_slot(bot, event)
             try:
                 event, owner = await self._hook_manager.pipeline_with_owner('before_event', event)
-            except BaseException:
+                if event is None:
+                    self._record_consumed_event(bot, original, appid, owner, slot)
+                    return
+            finally:
                 if slot is not None:
                     slot.discard()
-                raise
-            if event is None:
-                self._record_consumed_event(bot, original, appid, owner, slot)
-                return
-            if slot is not None:
-                slot.discard()
             if event.appid != appid:
                 raise ValueError('before_event hook must preserve appid')
         et = event.event_type
