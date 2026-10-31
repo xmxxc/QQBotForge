@@ -1,24 +1,22 @@
 """框架更新 — 版本检查/更新日志/在线更新/上传更新"""
 
 import asyncio
-import contextlib
 import json
 import logging
-import os
-import tempfile
 from datetime import datetime, timedelta, timezone
-from typing import cast
 
-from aiohttp import BodyPartReader, web
+from aiohttp import web
 
+from web.tools._market.mirror import _test_one_mirror
+from web.tools._market.mirrors import GITHUB_FILE_MIRRORS, _load_mirror_cache, _save_mirror_cache, clear_mirror_cache
 from web.tools._updater.framework import FrameworkUpdater
-from web.tools._updater.mirror import _test_one_mirror, clear_mirror_cache, detect_environment
-from web.tools._updater.shared import GITHUB_FILE_MIRRORS, _load_mirror_cache, _save_mirror_cache
+from web.tools._updater.supervisor import UNSUPPORTED
 
 log = logging.getLogger('ElainaBot.web.updater')
 
 _base_dir = ''
 _updater = None
+_update_task = None
 
 
 def set_context(base_dir: str):
@@ -27,17 +25,27 @@ def set_context(base_dir: str):
     _updater = FrameworkUpdater(base_dir)
 
 
-def _get_updater():
+def get_updater(base_dir: str | None = None):
+    # Startup recovery and the owner menu must work without the web panel.
+    if not _updater and base_dir:
+        set_context(base_dir)
     if not _updater:
         raise RuntimeError('更新器未初始化')
     return _updater
+
+
+_get_updater = get_updater  # older callers
 
 
 # ==================== 环境检测 ====================
 
 
 async def handle_detect_environment(request: web.Request):
-    return web.json_response({'success': True, 'data': detect_environment()})
+    updater = _get_updater()
+    environment = updater.environment()
+    is_git = environment == 'git'
+    warnings = [] if is_git else [UNSUPPORTED if environment == 'unsupported' else '请拉取新镜像或重新 Git 部署']
+    return web.json_response({'success': True, 'data': {'git': is_git, 'writable': is_git, 'warnings': warnings}})
 
 
 # ==================== 更新日志 ====================
@@ -124,36 +132,41 @@ async def handle_get_update_progress(request: web.Request):
 
 
 async def handle_start_update(request: web.Request):
+    global _update_task
     try:
         body = await request.json()
-    except Exception:
-        body = {}
+    except (ValueError, TypeError):
+        return web.json_response({'success': False, 'message': '请求必须是 JSON 对象'}, status=400)
+    if not isinstance(body, dict) or ('version' in body and not isinstance(body['version'], str)):
+        return web.json_response({'success': False, 'message': '更新参数无效'}, status=400)
+    updater = get_updater()
+    if not updater.supported():
+        return web.json_response({'success': False, 'message': UNSUPPORTED}, status=400)
+    try:
+        if (_update_task and not _update_task.done()) or updater.lock_active():
+            return web.json_response({'success': False, 'message': '已有更新或启动验证正在进行'}, status=409)
+    except OSError:
+        return web.json_response({'success': False, 'message': '无法获取更新锁，请检查运行目录权限和文件系统 flock 支持'}, status=400)
 
-    updater = _get_updater()
-
-    # 设置自定义镜像
-    if body.get('mirror'):
-        updater.set_custom_mirror(body['mirror'])
-
-    skip_backup = body.get('skip_backup', False)
-    auto_restart = body.get('auto_restart', False)
-
-    async def _do_update():
+    async def do_update():
         try:
-            if body.get('force'):
-                await updater.force_update(skip_backup=skip_backup, auto_restart=auto_restart)
-            elif body.get('version'):
-                await updater.update_to_version(body['version'], skip_backup=skip_backup, auto_restart=auto_restart)
+            if body.get('version'):
+                result = await updater.update_to_version(body['version'])
             else:
-                await updater.update_to_latest(skip_backup=skip_backup, auto_restart=auto_restart)
-        except Exception as e:
-            updater._report('failed', f'更新出错: {e}', 0)
+                result = await updater.update_to_latest()
+            if not result['success']:
+                updater._report('failed', result['message'])
+        except Exception:
+            log.exception('手动更新失败')
+            updater._report('failed', '更新失败，请查看框架日志')
 
-    asyncio.ensure_future(_do_update())
-    return web.json_response({'success': True, 'message': '更新已开始'})
+    updater._report('preparing', '正在准备手动更新', 0)
+    _update_task = asyncio.create_task(do_update())
+    return web.json_response({'success': True, 'message': '更新已开始；重启后请确认群成员并使用「群状态 恢复」'})
 
 
 # ==================== 镜像管理 ====================
+# 仅供插件市场（Market.js）使用；框架更新的 Git fetch 完全不读取这些设置。
 
 
 async def handle_get_mirrors(request: web.Request):
@@ -225,66 +238,5 @@ async def handle_set_custom_mirror(request: web.Request):
 
 
 async def handle_upload_update(request: web.Request):
-    """接收上传的 zip 压缩包并应用更新"""
-    updater = _get_updater()
-
-    reader = await request.multipart()
-    field = cast(BodyPartReader, await reader.next())
-    if not field or field.name != 'file':
-        return web.json_response({'success': False, 'message': '缺少文件'}, status=400)
-
-    filename = os.path.basename((field.filename or '').replace('\\', '/'))
-    if not filename.lower().endswith('.zip'):
-        return web.json_response({'success': False, 'message': '仅支持 zip 格式'}, status=400)
-
-    # 保存到临时文件
-    upload_dir = os.path.join(_base_dir, 'data', 'temp_update')
-    os.makedirs(upload_dir, exist_ok=True)
-    fd, filepath = tempfile.mkstemp(prefix='upload_', suffix='.zip', dir=upload_dir)
-    os.close(fd)
-
-    try:
-        with open(filepath, 'wb') as f:
-            while True:
-                chunk = await field.read_chunk()
-                if not chunk:
-                    break
-                f.write(chunk)
-    except Exception as e:
-        with contextlib.suppress(OSError):
-            os.remove(filepath)
-        return web.json_response({'success': False, 'message': f'保存文件失败: {e}'}, status=500)
-
-    # 读取额外字段
-    version_name = None
-    skip_backup = False
-    auto_restart = False
-    while True:
-        field = cast(BodyPartReader, await reader.next())
-        if field is None:
-            break
-        val = (await field.read()).decode('utf-8', errors='ignore')
-        if field.name == 'version_name':
-            version_name = val.strip() or None
-        elif field.name == 'skip_backup':
-            skip_backup = val.lower() in ('true', '1', 'yes')
-        elif field.name == 'auto_restart':
-            auto_restart = val.lower() in ('true', '1', 'yes')
-
-    def _do():
-        try:
-            updater.update_from_upload(
-                filepath,
-                version_name,
-                skip_backup=skip_backup,
-                auto_restart=auto_restart,
-            )
-        except Exception as e:
-            updater._report('failed', f'更新出错: {e}', 0)
-        finally:
-            with contextlib.suppress(OSError):
-                os.remove(filepath)
-
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, _do)
-    return web.json_response({'success': True, 'message': '上传成功，开始更新'})
+    """Archive replacement is intentionally unsupported."""
+    return web.json_response({'success': False, 'message': '上传更新已禁用，请使用 personal 的 Git 提交'})

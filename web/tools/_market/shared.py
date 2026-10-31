@@ -4,7 +4,7 @@ import logging
 import os
 import re
 
-from web.tools._updater.shared import (
+from web.tools._market.mirrors import (
     _build_mirror_url,
     _load_mirror_cache,
     load_github_mirror,

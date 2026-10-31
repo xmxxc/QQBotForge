@@ -1,12 +1,11 @@
-"""框架更新 — 镜像测速, 环境检测"""
+"""插件市场镜像测速。"""
 
 import asyncio
-import os
 import time
 
 import aiohttp as _aiohttp
 
-from web.tools._updater.shared import (
+from web.tools._market.mirrors import (
     GITHUB_FILE_MIRRORS,
     _build_mirror_url,
     _load_mirror_cache,
@@ -74,36 +73,3 @@ async def get_fast_mirrors(force=False):
     _mirror_testing = None
     _save_mirror_cache(ok)
     return ok
-
-
-# ==================== 环境检测 ====================
-
-
-def detect_environment():
-    """检测运行环境, 返回 {docker, writable, warning}"""
-    info = {'docker': False, 'writable': True, 'warnings': []}
-    # Docker 检测
-    if os.path.exists('/.dockerenv'):
-        info['docker'] = True
-    else:
-        try:
-            with open('/proc/1/cgroup') as f:
-                if 'docker' in f.read() or 'containerd' in f.read():
-                    info['docker'] = True
-        except OSError:
-            pass
-    # 可写性检测
-    try:
-        test_file = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-            '.write_test',
-        )
-        with open(test_file, 'w') as f:
-            f.write('test')
-        os.remove(test_file)
-    except Exception:
-        info['writable'] = False
-        info['warnings'].append('项目目录不可写, 更新将失败')
-    if info['docker']:
-        info['warnings'].append('检测到 Docker 环境, 请确保项目目录已挂载 volume 以持久化更新')
-    return info
