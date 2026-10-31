@@ -10,6 +10,7 @@ from aiohttp import web
 from web.tools._market.mirror import _test_one_mirror
 from web.tools._market.mirrors import GITHUB_FILE_MIRRORS, _load_mirror_cache, _save_mirror_cache, clear_mirror_cache
 from web.tools._updater.framework import FrameworkUpdater
+from web.tools._updater.supervisor import UNSUPPORTED
 
 log = logging.getLogger('ElainaBot.web.updater')
 
@@ -41,8 +42,10 @@ _get_updater = get_updater  # older callers
 
 async def handle_detect_environment(request: web.Request):
     updater = _get_updater()
-    is_git = updater.environment() == 'git'
-    return web.json_response({'success': True, 'data': {'git': is_git, 'writable': is_git, 'warnings': [] if is_git else ['请拉取新镜像或重新 Git 部署']}})
+    environment = updater.environment()
+    is_git = environment == 'git'
+    warnings = [] if is_git else [UNSUPPORTED if environment == 'unsupported' else '请拉取新镜像或重新 Git 部署']
+    return web.json_response({'success': True, 'data': {'git': is_git, 'writable': is_git, 'warnings': warnings}})
 
 
 # ==================== 更新日志 ====================
@@ -137,8 +140,13 @@ async def handle_start_update(request: web.Request):
     if not isinstance(body, dict) or ('version' in body and not isinstance(body['version'], str)):
         return web.json_response({'success': False, 'message': '更新参数无效'}, status=400)
     updater = get_updater()
-    if (_update_task and not _update_task.done()) or updater.lock_active():
-        return web.json_response({'success': False, 'message': '已有更新或启动验证正在进行'}, status=409)
+    if not updater.supported():
+        return web.json_response({'success': False, 'message': UNSUPPORTED}, status=400)
+    try:
+        if (_update_task and not _update_task.done()) or updater.lock_active():
+            return web.json_response({'success': False, 'message': '已有更新或启动验证正在进行'}, status=409)
+    except OSError:
+        return web.json_response({'success': False, 'message': '无法获取更新锁，请检查运行目录权限和文件系统 flock 支持'}, status=400)
 
     async def do_update():
         try:

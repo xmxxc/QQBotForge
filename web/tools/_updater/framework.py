@@ -22,11 +22,14 @@ from web.tools._updater.shared import GITHUB_API_URL, GITHUB_BRANCH, GITHUB_REPO
 from web.tools._updater.supervisor import (
     ACTIVE,
     TRANSACTION_ENV,
+    UNSUPPORTED,
     acquire_deploy_lock,
     clean_git_env,
     deploy_git,
     deploy_lock_held,
     finish_rollback,
+    is_current_target,
+    platform_supported,
     read_state,
     state_mutex,
     take_over,
@@ -132,8 +135,11 @@ class FrameworkUpdater:
         result = self._run_git('rev-parse', '--verify', 'HEAD')
         return result.stdout.strip() if not result.returncode else ''
 
+    def supported(self):
+        return os.name == 'posix' and platform_supported()
+
     def environment(self):
-        if os.name != 'posix':
+        if not self.supported():
             return 'unsupported'  # the update locks rely on POSIX flock
         root = self._run_git('rev-parse', '--show-toplevel')
         return 'git' if not root.returncode and Path(root.stdout.strip()).resolve() == self.base_dir else 'non_git'
@@ -257,7 +263,7 @@ class FrameworkUpdater:
             has_update=False, can_update=False, source={'repository': GITHUB_REPO, 'branch': GITHUB_BRANCH}, environment=self.environment(), error=None
         )
         if result['environment'] == 'unsupported':
-            return dict(result, error='框架更新器仅支持 Linux/macOS 的 Git 部署')
+            return dict(result, error=UNSUPPORTED)
         if result['environment'] != 'git':
             return dict(result, error='当前部署不是 Git 工作区，请拉取新镜像或重新 Git 部署')
         try:
@@ -332,6 +338,8 @@ class FrameworkUpdater:
 
     def lock_active(self):
         """A live process is driving an update or verifying one."""
+        if not self.supported():
+            return False
         return deploy_lock_held(self.base_dir)
 
     def _claim(self):
@@ -356,7 +364,7 @@ class FrameworkUpdater:
         del skip_backup, auto_restart
         environment = self.environment()
         if environment == 'unsupported':
-            return {'success': False, 'message': '框架更新器仅支持 Linux/macOS 的 Git 部署'}
+            return {'success': False, 'message': UNSUPPORTED}
         if environment != 'git':
             return {'success': False, 'message': '当前部署不是 Git 工作区，请拉取新镜像或重新 Git 部署'}
         if not isinstance(version, str) or not _SHA_RE.fullmatch(version):
@@ -367,7 +375,7 @@ class FrameworkUpdater:
         except FileExistsError:
             return {'success': False, 'message': '已有更新或启动验证正在进行，请先查看更新结果'}
         except (OSError, TimeoutError):
-            return {'success': False, 'message': '无法获取更新锁，请检查运行目录写入权限'}
+            return {'success': False, 'message': '无法获取更新锁，请检查运行目录权限和文件系统 flock 支持'}
         manager = None
         was_running = False
         switched = False
@@ -457,8 +465,13 @@ class FrameworkUpdater:
             os.close(lock_fd)
 
     async def update_to_latest(self, skip_backup=False, auto_restart=True):
-        if self.lock_active():
-            return {'success': False, 'message': '已有更新或启动验证正在进行'}
+        if not self.supported():
+            return {'success': False, 'message': UNSUPPORTED}
+        try:
+            if self.lock_active():
+                return {'success': False, 'message': '已有更新或启动验证正在进行'}
+        except OSError:
+            return {'success': False, 'message': '无法获取更新锁，请检查运行目录权限和文件系统 flock 支持'}
         result = await self.check_for_updates()
         if not result.get('can_update'):
             message = result.get('error') or f'无法更新：版本关系 {result.get("relation")}，CI {result.get("ci_status", "unknown")}'
@@ -536,10 +549,19 @@ class FrameworkUpdater:
         but unverified targets verify themselves within ws_timeout, everything
         else is rolled back to the original commit.
         """
+        if not self.supported():
+            return False
         state = self._state()
         if state.get('status') not in ACTIVE:
             return False
         transaction = state.get('transaction')
+        if state.get('status') == 'rolling_back' and state.get('target_process') and is_current_target(state['target_process']):
+            # A rollback cannot change code under its own live target. Exit first;
+            # the next startup will acquire the lock and finish recovery.
+            app._restart_requested = True
+            if app._stop_event:
+                app._stop_event.set()
+            return False
         if os.environ.get(TRANSACTION_ENV) == transaction and state.get('status') == 'awaiting_ws':
             confirmed = await self._await_ws(app, transaction)
             if confirmed is not None:
@@ -570,8 +592,13 @@ class FrameworkUpdater:
             if outcome.get('adopted'):
                 if await self._await_ws(app, transaction, time.monotonic() + self.ws_timeout):
                     return True
-                transition(self.base_dir, transaction, ('awaiting_ws',), status='rolling_back', message='WS 验证超时，正在回滚', phase='checking_out')
-                await asyncio.to_thread(finish_rollback, self.base_dir, transaction, '接管验证超时，已回滚原提交并重启；数据库备份已保留')
+                transition(self.base_dir, transaction, ('awaiting_ws',), status='rolling_back', message='WS 验证超时，退出后接管回滚', phase='stopping_target')
+                # This process adopted verification of the target. It must exit
+                # before another startup can stop its tree and change the code.
+                app._restart_requested = True
+                if app._stop_event:
+                    app._stop_event.set()
+                return False
             if self._current_sha() != head:
                 # The code on disk changed under this process: restart into it.
                 app._restart_requested = True

@@ -332,14 +332,209 @@ def test_manual_start_adopts_only_when_no_live_monitor(repo):
     assert not lock_held_elsewhere(repo.root)
 
 
-def test_adopted_verification_without_ws_rolls_back_and_restarts(repo):
+@pytest.mark.parametrize('record_target', [False, True])
+def test_adopted_verification_without_ws_exits_before_rollback(repo, record_target):
     app = _awaiting_ws(repo)
+    if record_target:
+        import psutil
+
+        supervisor.transition(
+            repo.root,
+            'first',
+            ('awaiting_ws',),
+            target_process=dict(pid=os.getpid(), created=psutil.Process().create_time(), pgid=os.getpgrp()),
+        )
     app.hook_manager.connection_status.statuses = []
     assert asyncio.run(FrameworkUpdater(str(repo.root), ws_timeout=0.3).verify_startup(app)) is False
-    assert json.loads(repo.pending.read_text())['status'] == 'rolled_back'
-    assert git(repo.root, 'rev-parse', 'HEAD') == repo.shas[0]
-    assert app._restart_requested is True
+    assert json.loads(repo.pending.read_text())['status'] == 'rolling_back'
+    assert git(repo.root, 'rev-parse', 'HEAD') == repo.shas[1]
+    assert app._restart_requested is True and app._stop_event.is_set()
 
 
 def test_monitor_and_process_agree_on_transaction_variable():
     assert supervisor.TRANSACTION_ENV == TRANSACTION_ENV
+
+
+ORPHAN_MONITOR = r"""
+import os, subprocess, sys, time
+from pathlib import Path
+from web.tools._updater import supervisor as s
+root, point = Path(sys.argv[1]), sys.argv[2]
+def pause():
+    (root / 'data/paused').touch()
+    while True: time.sleep(.01)
+original = subprocess.Popen
+class Launch(original):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if kwargs.get('start_new_session'):
+            (root / 'data/launched-pid').write_text(str(self.pid))
+            if point == 'after_popen': pause()
+s.subprocess.Popen = Launch
+real_wait = s.psutil.wait_procs
+def partial_wait(*args, **kwargs):
+    result = real_wait(*args, **kwargs)
+    if point == 'during_stop' and result[1]: pause()
+    return result
+s.psutil.wait_procs = partial_wait
+def trace(frame, event, arg):
+    if event == 'call' and frame.f_code.co_name == '_stop' and point == 'before_stop': pause()
+sys.settrace(trace)
+s.supervise_update(root, [sys.executable, str(root / 'data/target.py')], 'first', timeout=1)
+"""
+
+TARGET_TREE = r"""
+import os, subprocess, sys, time
+from pathlib import Path
+root = Path.cwd()
+# A separate child survives even if only the application leader is terminated.
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])
+(root / 'data/target-pids').write_text(f'{os.getpid()} {child.pid}')
+while True: time.sleep(.02)
+"""
+
+
+def running(pid):
+    import psutil
+
+    try:
+        process = psutil.Process(pid)
+        return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
+
+
+@pytest.mark.parametrize('entry', ['startup', 'next_update'])
+@pytest.mark.parametrize('point', ['before_stop', 'after_popen', 'during_stop'])
+def test_takeover_stops_target_tree_before_checkout(repo, monkeypatch, entry, point):
+    script = TARGET_TREE
+    if point == 'during_stop':
+        script = script.replace('import time; time.sleep(120)', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)')
+    (repo.data / 'target.py').write_text(script)
+    worker = subprocess.Popen([sys.executable, '-c', ORPHAN_MONITOR, str(repo.root), point], stderr=subprocess.PIPE, text=True)
+    pids = []
+    try:
+        wait_for(repo.data / 'paused', worker)
+        # Let the spawned child complete its handshake, if the parent died before recording it.
+        pids = [int(p) for p in wait_for(repo.data / 'target-pids').split()]
+        if point == 'during_stop':
+            assert not running(pids[0]) and running(pids[1])
+            assert json.loads(repo.pending.read_text()).get('target_members')
+        else:
+            assert all(running(p) for p in pids)
+        os.kill(worker.pid, signal.SIGKILL)
+        assert worker.wait(timeout=5) == -signal.SIGKILL
+        updater = FrameworkUpdater(str(repo.root))
+        app = stub_update(monkeypatch, updater, repo.root, repo.shas[2])
+        if entry == 'startup':
+            assert asyncio.run(updater.verify_startup(app)) is False
+            app._stop_event.clear()
+        else:
+            fd = updater._claim()
+            os.close(fd)
+        assert all(not running(p) for p in pids), 'target tree survived takeover'
+        assert json.loads(repo.pending.read_text())['status'] == 'rolled_back'
+        assert git(repo.root, 'rev-parse', 'HEAD') == repo.shas[0]
+        assert asyncio.run(updater.update_to_version(repo.shas[2]))['success']
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+            worker.wait()
+        for pid in pids:
+            if running(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+def test_takeover_never_signals_a_reused_pid(repo):
+    process = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True)
+    import psutil
+
+    try:
+        identity = dict(pid=process.pid, created=psutil.Process(process.pid).create_time() - 100, pgid=process.pid)
+        supervisor.transition(repo.root, 'first', ('awaiting_restart',), status='rolling_back', target_process=identity)
+        fd = FrameworkUpdater(str(repo.root))._claim()
+        os.close(fd)
+        assert process.poll() is None
+        assert json.loads(repo.pending.read_text())['status'] == 'rolled_back'
+    finally:
+        process.kill()
+        process.wait()
+
+
+def test_current_target_exits_before_rolling_back_its_own_code(repo):
+    import psutil
+
+    identity = dict(pid=os.getpid(), created=psutil.Process().create_time(), pgid=os.getpgrp())
+    supervisor.transition(repo.root, 'first', ('awaiting_restart',), status='rolling_back', target_process=identity)
+    app = ready_app()
+    assert asyncio.run(FrameworkUpdater(str(repo.root)).verify_startup(app)) is False
+    assert app._restart_requested and app._stop_event.is_set()
+    assert git(repo.root, 'rev-parse', 'HEAD') == repo.shas[1]
+    assert json.loads(repo.pending.read_text())['status'] == 'rolling_back'
+
+
+@pytest.mark.parametrize('entry', ['startup', 'next_update'])
+def test_child_without_identity_is_fenced_before_application_code(repo, monkeypatch, entry):
+    """Pause the launcher before its identity write, kill the monitor, take over, then resume it."""
+    script = ORPHAN_MONITOR.replace(
+        'super().__init__(*args, **kwargs)',
+        """if kwargs.get('start_new_session'):
+            command = args[0]
+            bootstrap = "import pathlib,runpy,sys,time; root=pathlib.Path(sys.argv[3]); (root/'data/child-paused').touch(); "
+            bootstrap += "exec(\\"while not (root/'data/child-resume').exists(): time.sleep(.01)\\"); "
+            bootstrap += "sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')"
+            args = ([command[0], '-c', bootstrap, *command[1:]], *args[1:])
+        super().__init__(*args, **kwargs)""",
+    )
+    worker = subprocess.Popen([sys.executable, '-c', script, str(repo.root), 'after_popen'], stderr=subprocess.PIPE, text=True)
+    pid = None
+    try:
+        wait_for(repo.data / 'paused', worker)
+        wait_for(repo.data / 'child-paused')
+        pid = int((repo.data / 'launched-pid').read_text())
+        os.kill(worker.pid, signal.SIGKILL)
+        worker.wait(timeout=5)
+        state = json.loads(repo.pending.read_text())
+        assert state['phase'] == 'starting_target' and not state.get('target_process')
+        up = FrameworkUpdater(str(repo.root))
+        app = stub_update(monkeypatch, up, repo.root, repo.shas[2])
+        if entry == 'startup':
+            original_transition = framework.transition
+
+            def during_adoption(*args, **kwargs):
+                if kwargs.get('phase') == 'verifying':
+                    (repo.data / 'child-resume').touch()
+                    deadline = time.monotonic() + 5
+                    while running(pid) and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    assert not running(pid), 'late launcher executed the application during adoption'
+                    assert not json.loads(repo.pending.read_text()).get('target_process')
+                return original_transition(*args, **kwargs)
+
+            monkeypatch.setattr(framework, 'transition', during_adoption)
+            assert asyncio.run(up.verify_startup(app)) is True
+        else:
+            fd = up._claim()
+            os.close(fd)
+        # Complete a subsequent transaction before allowing the stale launcher to proceed.
+        assert asyncio.run(up.update_to_version(repo.shas[2]))['success']
+        (repo.data / 'child-resume').touch()
+        deadline = time.monotonic() + 5
+        while running(pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not running(pid)
+        assert not (repo.data / 'target-pids').exists()
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+            worker.wait()
+        if pid and running(pid):
+            os.kill(pid, signal.SIGKILL)
+
+
+@pytest.mark.parametrize('valid_repo', [False, True])
+def test_empty_hooks_directory_is_cleaned_on_normal_exit(tmp_path, valid_repo):
+    code = "from web.tools._updater import supervisor as s; import sys; s.deploy_git(sys.argv[1], 'rev-parse', 'HEAD'); print(s._no_hooks_dir)"
+    directory = REPO if valid_repo else tmp_path
+    result = subprocess.run([sys.executable, '-c', code, str(directory)], cwd=REPO, text=True, capture_output=True, check=True)
+    assert not Path(result.stdout.strip()).exists()

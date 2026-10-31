@@ -102,3 +102,53 @@ async def test_framework_fetch_ignores_market_mirror(market, monkeypatch):
     fetch = next(c for c in commands if 'fetch' in c)
     assert 'https://github.com/xmxxc/QQBotForge.git' in fetch
     assert not any('old-mirror' in str(part) for c in commands for part in c)
+
+
+@pytest.mark.asyncio
+async def test_windows_entries_refuse_before_locking(tmp_path, monkeypatch):
+    import os
+
+    from web.tools._updater import framework, supervisor
+
+    monkeypatch.setattr(framework, 'os', SimpleNamespace(name='nt', environ=os.environ))
+    monkeypatch.setattr(supervisor, 'fcntl', None)
+    handlers.set_context(str(tmp_path))
+    updater = handlers.get_updater()
+    for result in (await updater.update_to_latest(), await updater.update_to_version('a' * 40), await updater.force_update()):
+        assert result['success'] is False and '此平台不支持框架更新' in result['message']
+    assert '此平台不支持框架更新' in (await updater.check_for_updates())['error']
+    app = web.Application()
+    app.router.add_get('/check', handlers.handle_check_update)
+    app.router.add_get('/environment', handlers.handle_detect_environment)
+    app.router.add_post('/start', handlers.handle_start_update)
+    async with TestClient(TestServer(app)) as client:
+        for method, path, kwargs in [('get', '/check', {}), ('get', '/environment', {}), ('post', '/start', {'json': {}})]:
+            response = await getattr(client, method)(path, **kwargs)
+            assert response.status < 500
+            body = json.dumps(await response.json(), ensure_ascii=False)
+            assert '此平台不支持框架更新' in body
+            assert '重新 Git 部署' not in body
+    assert not (tmp_path / 'data/update.lock').exists()
+
+
+@pytest.mark.asyncio
+async def test_unsupported_filesystem_lock_refuses_without_starting(tmp_path, monkeypatch):
+    import errno
+
+    from web.tools._updater import supervisor
+
+    def unavailable(*args):
+        raise OSError(errno.ENOLCK, 'No locks available')
+
+    handlers.set_context(str(tmp_path))
+    updater = handlers.get_updater()
+    monkeypatch.setattr(supervisor.fcntl, 'flock', unavailable)
+    result = await updater.update_to_latest()
+    assert result['success'] is False and 'flock' in result['message']
+    app = web.Application()
+    app.router.add_post('/start', handlers.handle_start_update)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post('/start', json={})
+        assert response.status == 400
+        assert (await response.json())['success'] is False
+    assert not updater.pending_file.exists()

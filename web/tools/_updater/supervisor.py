@@ -43,6 +43,12 @@ ACTIVE = ('switching', 'awaiting_restart', 'awaiting_ws', 'rolling_back')
 TERMINAL = ('confirmed', 'rolled_back', 'failed', 'rollback_failed')
 _PROXY_ENV = {'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy'}
 _no_hooks_dir = None
+_no_hooks_temporary = None
+UNSUPPORTED = '此平台不支持框架更新（需要 POSIX flock）'
+
+
+def platform_supported():
+    return os.name == 'posix' and fcntl is not None
 
 
 def clean_git_env(**extra):
@@ -54,9 +60,10 @@ def clean_git_env(**extra):
 
 def deploy_git(root, *args, timeout=60):
     """Run Git in the deployment repository without hooks or fsmonitor."""
-    global _no_hooks_dir
+    global _no_hooks_dir, _no_hooks_temporary
     if _no_hooks_dir is None or not os.path.isdir(_no_hooks_dir):
-        _no_hooks_dir = tempfile.mkdtemp(prefix='qqbotforge-nohooks-')
+        _no_hooks_temporary = tempfile.TemporaryDirectory(prefix='qqbotforge-nohooks-')
+        _no_hooks_dir = _no_hooks_temporary.name
     command = ['git', '-c', f'core.hooksPath={_no_hooks_dir}', '-c', 'core.fsmonitor=false', '-C', str(root), *args]
     try:
         return subprocess.run(command, capture_output=True, text=True, timeout=timeout, env=clean_git_env())
@@ -88,6 +95,8 @@ def _open_lock(path):
 
 
 def _flock(fd, timeout):
+    if not platform_supported():
+        raise OSError(UNSUPPORTED)
     deadline = time.monotonic() + timeout
     while True:
         try:
@@ -101,9 +110,15 @@ def _flock(fd, timeout):
 
 def acquire_deploy_lock(root, timeout=0.0):
     """Return a locked file descriptor, or None while a live process holds it."""
+    if not platform_supported():
+        raise OSError(UNSUPPORTED)
     fd = _open_lock(Path(root) / 'data/update.lock')
-    if _flock(fd, timeout):
-        return fd
+    try:
+        if _flock(fd, timeout):
+            return fd
+    except BaseException:
+        os.close(fd)
+        raise
     os.close(fd)
     return None
 
@@ -119,6 +134,8 @@ def deploy_lock_held(root):
 @contextlib.contextmanager
 def state_mutex(root, timeout=30.0):
     """Exclusive section for update state; never broken while its holder lives."""
+    if not platform_supported():
+        raise OSError(UNSUPPORTED)
     fd = _open_lock(Path(root) / 'data/update_state.lock')
     try:
         if not _flock(fd, timeout):
@@ -174,28 +191,127 @@ def take_over(root, adopt=None):
         if state.get('status') not in ACTIVE:
             return None
         transaction = state['transaction']
-    if state['status'] in ('awaiting_restart', 'awaiting_ws') and adopt and adopt(state):
+        # Fence an unregistered launcher before releasing the mutex. Otherwise
+        # it could register between the adoption decision and the callback.
+        if state.get('phase') == 'starting_target' and not state.get('target_process'):
+            state['phase'] = 'taking_over'
+            _write(Path(root) / 'data/update_pending.json', state)
+    target = state.get('target_process')
+    # Only the actual target may adopt itself; another startup must stop it.
+    may_adopt = not target or is_current_target(target)
+    if state['status'] in ('awaiting_restart', 'awaiting_ws') and may_adopt and adopt and adopt(state):
         return read_state(root)
     if state['status'] != 'rolling_back':
         transition(root, transaction, ACTIVE, status='rolling_back', message='更新进程已退出，正在接管并回滚', phase='takeover')
+    stop_target(root, transaction)
     finish_rollback(root, transaction, '更新进程意外退出，已接管并回滚到原提交；数据库备份已保留')
     return read_state(root)
 
 
-def _stop(process):
-    with contextlib.suppress(psutil.Error):
-        root = psutil.Process(process.pid)
-        children = root.children(recursive=True)
-        for child in reversed(children):
-            with contextlib.suppress(psutil.Error):
-                child.terminate()
-        process.terminate()
-        _, alive = psutil.wait_procs(children + [root], timeout=3)
-        for child in alive:
-            with contextlib.suppress(psutil.Error):
-                child.kill()
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        process.wait(timeout=3)
+def _identity():
+    process = psutil.Process()
+    return dict(pid=process.pid, created=process.create_time(), pgid=os.getpgrp())
+
+
+def is_current_target(identity):
+    return identity['pid'] == os.getpid() and identity['created'] == psutil.Process().create_time()
+
+
+def _group_members(pgid):
+    members = []
+    for process in psutil.process_iter():
+        try:
+            if os.getpgid(process.pid) == pgid and process.status() != psutil.STATUS_ZOMBIE:
+                members.append(process)
+        except (ProcessLookupError, psutil.NoSuchProcess):
+            pass
+    return members
+
+
+def _matching_process(identity):
+    try:
+        process = psutil.Process(identity['pid'])
+        if process.create_time() == identity['created'] and process.status() != psutil.STATUS_ZOMBIE:
+            return process
+    except psutil.NoSuchProcess:
+        pass
+    return None
+
+
+def _stop(identity, known, remember):
+    """Stop identity-checked group members, persisting progress before signals.
+
+    A known live member pins the group ID even after its leader was reaped.
+    Without a matching identity we never signal an ambiguous/recycled group.
+    """
+    if is_current_target(identity):
+        raise OSError('目标进程正在自行接管，请先退出再恢复')
+    leader = _matching_process(identity)
+    anchors = [p for item in [identity, *known] if (p := _matching_process(item)) is not None]
+    if leader and (os.getpgid(leader.pid) != identity['pgid'] or identity['pgid'] != leader.pid):
+        raise OSError('目标进程组身份不匹配，拒绝回滚')
+    anchors = [p for p in anchors if os.getpgid(p.pid) == identity['pgid']]
+    if not anchors:
+        # A reused leader PID is unrelated; do not signal its new group.
+        if psutil.pid_exists(identity['pid']) and not leader:
+            # A zombie can still pin the original group, and needs no signal.
+            if psutil.Process(identity['pid']).create_time() == identity['created'] and _group_members(identity['pgid']):
+                raise OSError('目标进程组身份无法确认，拒绝回滚')
+            return
+        if _group_members(identity['pgid']):
+            raise OSError('目标进程组仍存活但身份无法确认，拒绝回滚')
+        return
+    members = _group_members(identity['pgid'])
+    for force in (False, True):
+        deadline = time.monotonic() + 3
+        while members:
+            # If killed after the leader exits, the next owner can resume from
+            # these members without relying on a recycled leader PID.
+            remember([dict(pid=p.pid, created=p.create_time(), pgid=identity['pgid']) for p in members])
+            for process in members:
+                with contextlib.suppress(psutil.NoSuchProcess):
+                    process.kill() if force else process.terminate()
+            _, alive = psutil.wait_procs(members, timeout=0.1)
+            alive = [p for p in alive if p.is_running() and p.status() != psutil.STATUS_ZOMBIE]
+            if not alive:
+                if _group_members(identity['pgid']):
+                    raise OSError('目标进程组仍有未确认的子进程，拒绝回滚')
+                return
+            members = _group_members(identity['pgid'])
+            if time.monotonic() >= deadline:
+                break
+    if members:
+        raise OSError('目标进程树未退出，拒绝回滚')
+
+
+def stop_target(root, transaction):
+    state = read_state(root)
+    if state.get('transaction') != transaction or state.get('status') != 'rolling_back':
+        return
+
+    def remember(members):
+        if not transition(root, transaction, ('rolling_back',), target_members=members):
+            raise OSError('更新事务已改变，拒绝停止进程')
+
+    if state.get('target_process'):
+        _stop(state['target_process'], state.get('target_members', []), remember)
+    transition(root, transaction, ('rolling_back',), phase='checking_out')
+
+
+def run_target(root, transaction, command):
+    """Persist identity before executing any target code (including imports).
+
+    The state mutex fences a late child against takeover even when its parent
+    was SIGKILLed between Popen and the child's first instruction. There is no
+    parent-side identity write to lose. exec preserves PID/create_time/group.
+    """
+    with state_mutex(root):
+        state = read_state(root)
+        if state.get('transaction') != transaction or state.get('status') != 'awaiting_ws' or state.get('phase') != 'starting_target':
+            return 0
+        state.update(target_process=_identity(), phase='verifying')
+        _write(Path(root) / 'data/update_pending.json', state)
+    os.execvpe(command[0], command, os.environ)
 
 
 def supervise_update(base_dir, command, transaction, timeout=90.0, lock_fd=None):
@@ -226,7 +342,14 @@ def supervise_update(base_dir, command, transaction, timeout=90.0, lock_fd=None)
         me = psutil.Process()
         monitor = dict(supervisor_pid=me.pid, supervisor_created=me.create_time())
         if not transition(
-            root, transaction, ('awaiting_restart',), status='awaiting_ws', message='新版本启动中，等待 WS 连接确认', phase='verifying', **monitor
+            root,
+            transaction,
+            ('awaiting_restart',),
+            status='awaiting_ws',
+            message='新版本启动中，等待 WS 连接确认',
+            phase='starting_target',
+            target_process=None,
+            **monitor,
         ):
             return 0
         env = os.environ.copy()
@@ -234,7 +357,12 @@ def supervise_update(base_dir, command, transaction, timeout=90.0, lock_fd=None)
         env[TRANSACTION_ENV] = transaction
         deadline = time.monotonic() + timeout
         try:
-            child = subprocess.Popen(command, cwd=root, env=env, start_new_session=True)
+            child = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), '--target', str(root), transaction, *command],
+                cwd=root,
+                env=env,
+                start_new_session=True,
+            )
             while child.poll() is None and time.monotonic() < deadline:
                 observed = read_state(root)
                 if observed.get('transaction') != transaction or observed.get('status') != 'awaiting_ws':
@@ -247,9 +375,9 @@ def supervise_update(base_dir, command, transaction, timeout=90.0, lock_fd=None)
         if not transition(root, transaction, ('awaiting_ws',), status='rolling_back', message='WS 验证失败，正在回滚', phase='stopping_target'):
             owns_child = False
             return 0
+        stop_target(root, transaction)
         if child:
-            _stop(child)
-        transition(root, transaction, ('rolling_back',), phase='checking_out')
+            child.wait(timeout=5)
         if not finish_rollback(root, transaction, '新版本启动失败或 WS 超时，已回滚原提交并重启；数据库备份已保留'):
             return 1
         os.close(lock_fd)
@@ -258,13 +386,22 @@ def supervise_update(base_dir, command, transaction, timeout=90.0, lock_fd=None)
         child = subprocess.Popen(command, cwd=root, env=env, start_new_session=True)
         return child.wait()
     finally:
-        if owns_child and child and child.poll() is None:
-            _stop(child)
-        if lock_fd is not None:
-            os.close(lock_fd)
+        try:
+            if owns_child and child and child.poll() is None:
+                current = read_state(root)
+                if current.get('transaction') == transaction and current.get('status') == 'rolling_back':
+                    stop_target(root, transaction)
+                else:
+                    child.terminate()
+                child.wait(timeout=5)
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
 
 
 def main():
+    if sys.argv[1] == '--target':
+        raise SystemExit(run_target(sys.argv[2], sys.argv[3], sys.argv[4:]))
     base, parent_pid, parent_created, transaction, timeout, lock_fd, *command = sys.argv[1:]
     Path(__file__).with_suffix('.ready').write_text(transaction, encoding='utf-8')
     # Bind to a process identity, not a PID that may have been recycled.
