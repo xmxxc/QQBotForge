@@ -72,6 +72,7 @@ def test_bots_payload_connected(case):
     bot, _, connected = CASES[case]
     payload = _bots.running_bot_payload(APPID, bot)
     assert payload['connected'] is connected
+    assert payload['connection_status'] == CASES[case][1]
 
 
 def test_protocol_unknown_on_open_socket_stays_connected():
@@ -81,3 +82,35 @@ def test_protocol_unknown_on_open_socket_stays_connected():
 
 def test_created_but_not_started_is_disconnected():
     assert _bots.ws_connection_state(_ws_bot()) == 'disconnected'
+
+
+def test_configured_payload_has_unconnected_status():
+    payload = _bots.configured_bot_payload({'appid': APPID, 'secret': 's', 'enabled': True})
+    assert payload['connection_status'] == '未连接'
+    assert payload['connected'] is False
+
+
+async def test_bots_http_payload_keeps_status_and_compatibility(monkeypatch):
+    from web import api
+
+    connected = _ws_bot('connecting', 'connected', 'ready')
+    manager2 = ConnectionStatusManager()
+    client2 = WSClient('102000002', token_manager=None, on_event=None, ack_interaction=None, connection_status=manager2)
+    client2._status.update_context(connection_generation='g2')
+    for phase in ('connecting', 'connected', 'disconnected', 'reconnecting'):
+        client2._status.publish(phase, reason='test')
+    reconnecting = SimpleNamespace(appid='102000002', robot_qq='', union_openid='', ws_client=client2, connection_status=manager2)
+    manager = SimpleNamespace(_bots={APPID: connected, reconnecting.appid: reconnecting})
+    monkeypatch.setattr(api, '_bot_manager', manager)
+    monkeypatch.setattr(api, 'cfg', SimpleNamespace(get_bot_configs=lambda: [
+        {'appid': '102000003', 'secret': 's', 'enabled': False},
+    ]))
+    response = await api.handle_get_bots(make_mocked_request('GET', '/api/bots'))
+    body = json.loads(response.body)
+    bots = {item['appid']: item for item in body['data']['bots']}
+    assert bots[APPID]['connected'] is True
+    assert bots[APPID]['connection_status'] == '已连接'
+    assert bots['102000002']['connected'] is False
+    assert bots['102000002']['connection_status'] == '断线重连中'
+    assert bots['102000003']['connected'] is False
+    assert bots['102000003']['connection_status'] == '未连接'
