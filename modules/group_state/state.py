@@ -28,7 +28,7 @@ PREFIX = '/api/ext/group-state/'
 MESSAGE_TYPES = {'GROUP_AT_MESSAGE_CREATE', 'GROUP_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE'}
 REJECTED_TRANSITIONS = {'late_event', 'same_time_conflict', 'conflicting_duplicate', 'incomplete_event', 'missing_native_group'}
 log = get_logger(EXTENSION, '群状态')
-NAMES_MAX = 200
+NAMES_BATCH = 200
 
 
 async def display_names(bot, result):
@@ -38,9 +38,13 @@ async def display_names(bot, result):
     groups = {result.get('group'), *(g.get('group') for g in result.get('groups') or [] if isinstance(g, dict))}
     members = {result.get('member'), result.get('self_member'), *(result.get('missing_known_members') or [])}
     members |= {m.get('member') for m in listed if isinstance(m, dict)}
-    groups = sorted(g for g in groups if isinstance(g, str) and g)[:NAMES_MAX]
-    members = sorted(m for m in members if isinstance(m, str) and m)[:NAMES_MAX]
-    shown = await asyncio.gather(*(display_group(bot, g) for g in groups), *(display_member(bot, m) for m in members))
+    groups = sorted(g for g in groups if isinstance(g, str) and g)
+    members = sorted(m for m in members if isinstance(m, str) and m)
+    # Resolve every identity, with a bounded number of concurrent lookups.
+    identities = [(display_group, g) for g in groups] + [(display_member, m) for m in members]
+    shown = []
+    for start in range(0, len(identities), NAMES_BATCH):
+        shown.extend(await asyncio.gather(*(resolve(bot, native) for resolve, native in identities[start:start + NAMES_BATCH])))
     split = len(groups)
     return {'groups': dict(zip(groups, shown[:split], strict=True)), 'members': dict(zip(members, shown[split:], strict=True))}
 

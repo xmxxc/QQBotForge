@@ -65,7 +65,7 @@ DIRECTORY = ('id', 'name', 'enabled', 'open_groups')
 # Owner page fields holding native QQ IDs; names are looked up for display only.
 GROUP_KEYS = {'group', 'groups', 'open_groups', 'policy_before', 'policy_after'}
 MEMBER_KEYS = {'member'}
-NAMES_MAX = 200
+NAMES_BATCH = 200
 
 
 def native_ids(value, groups, members):
@@ -84,8 +84,12 @@ async def display_names(bot, value):
     """Display text for the IDs on an owner page; the response data keeps the native IDs."""
     groups, members = set(), set()
     native_ids(value, groups, members)
-    groups, members = sorted(groups)[:NAMES_MAX], sorted(members)[:NAMES_MAX]
-    shown = await asyncio.gather(*(display_group(bot, g) for g in groups), *(display_member(bot, m) for m in members))
+    groups, members = sorted(groups), sorted(members)
+    # Resolve every identity, with a bounded number of concurrent lookups.
+    identities = [(display_group, g) for g in groups] + [(display_member, m) for m in members]
+    shown = []
+    for start in range(0, len(identities), NAMES_BATCH):
+        shown.extend(await asyncio.gather(*(resolve(bot, native) for resolve, native in identities[start:start + NAMES_BATCH])))
     split = len(groups)
     return {'groups': dict(zip(groups, shown[:split], strict=True)), 'members': dict(zip(members, shown[split:], strict=True))}
 

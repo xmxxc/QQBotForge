@@ -17,7 +17,7 @@ log = get_logger(EXTENSION, '黑白名单授权')
 GROUP_KEYS = {'group', 'groups'}
 MEMBER_KEYS = {'member', 'members'}
 SKIP_KEYS = {'resources', 'resource_scope', 'function_scope', 'credential'}
-NAMES_MAX = 200
+NAMES_BATCH = 200
 SUMMARY_MAX = 10
 OPERATIONS = {
     'snapshot': '查看策略与来源',
@@ -64,8 +64,12 @@ async def display_names(bot, *values):
     groups, members = set(), set()
     for value in values:
         native_ids(value, groups, members)
-    groups, members = sorted(groups)[:NAMES_MAX], sorted(members)[:NAMES_MAX]
-    shown = await asyncio.gather(*(display_group(bot, g) for g in groups), *(display_member(bot, m) for m in members))
+    groups, members = sorted(groups), sorted(members)
+    # Resolve every identity, with a bounded number of concurrent lookups.
+    identities = [(display_group, g) for g in groups] + [(display_member, m) for m in members]
+    shown = []
+    for start in range(0, len(identities), NAMES_BATCH):
+        shown.extend(await asyncio.gather(*(resolve(bot, native) for resolve, native in identities[start:start + NAMES_BATCH])))
     split = len(groups)
     return {'groups': dict(zip(groups, shown[:split], strict=True)), 'members': dict(zip(members, shown[split:], strict=True))}
 

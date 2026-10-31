@@ -228,3 +228,25 @@ async def test_ninja3_eligibility_is_identical_with_or_without_names(ninja, monk
     stored_names(host, users={'MEMBERB': '显示名', 'MEMBERA': 'MEMBERB'}, groups={'group-a': 'group-b'})
     assert await run() == before
     assert 'fake-login' in str(before[0]) and 'fake-login' not in str(before[1])
+
+
+@pytest.mark.parametrize('area', ['ninja3', 'access', 'state'])
+async def test_display_names_resolve_every_identity_beyond_one_batch(ninja, access_host, group_host, area):
+    import sys
+
+    groups = [f'group-{i:04d}' for i in range(205)]
+    members = [f'member-{i:04d}' for i in range(205)]
+    if area == 'ninja3':
+        host, module = ninja, sys.modules['plugins.ninja3.service']
+        value = {'groups': groups, 'rows': [{'member': member} for member in members]}
+    elif area == 'access':
+        host = access_host
+        module = sys.modules[type(host.access).__module__.rsplit('.', 1)[0] + '.management']
+        value = {'groups': groups, 'members': members}
+    else:
+        host, module = group_host, sys.modules[type(group_host.state).__module__]
+        value = {'groups': [{'group': group} for group in groups], 'members': [{'member': member} for member in members]}
+    stored_names(host, users={member: '成员' for member in members}, groups={group: '群名' for group in groups})
+    names = await module.display_names('bot-a', value)
+    assert names['groups'] == dict.fromkeys(groups, '群名')
+    assert names['members'] == {member: '成员（…' + member[-4:] + '）' for member in members}
