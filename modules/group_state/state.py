@@ -708,8 +708,9 @@ class GroupState:
             'group_state': public,
         }
 
-    def fact_current(self, proof):
-        return isinstance(proof, dict) and bool(proof.get('usable')) and self._fresh(proof)
+    def fact_current(self, proof, *, require_usable=True):
+        """Check freshness; management may compare an unverified observation without granting eligibility."""
+        return isinstance(proof, dict) and (not require_usable or bool(proof.get('usable'))) and self._fresh(proof)
 
     def join_current(self, proof):
         """Like ``fact_current`` for a proof whose member is backed only by its native join basis."""

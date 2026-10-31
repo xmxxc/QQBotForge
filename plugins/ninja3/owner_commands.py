@@ -266,8 +266,10 @@ class OwnerCommands:
     async def deny(self, t):
         event, acl, facts, member = t['event'], t['acl'], t['facts'], t['member']
         bot, group = event.appid, event.group_id
-        if denials(await acl.access_snapshot(bot, service.CONSUMER), group, member):
-            await self.plugin.reply(event, f'{t["who"]}已在 {t["where"]} 的忍3拒绝名单中')
+        plugin, who, where = self.plugin, t['who'], t['where']
+        decision = await acl.evaluate(bot, service.CONSUMER, service.FUNCTION, group, member, action='invoke')
+        if decision.get('denies'):
+            await plugin.reply(event, f'{who}已在 {where} 的忍3拒绝名单中')
             return
 
         async def state():
@@ -295,6 +297,7 @@ class OwnerCommands:
             return stable
 
         async def run(click, offered_state):
+            write_proof = await facts.fact(bot, group, member)
             if await state() != offered_state:
                 raise TargetStateChangedError
             try:
@@ -307,15 +310,18 @@ class OwnerCommands:
                     member=member,
                     _expected_version=offered_state['version'],
                     _expected_valid_until=offered_state['valid_until'],
+                    _expected_fact={key: write_proof.get(key) for key in (
+                        'bot', 'group', 'generation', 'version', 'recovery_revision', 'writer_revision',
+                    )},
                 )
             except ValueError as error:
                 if str(error) == '授权状态已变化':
                     raise TargetStateChangedError from error
                 raise
             log.info(f'[{bot}] 拉黑 group={group} member={member}')
-            await self.plugin.reply(click, f'已拉黑 {t["who"]}：在 {t["where"]} 不能查询忍3账号')
+            await plugin.reply(click, f'已拉黑 {who}：在 {where} 不能查询忍3账号')
 
-        await self.plugin.confirmations.offer(event, f'确认拉黑 {t["who"]}？', label='拉黑', state=state, run=run)
+        await plugin.confirmations.offer(event, f'确认拉黑 {who}？', label='拉黑', state=state, run=run)
 
     async def allow(self, t):
         event, acl, member = t['event'], t['acl'], t['member']

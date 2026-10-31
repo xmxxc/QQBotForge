@@ -1,7 +1,8 @@
 """#143 owner @-mention short commands and the reusable confirmation buttons, through the real app."""
 
+import asyncio
 import json
-from types import SimpleNamespace
+from types import FunctionType, SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -12,6 +13,7 @@ from test_ninja3 import SECRET, grant
 from test_ninja3 import ninja as ninja  # noqa: F401
 
 from core.base.config import cfg
+from core.message.event import Event
 from plugins.ninja3.owner_commands import mention_target
 
 MEMBER = '未知成员（…BERA）'
@@ -309,6 +311,85 @@ async def test_confirmation_conditional_write_rechecks_after_acl_lock(ninja, mon
     monkeypatch.setattr(host.access, 'manage_access', race)
     assert await click(host, ok) == ['目标状态已变化，请重新发送“拉黑 @成员”']
     assert (await acl_state(host))[1] == []
+
+
+@pytest.mark.parametrize('change', ['confirm', 'pending', 'expiry', 'unchanged'])
+async def test_confirmation_checks_facts_after_waiting_for_write(ninja, monkeypatch, change):
+    host = ninja
+    await host.setup()
+    await grant(host)
+    now = [1000.0]
+    host.access.clock = lambda: now[0]
+    host.ninja().clock = lambda: now[0]
+    if change == 'expiry':
+        await host.access.manage_access('bot-a', 'ninja3', 'expiry', function='query', group='group-a', member='MEMBERA', expires_at=1050)
+    ok, _ = await offer_deny(host)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = host.access.manage_access
+
+    async def wait_before_write(*args, **kwargs):
+        if args[2] == 'deny':
+            entered.set()
+            await release.wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(host.access, 'manage_access', wait_before_write)
+    action = asyncio.create_task(click(host, ok))
+    await asyncio.wait_for(entered.wait(), timeout=3)
+    if change == 'confirm':
+        await host.state.confirm_member('bot-a', 'group-a', 'MEMBERA', evidence='new verification')
+    elif change == 'pending':
+        host.state.pending_writes['bot-a'] = 1
+    elif change == 'expiry':
+        now[0] = 1060
+    release.set()
+    try:
+        reply = await action
+        if change == 'unchanged':
+            assert reply == [f'已拉黑 {MEMBER}：在 {GROUP} 不能查询忍3账号']
+            assert len((await acl_state(host))[1]) == 1
+        else:
+            assert reply == ['目标状态已变化，请重新发送“拉黑 @成员”']
+            assert (await acl_state(host))[1] == []
+    finally:
+        if change == 'pending':
+            host.state.pending_writes.pop('bot-a', None)
+
+
+@pytest.mark.parametrize('group,member,scope', [('', 'MEMBERA', {'kind': 'function', 'id': 'query'}), ('', '', {'kind': 'all'}), ('group-a', '', {'kind': 'all'})])
+@pytest.mark.parametrize('framework_denied', [False, True])
+async def test_applicable_denial_does_not_offer_confirmation(ninja, group, member, scope, framework_denied):
+    host = ninja
+    await host.setup()
+    await host.access.manage_access('bot-a', 'ninja3', 'deny', function='query', group=group, member=member, function_scope=scope)
+    if framework_denied:
+        cfg.set_bot_setting('bot-a', 'blacklist.user_list', {'MEMBERA': 'test'})
+    count = len(host.sender.keyboards)
+    assert await command(host, '拉黑') == [f'{MEMBER}已在 {GROUP} 的忍3拒绝名单中']
+    assert len(host.sender.keyboards) == count
+    assert host.ninja().confirmations.pending == {}
+
+
+async def test_pending_confirmation_does_not_capture_original_event(ninja):
+    await ninja.setup()
+    await offer_deny(ninja)
+    seen = set()
+
+    def contains_event(value):
+        if id(value) in seen:
+            return False
+        seen.add(id(value))
+        if isinstance(value, Event):
+            return True
+        if isinstance(value, FunctionType):
+            return any(contains_event(cell.cell_contents) for cell in value.__closure__ or ())
+        if isinstance(value, dict):
+            return any(contains_event(item) for item in value.values())
+        if isinstance(value, (tuple, list)):
+            return any(contains_event(item) for item in value)
+        return False
+
+    assert not contains_event(ninja.ninja().confirmations.pending)
 
 
 async def test_confirmation_lost_on_reload(ninja):
