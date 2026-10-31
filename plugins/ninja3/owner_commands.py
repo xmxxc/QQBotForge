@@ -46,31 +46,39 @@ class Confirmations:
     the owner saw, nothing runs and the owner is asked to start over.
     """
 
-    def __init__(self, plugin):
+    def __init__(self, plugin, *, prefix="n3", menu=False):
         self.plugin = plugin
+        self.prefix = prefix
+        self.menu = menu
         self.pending = {}
 
-    async def offer(self, event, prompt, *, label, state, run):
+    async def offer(self, event, prompt, *, label, state, run, business_group=None):
         """``state`` returns a comparable snapshot; ``run`` receives the click and snapshot."""
         plugin = self.plugin
         now = plugin.clock()
         self.pending = {key: value for key, value in self.pending.items() if value['expires_at'] > now}
+        try:
+            snapshot = await state()
+        except TargetStateChangedError:
+            await plugin.reply(event, '目标状态已变化，请重新打开主人菜单' if self.menu else f'目标状态已变化，请重新发送“{label} @成员”')
+            return
         token = uuid4().hex
         self.pending[token] = {
             'bot': event.appid,
             'group': event.group_id,
+            'business_group': business_group,
             'owner': event.raw_user_id,
             'expires_at': now + CONFIRM_TTL,
             'label': label,
-            'snapshot': await state(),
+            'snapshot': snapshot,
             'state': state,
             'run': run,
         }
         # The platform shows the buttons to the owner only; clicks are still rechecked below.
         buttons = [
             [
-                {'text': '确认', 'type': 1, 'data': f'n3:ok:{token}', 'list': [event.raw_user_id]},
-                {'text': '取消', 'type': 1, 'data': f'n3:no:{token}', 'list': [event.raw_user_id]},
+                {'text': '确认', 'type': 1, 'data': f'{self.prefix}:ok:{token}', 'list': [event.raw_user_id]},
+                {'text': '取消', 'type': 1, 'data': f'{self.prefix}:no:{token}', 'list': [event.raw_user_id]},
             ]
         ]
         markdown = cfg.get_bot_setting(event.appid, 'message.use_markdown', True)
@@ -100,7 +108,7 @@ class Confirmations:
         if not accepted:
             await plugin.reply(event, f'已取消{label}')
             return
-        if plugin.emergency.active(event.appid):
+        if not self.menu and plugin.emergency.active(event.appid):
             await plugin.owner_private(event.appid, '紧急模式已开启，成员查询与授权操作暂停')
             return
         try:
@@ -108,14 +116,14 @@ class Confirmations:
             if not changed:
                 await request['run'](event, request['snapshot'])
         except TargetStateChangedError:
-            await plugin.reply(event, f'目标状态已变化，请重新发送“{label} @成员”')
+            await plugin.reply(event, ('目标状态已变化，请重新打开主人菜单' if self.menu else f'目标状态已变化，请重新发送“{label} @成员”'))
             return
         except (ValueError, RuntimeError, sqlite3.Error, OSError) as error:
             log.error(f'[{event.appid}] {label}确认失败: {type(error).__name__}')
             await plugin.reply(event, f'{label}未完成：授权或群状态暂不可用，请检查后台')
             return
         if changed:
-            await plugin.reply(event, f'目标状态已变化，请重新发送“{label} @成员”')
+            await plugin.reply(event, ('目标状态已变化，请重新打开主人菜单' if self.menu else f'目标状态已变化，请重新发送“{label} @成员”'))
 
 
 class TargetStateChangedError(Exception):
@@ -205,21 +213,53 @@ class OwnerCommands:
             log.error(f'[{bot}] {name}失败: {type(error).__name__}')
             await plugin.reply(event, f'{name}未完成：授权或群状态存储暂不可用，请检查后台')
 
+    async def execute(self, event, name, group, member, *, confirmations):
+        """Menu adapter: original channel Event plus server-selected business group."""
+        plugin, bot = self.plugin, event.appid
+        if not plugin.is_owner(event):
+            await plugin.reply(event, '仅主人可用')
+            return
+        if plugin.emergency.active(bot):
+            await plugin.reply(event, '紧急模式已开启，成员查询与授权操作暂停')
+            return
+        acl = plugin.access()
+        await plugin.declare(acl, bot)
+        facts = acl.group_state()
+        if facts is None:
+            await plugin.reply(event, '群状态模块未启用')
+            return
+        proof = await facts.fact(bot, group, member)
+        if proof['reason'] in service.PAUSED:
+            await plugin.reply(event, '待处理：群状态恢复未完成')
+            return
+        if name == '授权' and not proof.get('member'):
+            await plugin.reply(event, '已记录成员状态已变化，请重新打开主人菜单')
+            return
+        if not plugin.is_owner(event):
+            await plugin.reply(event, '仅主人可用')
+            return
+        await getattr(self, METHODS[name])({
+            'event': event, 'group': group, 'member': member, 'acl': acl,
+            'facts': facts, 'proof': proof, 'confirmations': confirmations,
+            'who': await service.member_label(bot, member), 'where': await display_group(bot, group),
+        })
+
     async def confirm_present(self, t, command):
         """Use the owner's command in this group as in-group evidence; a member's message never is."""
         event, proof = t['event'], t['proof']
         if proof['usable'] and (proof['member'] or {}).get('status') == 'present':
             return proof
-        evidence = f'主人在本群发送“{command} @成员”（消息 {event.message_id or "未知"}）'
-        confirmed = await t['facts'].confirm_member(event.appid, event.group_id, t['member'], evidence=evidence[:1000])
+        evidence = (f'主人在主人菜单选择“{command}”（消息 {event.message_id or "未知"}）'
+                    if 'group' in t else f'主人在本群发送“{command} @成员”（消息 {event.message_id or "未知"}）')
+        confirmed = await t['facts'].confirm_member(event.appid, t.get('group', event.group_id), t['member'], evidence=evidence[:1000])
         if not confirmed.get('reliable'):
             await self.plugin.reply(event, f'{command}待处理：成员在群事实未能确认，请稍后重试')
             return None
-        return await t['facts'].fact(event.appid, event.group_id, t['member'])
+        return await t['facts'].fact(event.appid, t.get('group', event.group_id), t['member'])
 
     async def grant(self, t):
         plugin, event, acl, member = self.plugin, t['event'], t['acl'], t['member']
-        bot, group = event.appid, event.group_id
+        bot, group = event.appid, t.get('group', event.group_id)
         proof = await self.confirm_present(t, '授权')
         if proof is None:
             return
@@ -254,7 +294,7 @@ class OwnerCommands:
 
     async def revoke(self, t):
         event, acl, member = t['event'], t['acl'], t['member']
-        bot, group = event.appid, event.group_id
+        bot, group = event.appid, t.get('group', event.group_id)
         snapshot = await acl.access_snapshot(bot, service.CONSUMER)
         if not any(g['group'] == group and g['member'] == member for g in snapshot['grants']):
             await self.plugin.reply(event, f'{t["who"]}在 {t["where"]} 没有忍3查询授权，无需撤销')
@@ -265,8 +305,10 @@ class OwnerCommands:
 
     async def deny(self, t):
         event, acl, facts, member = t['event'], t['acl'], t['facts'], t['member']
-        bot, group = event.appid, event.group_id
+        bot, group = event.appid, t.get('group', event.group_id)
         plugin, who, where = self.plugin, t['who'], t['where']
+        confirmations = t.get('confirmations', plugin.confirmations)
+        menu = confirmations.menu
         decision = await acl.evaluate(bot, service.CONSUMER, service.FUNCTION, group, member, action='invoke')
         if decision.get('denies'):
             await plugin.reply(event, f'{who}已在 {where} 的忍3拒绝名单中')
@@ -294,9 +336,18 @@ class OwnerCommands:
                 'cycle': fact.get('cycle'),
                 'member_role': fact.get('member_role'),
             }
+            if menu:
+                stable['menu_ready'] = (confirmations.plugin.ninja(bot) is plugin
+                                        and plugin.access_provider() is acl and acl.group_state() is facts
+                                        and not plugin.emergency.active(bot))
+                if not stable['menu_ready']:
+                    raise TargetStateChangedError
+                stable['fact_revision'] = {key: proof.get(key) for key in ('generation', 'version', 'recovery_revision', 'writer_revision')}
             return stable
 
         async def run(click, offered_state):
+            if menu and not offered_state.get('menu_ready'):
+                raise TargetStateChangedError
             write_proof = await facts.fact(bot, group, member)
             if await state() != offered_state:
                 raise TargetStateChangedError
@@ -321,11 +372,11 @@ class OwnerCommands:
             log.info(f'[{bot}] 拉黑 group={group} member={member}')
             await plugin.reply(click, f'已拉黑 {who}：在 {where} 不能查询忍3账号')
 
-        await plugin.confirmations.offer(event, f'确认拉黑 {who}？', label='拉黑', state=state, run=run)
+        await confirmations.offer(event, f'确认拉黑 {who}？', label='拉黑', state=state, run=run, business_group=group if menu else None)
 
     async def allow(self, t):
         event, acl, member = t['event'], t['acl'], t['member']
-        bot, group = event.appid, event.group_id
+        bot, group = event.appid, t.get('group', event.group_id)
         if not denials(await acl.access_snapshot(bot, service.CONSUMER), group, member):
             await self.plugin.reply(event, f'{t["who"]}不在 {t["where"]} 的忍3拒绝名单中')
             return
@@ -335,7 +386,7 @@ class OwnerCommands:
 
     async def explain(self, t):
         event, acl, member = t['event'], t['acl'], t['member']
-        bot, group = event.appid, event.group_id
+        bot, group = event.appid, t.get('group', event.group_id)
         decision = await acl.evaluate(bot, service.CONSUMER, service.FUNCTION, group, member, action='invoke')
         opened = await self.plugin.store.get(bot, 'groups', group)
         is_open = bool(opened and opened['enabled'])

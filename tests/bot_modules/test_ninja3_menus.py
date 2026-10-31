@@ -78,10 +78,10 @@ async def test_owner_menu_is_shared_but_management_rechecks_owner(ninja):
     assert not (await h.ninja_api('GET', 'notices'))[1]['data']
     await h.say('菜单', user='owner-a')
     management = buttons(h)[1:]
-    assert [b['text'] for b in management] == ['修改密码', '紧急模式']
+    assert [b['text'] for b in management] == ['主人菜单', '修改密码', '紧急模式']
     for b in management:
         await h.click(b['data'], user='MEMBERA', group='group-a')
-        assert h.texts() == ['仅主人可以管理']
+        assert h.texts() == ['仅主人可用' if b['text'] == '主人菜单' else '仅主人可以管理']
         await h.click(b['data'], user='owner-a', group='group-a')
         if b['text'] == '紧急模式':
             assert h.texts() == []
@@ -89,6 +89,8 @@ async def test_owner_menu_is_shared_but_management_rechecks_owner(ninja):
             await asyncio.gather(*list(h.ninja().emergency.runners.values()))
             await h.event('忍3退出紧急模式', user='owner-a')
             assert (await h.ninja_api('GET', 'emergency'))[1]['data']['state'] == 'exited'
+        elif b['text'] == '主人菜单':
+            assert h.texts() == ['主人菜单模块未启用']
         else:
             assert h.texts() == [b['text'] + '尚未交付，当前不可用']
 
