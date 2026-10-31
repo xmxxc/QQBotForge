@@ -12,12 +12,15 @@
 <p><label>主人核验依据 <input id="gs-evidence" maxlength="1000"></label> <label>已核实角色 <select id="gs-role"><option value="">角色未知</option><option value="member">普通成员</option><option value="admin">管理员</option><option value="owner">群主</option></select></label> <button id="gs-confirm">记录单人事实</button></p>
 <p>以上仅记录群事实，不授予功能资格。错误结果保留历史，不能直接认定成员离群。普通成员无此页面管理权限。</p>
 <p id="gs-status" role="status"></p><div id="gs-summary" style="white-space:pre-wrap;overflow-wrap:anywhere"></div>
-<details><summary>原始字段（主人详情，含原生 ID）</summary><pre id="gs-output" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre></details>
+<details><summary>原始字段（主人详情，含可复制的原生 ID）</summary><pre id="gs-output" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre></details>
 <script>
 (()=>{
  const bot=document.getElementById('gs-bot'), status=document.getElementById('gs-status'), output=document.getElementById('gs-output'), summaryBox=document.getElementById('gs-summary');
  const groupInput=document.getElementById('gs-group'), next=document.getElementById('gs-next');
  let latestRequest=0, memberPage=null;
+ // Display names from the response; identities and the raw fields below keep native IDs.
+ let names={};
+ const gn=id=>names.groups?.[id]||id, mn=id=>names.members?.[id]||id;
  // Pagination belongs to one Bot and group; any newer selection or request retires it.
  function clearPage(){memberPage=null;next.disabled=true;}
  // Same table and rules as modules/group_state/text.py, so the page and QQ replies agree; raw fields stay below.
@@ -64,24 +67,24 @@
   const reason=recoveryReason(recovery,pause);
   return '恢复基线：未就绪（'+state+(reason?'；原因：'+reason:'')+'）';
  }
- const memberLine=(m,own)=>m.member+'：'+label(m)+paused(m)+'，'+role(m.member_role)+botMark(m.bot,own)+(m.status==='left'?'，已离群':'');
+ const memberLine=(m,own)=>mn(m.member)+'：'+label(m)+paused(m)+'，'+role(m.member_role)+botMark(m.bot,own)+(m.status==='left'?'，已离群':'');
  // Headline for the status line and readable lines for the summary block.
  function summary(data,action){
   if(action==='rebuild')return [data?.ready===true?'恢复基线重建：已完成，事实恢复可用':'恢复基线重建：未完成，事实仍暂停使用，请查看未就绪或待核验的群／成员后重试',[]];
   if(Array.isArray(data?.groups)){
    const recovery=data.recovery||{};
-   return ['已知群（非全部）：'+(data.groups.map(g=>g.group+' '+label(g)+'，名册'+label(g.roster)).join('；')||'暂无'),
+   return ['已知群（非全部）：'+(data.groups.map(g=>gn(g.group)+' '+label(g)+'，名册'+label(g.roster)).join('；')||'暂无'),
     [recoveryLine(recovery),
-     ...data.groups.map(g=>g.group+'：'+label(g)+paused(g)+'；'+botState(g)+'；最近查询 '+when(g.checked_at)+'；名册'+label(g.roster))]];
+     ...data.groups.map(g=>gn(g.group)+'：'+label(g)+paused(g)+'；'+botState(g)+'；最近查询 '+when(g.checked_at)+'；名册'+label(g.roster))]];
   }
   if(action==='members')return ['已知成员：名册'+label(data?.roster)+'，本页 '+(data?.members||[]).length+' 人',(data?.members||[]).map(m=>memberLine(m))];
   if(action==='roster'){
    const complete=data?.complete===true, members=data?.members||[];
    return ['名册核验：'+(complete?'完整':'不完整，原因：'+(reasonText(data?.reason||data?.continuity_reason)||'未知')),
-    ['本轮读到 '+members.length+' 人（'+(complete?'可作全群名单':'仅本轮观察，不能作全群名单')+'）',...members.map(m=>m.member+'：'+role(m.member_role)+botMark(m.bot,m.member===data.self_member)),
-     ...(data?.missing_known_members?.length?['名册缺少的已知成员：'+data.missing_known_members.join('、')]:[])]];
+    ['本轮读到 '+members.length+' 人（'+(complete?'可作全群名单':'仅本轮观察，不能作全群名单')+'）',...members.map(m=>mn(m.member)+'：'+role(m.member_role)+botMark(m.bot,m.member===data.self_member)),
+     ...(data?.missing_known_members?.length?['名册缺少的已知成员：'+data.missing_known_members.map(mn).join('、')]:[])]];
   }
-  if(action==='refresh')return ['刷新结果：'+data?.group+' '+label(data)+paused(data),[botState(data),'最近查询 '+when(data?.checked_at)]];
+  if(action==='refresh')return ['刷新结果：'+gn(data?.group)+' '+label(data)+paused(data),[botState(data),'最近查询 '+when(data?.checked_at)]];
   return [(action==='confirm-member'?'人工确认：':'单人核验：')+memberLine(data||{}),['最近查询 '+when(data?.checked_at)]];
  }
  async function run(action='', nextPage=false){
@@ -105,6 +108,7 @@
    if(!isCurrent())return;
    if(!response.ok||!data.success)throw Error(data.error||data.message||'读取失败');
    if(action==='members'&&data.data?.group===group){memberPage=data.data;next.disabled=!memberPage.next_cursor;}
+   names=data.names||{};
    const [headline,lines]=summary(data.data,action);
    output.textContent=JSON.stringify(data.data,null,2);summaryBox.textContent=lines.join('\n');status.textContent='已更新：'+headline;
   }catch(error){if(isCurrent()){status.textContent=error.message;output.textContent='';summaryBox.textContent='';}}

@@ -38,7 +38,7 @@ async def test_independent_known_groups_owner_entry_refresh_and_restart(group_ho
     group = refreshed['groups'][0]
     assert group['reliable'] and group['bot_state']['member_role'] == 'admin'
     assert group['bot_state']['in_group'] is True
-    assert 'group-a' in host.sender.messages[-1][2]
+    assert '群 未知群（…up-a）：' in host.sender.messages[-1][2]
     group['bot_state']['member_role'] = 'forged'
     assert (await host.state.snapshot('bot-a'))['groups'][0]['bot_state']['member_role'] == 'admin'
     assert await host.modules.reload('group_state')
@@ -370,7 +370,7 @@ async def test_malformed_platform_role_is_a_historical_error(group_host, role, e
         await host.event('群状态 刷新 group-a')
         assert len(host.sender.messages) == 1
         # The owner reply is a Chinese summary (#62); the facts it summarises come from the module.
-        assert host.sender.messages[-1][2].startswith('群刷新结果\n群 group-a：未知（平台返回无法识别）\n历史记录：Bot 在群（管理员）')
+        assert host.sender.messages[-1][2].startswith('群刷新结果\n群 未知群（…up-a）：未知（平台返回无法识别）\n历史记录：Bot 在群（管理员）')
     [result] = returned
     assert not result['reliable'] and result['status'] == 'historical'
     assert result['reason'] == 'response_unknown' and result['bot_state'] == previous['bot_state']

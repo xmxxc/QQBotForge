@@ -20,7 +20,8 @@
 <p>成员先私聊发送“身份绑定 申请 群原生ID 成员原生ID”。申请编号和相同字符串都不是关联证据；绑定不授予功能资格，也不会主动联系新成员。</p>
 <p><button id="ac-binding-list">查看待审与已绑定</button> <label>申请ID <input id="ac-binding-request" maxlength="256"></label></p>
 <p><label>核对两侧身份的依据 <input id="ac-binding-evidence" maxlength="1000"></label> <label><input type="checkbox" id="ac-binding-checked">主人已核对为同一人</label> <button id="ac-binding-confirm">确认关联</button> <button id="ac-binding-reject">拒绝申请</button> <button id="ac-binding-revoke">撤销填写群／成员的关联</button></p>
-<p id="ac-status" role="status"></p><pre id="ac-output" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
+<style>details.ac-nid{display:inline-block}details.ac-nid code{display:block;user-select:all}</style>
+<p id="ac-status" role="status"></p><div id="ac-names"></div><pre id="ac-output" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
 <script>
 (()=>{
  const el=id=>document.getElementById('ac-'+id), value=id=>el(id).value.trim();
@@ -28,8 +29,18 @@
  function functionScope(){const kind=value('function-scope');return kind==='all'?{kind}:{kind,id:kind==='group'?value('function-group'):value('function')};}
  function resourceScope(){const kind=value('resource-scope');return kind==='all'?{kind}:kind==='group'?{kind,id:value('resource-group')}:{kind,ids:resources()};}
  function policy(){const kind=value('policy'), p={kind,groups:value('group')?[value('group')]:[],private:el('private').checked};if(kind==='role')p.roles=[value('role')];if(kind==='members')p.members=value('member')?[value('member')]:[];return p;}
+ // Display names only; native IDs stay in the tooltip, the expandable detail and the JSON below.
+ function named(names,kind,id){const d=document.createElement('details'),s=document.createElement('summary'),c=document.createElement('code');d.className='ac-nid';s.textContent=names[kind]?.[id]||id;s.title=id;c.textContent=id;d.append(s,c);return d;}
+ function showNames(data,names){
+  const box=el('names'), line=(...parts)=>{const p=document.createElement('p');p.append(...parts);box.append(p);};
+  const target=(kind,id)=>id?named(names,kind,id):'全部';
+  box.replaceChildren();
+  if(Array.isArray(data?.grants))for(const g of data.grants)line('授权来源：群 ',target('groups',g.group),' · 成员 ',target('members',g.member),' · '+(g.expires_at?'到期 '+new Date(g.expires_at*1000).toLocaleString('zh-CN',{hour12:false}):'长期'));
+  if(Array.isArray(data?.denies))for(const d of data.denies)line('明确拒绝：群 ',target('groups',d.group),' · 成员 ',target('members',d.member));
+  for(const [kind,title] of [['groups','涉及的群：'],['members','涉及的成员：']]){const ids=Object.keys(names[kind]||{});if(ids.length)line(title,...ids.flatMap((id,i)=>[...(i?['、']:[]),named(names,kind,id)]));}
+ }
  async function run(operation){
-  el('status').textContent='处理中…';
+  el('status').textContent='处理中…';el('names').replaceChildren();
   try {
   const bot=value('bot'), consumer=value('consumer'), body={operation,consumer,function:value('function'),group:value('group'),member:value('member')};
   if(operation.startsWith('binding_')){delete body.consumer;delete body.function;delete body.group;delete body.member;if(operation==='binding_confirm'){body.request=value('binding-request');body.evidence=value('binding-evidence');body.confirmed=el('binding-checked').checked;}if(operation==='binding_reject')body.request=value('binding-request');if(operation==='binding_revoke'){body.group=value('group');body.member=value('member');}}
@@ -44,7 +55,7 @@
   if(operation.startsWith('bulk_')){body.members=value('bulk-members').split(/\r?\n/).map(s=>s.trim()).filter(Boolean).map(member=>({member}));delete body.member;}
   if(operation==='explain')body.resource=resources()[0]||'';
   if(operation==='audience'){delete body.member;body.resource=resources()[0]||'';body.actions=value('audience-actions').split(',');}
-  const response=await fetch('/api/ext/access-control/?'+new URLSearchParams({bot,...(operation==='snapshot'?{consumer}:{})}),{method:operation==='snapshot'?'GET':'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},...(operation==='snapshot'?{}:{body:JSON.stringify(body)})});const data=await response.json();if(!response.ok||!data.success)throw Error(data.error||'处理失败');el('output').textContent=JSON.stringify(data.data,null,2);el('status').textContent='已处理，请核对资格原因和来源';}catch(error){el('status').textContent=error.message;el('output').textContent='';}
+  const response=await fetch('/api/ext/access-control/?'+new URLSearchParams({bot,...(operation==='snapshot'?{consumer}:{})}),{method:operation==='snapshot'?'GET':'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},...(operation==='snapshot'?{}:{body:JSON.stringify(body)})});const data=await response.json();if(!response.ok||!data.success)throw Error(data.error||'处理失败');showNames(data.data,data.names||{});el('output').textContent=JSON.stringify(data.data,null,2);el('status').textContent='已处理，请核对资格原因和来源';}catch(error){el('status').textContent=error.message;el('names').replaceChildren();el('output').textContent='';}
  }
  for(const [button,operation] of Object.entries({'load':'snapshot','register':'register','inventory':'resources','policy-save':'policy','grant':'grant','revoke':'revoke','deny':'deny','allow':'allow','explain':'explain','expiry-save':'expiry','function-group-save':'function_group','bulk-grant':'bulk_grant','bulk-revoke':'bulk_revoke','bulk-expiry':'bulk_expiry','binding-list':'binding_list','binding-confirm':'binding_confirm','binding-reject':'binding_reject','binding-revoke':'binding_revoke','audience':'audience'}))el(button).onclick=()=>run(operation);
  fetch('/api/bots',{credentials:'same-origin'}).then(r=>r.json()).then(data=>{for(const row of data.data?.bots||data.bots||[]){const option=document.createElement('option');option.value=row.appid;option.textContent=(row.name||row.appid)+' ('+row.appid+')';el('bot').append(option);}}).catch(()=>{el('status').textContent='无法读取Bot，请检查登录状态';});

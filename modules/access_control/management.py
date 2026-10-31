@@ -8,10 +8,87 @@ from aiohttp import web
 
 from core.base.config import cfg
 from core.base.logger import EXTENSION, get_logger
+from core.display import display_group, display_member
 from core.plugin._blacklist import get_blacklist_map
 
 PREFIX = '/api/ext/access-control/'
 log = get_logger(EXTENSION, '黑白名单授权')
+# Fields holding native QQ group / member IDs. Resource category groups and scopes are not QQ groups.
+GROUP_KEYS = {'group', 'groups'}
+MEMBER_KEYS = {'member', 'members'}
+SKIP_KEYS = {'resources', 'resource_scope', 'function_scope', 'credential'}
+NAMES_BATCH = 200
+SUMMARY_MAX = 10
+OPERATIONS = {
+    'snapshot': '查看策略与来源',
+    'register': '注册消费方',
+    'resources': '保存资源清单',
+    'policy': '保存功能策略',
+    'grant': '授权',
+    'revoke': '撤销授权',
+    'deny': '明确拒绝',
+    'allow': '移除拒绝',
+    'expiry': '修改来源期限',
+    'function_group': '保存功能组',
+    'bulk_grant': '批量授权',
+    'bulk_revoke': '批量撤销',
+    'bulk_expiry': '批量期限',
+    'explain': '解释资格',
+    'audience': '全员资格报告',
+    'join_rule': '关闭入群自动授权',
+    'adopt_legacy': '接管旧来源',
+    'binding_list': '查看身份绑定',
+    'binding_confirm': '确认身份关联',
+    'binding_reject': '拒绝绑定申请',
+    'binding_revoke': '撤销身份关联',
+    'binding_import': '身份迁移',
+}
+
+
+def native_ids(value, groups, members):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in SKIP_KEYS:
+                continue
+            target = groups if key in GROUP_KEYS else members if key in MEMBER_KEYS else None
+            if target is not None:
+                target.update(v for v in (item if isinstance(item, list) else [item]) if isinstance(v, str) and v)
+            native_ids(item, groups, members)
+    elif isinstance(value, list):
+        for item in value:
+            native_ids(item, groups, members)
+
+
+async def display_names(bot, *values):
+    """Display text for the IDs an owner reply or page shows; identities and data keep native IDs."""
+    groups, members = set(), set()
+    for value in values:
+        native_ids(value, groups, members)
+    groups, members = sorted(groups), sorted(members)
+    # Resolve every identity, with a bounded number of concurrent lookups.
+    identities = [(display_group, g) for g in groups] + [(display_member, m) for m in members]
+    shown = []
+    for start in range(0, len(identities), NAMES_BATCH):
+        shown.extend(await asyncio.gather(*(resolve(bot, native) for resolve, native in identities[start:start + NAMES_BATCH])))
+    split = len(groups)
+    return {'groups': dict(zip(groups, shown[:split], strict=True)), 'members': dict(zip(members, shown[split:], strict=True))}
+
+
+def owner_summary(request, result, names):
+    """Chinese owner summary sent before the unchanged JSON reply."""
+    operation = request.get('operation', '') if isinstance(request, dict) else ''
+    consumer = request.get('consumer', '') if isinstance(request, dict) else ''
+    title = OPERATIONS.get(operation, '操作')
+    lines = [f'授权管理：{title}已处理' + (f'（消费方 {consumer}）' if consumer else '')]
+    if isinstance(result, dict) and isinstance(result.get('allowed'), bool):
+        lines.append('结论：允许' if result['allowed'] else f'结论：不允许（{result.get("reason") or "原因未知"}）')
+    for label, kind in (('群', 'groups'), ('成员', 'members')):
+        shown = list(names[kind].values())
+        if shown:
+            more = f' 等 {len(shown)} 个' if len(shown) > SUMMARY_MAX else ''
+            lines.append(f'{label}：' + '、'.join(shown[:SUMMARY_MAX]) + more)
+    lines.append('原始 JSON 见下一条消息')
+    return '\n'.join(lines)
 
 
 def classify_receipt(reply):
@@ -96,7 +173,8 @@ class Management:
                 result = await self.execute(bot, await request.json())
             else:
                 return web.json_response({'success': False, 'error': '方法不存在'}, status=405)
-            return web.json_response({'success': True, 'data': result}, headers={'Cache-Control': 'no-store'})
+            body = {'success': True, 'data': result, 'names': await display_names(bot, result)}
+            return web.json_response(body, headers={'Cache-Control': 'no-store'})
         except (ValueError, TypeError, KeyError) as error:
             return web.json_response({'success': False, 'error': str(error)}, status=422)
         except (sqlite3.Error, OSError, RuntimeError):
@@ -183,12 +261,18 @@ class Management:
             source = bot.sender if bot else None
         if source is None:
             return None
+        summary = None
         try:
-            result = await self.execute(event.appid, json.loads(text.split(maxsplit=1)[1]), actor=event.user_id)
+            data = json.loads(text.split(maxsplit=1)[1])
+            result = await self.execute(event.appid, data, actor=event.user_id)
             content = '已处理，请在主人私聊或后台查看详情' if event.is_group else json.dumps(result, ensure_ascii=False)
+            if not event.is_group:
+                summary = owner_summary(data, result, await display_names(event.appid, data, result))
         except (ValueError, TypeError, KeyError) as error:
             content = str(error)
         except (sqlite3.Error, OSError, RuntimeError):
             content = '该授权范围暂不可用，请检查存储与群事实'
+        if summary is not None:
+            await source.reply(event, summary)
         await source.reply(event, content)
         return None
