@@ -456,19 +456,22 @@ class OwnerMenu:
         await self.show(event, group, '\n'.join(lines), rows+[nav])
 
     async def recover(self, event, groups, *, confirm):
+        from modules.group_state.state import member_departed
         from modules.group_state.text import REASONS
         facts, bot = self.module('group_state'), event.appid
         snapshot = await facts.snapshot(bot)
         groups = groups if groups is not None else [g['group'] for g in snapshot['groups']]
-        count, failed, total, reason = 0, 0, 0, ''
+        count, failed, total, skipped, reason = 0, 0, 0, 0, ''
         try:
             if confirm:
                 # Read all pages before any write; fixed IDs never grow during execution.
-                targets = {group: [r['member'] for r in await self.known(bot, group)] for group in groups}
                 versions = {group: await facts.members(bot, group, limit=1) for group in groups}
+                records = {group: await self.known(bot, group) for group in groups}
+                targets = {group: [r['member'] for r in rows if not member_departed(r)] for group, rows in records.items()}
+                skipped = sum(member_departed(r) for rows in records.values() for r in rows)
                 total = sum(len(ids) for ids in targets.values())
                 for group in groups:
-                    if targets[group] != [r['member'] for r in await self.known(bot, group)]:
+                    if records[group] != await self.known(bot, group):
                         raise ValueError('已记录成员范围变化')
                 for group, members in targets.items():
                     for member in members:
@@ -477,7 +480,10 @@ class OwnerMenu:
                         current = await facts.members(bot, group, limit=1)
                         if any(current[k] != versions[group][k] for k in ('version', 'generation')):
                             raise ValueError('已记录成员范围变化')
-                        result = await facts.confirm_member(bot, group, member, evidence=f'主人在主人菜单批量确认（消息 {event.message_id or "未知"}）')
+                        result = await facts.confirm_member(
+                            bot, group, member, evidence=f'主人在主人菜单批量确认（消息 {event.message_id or "未知"}）',
+                            expected_version=versions[group]['version'],
+                        )
                         if result.get('source') != 'owner_confirmed' or result.get('status') != 'present' or result.get('reason'):
                             failed += 1
                             raise ValueError('成员确认未完成')
@@ -500,7 +506,7 @@ class OwnerMenu:
             ready = False
             failed = max(failed, total-count)
             reason = str(error) if isinstance(error, ValueError) else type(error).__name__
-        await self.reply(event, f'已确认 {count} 人，' + ('恢复已完成' if ready else f'恢复未完成；失败 {failed} 项：{reason or "状态仍待核验"}') + '（恢复范围为此 Bot 的所有已知群）')
+        await self.reply(event, f'已确认 {count} 人，' + (f'跳过已退群 {skipped} 人，' if skipped else '') + ('恢复已完成' if ready else f'恢复未完成；失败 {failed} 项：{reason or "状态仍待核验"}') + '（恢复范围为此 Bot 的所有已知群）')
 
     async def available(self, facts):
         # The availability hook runs before ModuleManager publishes setup's return.
@@ -531,7 +537,7 @@ class OwnerMenu:
             if not address:
                 self.ctx.log.info('主人菜单恢复推送不可用: no_c2c_address')
                 continue
-            content, buttons, token, _ = self.card(bot, actor, '', '', '待恢复群：\n'+'\n'.join(names)+'\n只确认已记录成员；恢复影响此 Bot 所有已知群', [[('全部确认在群并恢复', ('recover_all',))]])
+            content, buttons, token, _ = self.card(bot, actor, '', '', '待恢复群：\n'+'\n'.join(names)+'\n只确认未退群的已记录成员；退群成员请单人确认；恢复影响此 Bot 所有已知群', [[('全部确认在群并恢复', ('recover_all',))]])
             def check(actor=actor):
                 return self.active and actor in (cfg.get_bot_config(bot) or {}).get('owner_ids', []) and actor not in get_blacklist_map(bot, 'user')
             try:

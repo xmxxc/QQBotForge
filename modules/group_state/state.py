@@ -55,6 +55,15 @@ def identifier(value):
     return value
 
 
+def member_departed(record):
+    """A leave ends the current cycle even when later queries overwrite its status."""
+    return (
+        record.get('status') == 'left'
+        or record.get('state') == 'left'
+        or 'left_cycle' in record and record['left_cycle'] == record.get('cycle')
+    )
+
+
 class GroupState:
     """Snapshots are detached historical/current facts, never an admission decision."""
 
@@ -510,7 +519,7 @@ class GroupState:
         await self._notify(bot, group, 'member_confirmed' if manual else 'member_verified')
         return self._member_result(bot, group, published, published['version'])
 
-    async def confirm_member(self, bot, native_group, member, *, evidence, member_role=None):
+    async def confirm_member(self, bot, native_group, member, *, evidence, member_role=None, expected_version=None):
         identifier(native_group)
         identifier(member)
         if not isinstance(evidence, str) or not evidence.strip() or len(evidence) > 1000:
@@ -519,6 +528,8 @@ class GroupState:
             raise ValueError('角色须为 member、admin、owner 或 null')
         state = await self._state(bot)
         group = self._group(state, native_group)
+        if expected_version is not None and (type(expected_version) is not int or group['version'] != expected_version):
+            raise ValueError('成员快照已变化，请重新确认')
         self._invalidate(state, group, 'individual_verification')
         version = group['version']
         record = group['members'].setdefault(member, {'member': member, 'member_role': None, 'bot': None})
@@ -905,7 +916,7 @@ class GroupState:
         anchor = previous.get('cycle_anchor') or previous.get('checked_at')
         # Stale, cancelled or restarted queries overwrite status and state; the cycle a
         # trusted leave ended stays ended until a new cycle starts.
-        departed = previous.get('status') == 'left' or previous.get('state') == 'left' or 'left_cycle' in previous and previous['left_cycle'] == previous.get('cycle')
+        departed = member_departed(previous)
         # R17: verification alone preserves the cycle. Only an observed departure/
         # join, a rejected transition the owner cannot see past, or platform
         # evidence of a different join establishes a new one.

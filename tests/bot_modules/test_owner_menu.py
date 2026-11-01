@@ -348,6 +348,10 @@ async def test_all_groups_recovery_and_bot_isolation(menu):
     await members(h, 1)
     await h.state.confirm_member('bot-a', 'group-b', 'member-b', evidence='fake')
     await h.state.confirm_member('bot-b', 'group-c', 'member-c', evidence='other bot')
+    from socket_platform import until
+    h.lifecycle('GROUP_MEMBER_REMOVE', member='member-b', group='group-b', sequence=2, timestamp=1000)
+    await until(lambda: h.state.states['bot-a']['groups']['group-b']['members']['member-b']['status'] == 'left')
+    await until(lambda: not h.state.notifications.busy('bot-a') and not h.state.pending_writes.get('bot-a'))
     await h.event('忍3', user='owner-a')
     h.texts()
     sent = []
@@ -360,7 +364,7 @@ async def test_all_groups_recovery_and_bot_isolation(menu):
     assert sent
     h.sender.keyboards.append(sent[0])
     assert '恢复已完成' in str(await press(h, '全部确认在群并恢复', group=''))
-    assert (await h.state.fact('bot-a', 'group-b', 'member-b'))['member']['source'] == 'owner_confirmed'
+    assert (await h.state.fact('bot-a', 'group-b', 'member-b'))['member']['status'] == 'left'
     assert '主人在主人菜单批量确认' not in str((await h.state.fact('bot-b', 'group-c', 'member-c'))['member'].get('evidence'))
 
 
@@ -534,3 +538,65 @@ async def test_deny_state_becomes_unavailable_during_offer(menu, monkeypatch):
     assert '状态已变化' in str(await press(h, '拉黑', group=''))
     assert not h.menu().confirmations.pending
     assert not (await h.access.access_snapshot('bot-a', 'ninja3'))['denies']
+
+
+@pytest.mark.parametrize('verify_after_leave', [False, True])
+async def test_bulk_recovery_keeps_departed_members_left(menu, verify_after_leave):
+    from socket_platform import until
+
+    h = menu
+    await members(h, 2)
+    await h.access.manage_access('bot-a', 'ninja3', 'policy', function='query', policy={'kind': 'group', 'groups': ['group-a']})
+    assert (await h.access.evaluate('bot-a', 'ninja3', 'query', 'group-a', 'member-1'))['allowed']
+    h.lifecycle('GROUP_MEMBER_REMOVE', member='member-1', sequence=2, timestamp=1000)
+    await until(lambda: h.state.states['bot-a']['groups']['group-a']['members']['member-1']['status'] == 'left')
+    await until(lambda: not h.state.notifications.busy('bot-a') and not h.state.pending_writes.get('bot-a'))
+    await h.say('普通消息', user='member-new')
+    before = (await h.state.fact('bot-a', 'group-a', 'member-1'))['member']
+    if verify_after_leave:
+        response = await h.api('POST', 'member', body={'group': 'group-a', 'member': 'member-1'})
+        assert response.status == 200
+    before = (await h.state.fact('bot-a', 'group-a', 'member-1'))['member']
+    for _ in range(2):
+        await private_group(h)
+        await press(h, '群状态', group='')
+        reply = await press(h, '全部确认在群并恢复', group='')
+        after = (await h.state.fact('bot-a', 'group-a', 'member-1'))['member']
+        assert after['status'] == 'left' and after['state'] != 'present'
+        assert after['cycle'] == before['cycle'] and after['source'] == before['source']
+        assert '跳过已退群 1 人' in str(reply)
+        assert not (await h.access.evaluate('bot-a', 'ninja3', 'query', 'group-a', 'member-1'))['allowed']
+        assert (await h.state.fact('bot-a', 'group-a', 'member-0'))['member']['source'] == 'owner_confirmed'
+        assert (await h.state.fact('bot-a', 'group-a', 'member-new'))['member']['source'] == 'owner_confirmed'
+    assert await h.modules.reload('group_state')
+    after = (await h.state.fact('bot-a', 'group-a', 'member-1'))['member']
+    assert after['status'] == 'left' and after['cycle'] == before['cycle']
+    response = await h.api('POST', 'confirm-member', body={'group': 'group-a', 'member': 'member-1', 'evidence': '主人单人核对'})
+    assert response.status == 200, await response.text()
+    assert (await h.state.fact('bot-a', 'group-a', 'member-1'))['member']['status'] == 'present'
+
+
+async def test_bulk_recovery_rechecks_leave_before_confirmation(menu, monkeypatch):
+    from socket_platform import until
+
+    h = menu
+    await members(h, 1)
+    await private_group(h)
+    await press(h, '群状态', group='')
+    original = h.state.confirm_member
+    left = []
+
+    async def leave_before_confirm(bot, group, member, **kwargs):
+        if not left:
+            left.append(member)
+            h.lifecycle('GROUP_MEMBER_REMOVE', member=member, sequence=2, timestamp=1000)
+            await until(lambda: h.state.states[bot]['groups'][group]['members'][member]['status'] == 'left')
+            await until(lambda: not h.state.notifications.busy(bot) and not h.state.pending_writes.get(bot))
+        return await original(bot, group, member, **kwargs)
+
+    monkeypatch.setattr(h.state, 'confirm_member', leave_before_confirm)
+    reply = await press(h, '全部确认在群并恢复', group='')
+    member = (await h.state.fact('bot-a', 'group-a', left[0]))['member']
+    assert member['status'] == 'left' and member['state'] == 'left'
+    assert '恢复未完成' in str(reply)
+    assert '已确认 0 人' in str(reply)
