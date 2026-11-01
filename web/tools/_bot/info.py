@@ -7,7 +7,7 @@ import aiohttp as _aiohttp
 from aiohttp import web
 
 from core.base.config import cfg
-from web.tools._bots import ws_connection_state
+from web.tools._bots import connection_status_text, ws_connection_state
 
 _SSL_CTX = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 _SSL_CTX.load_default_certs(ssl.Purpose.SERVER_AUTH)
@@ -23,8 +23,6 @@ _HEADERS = {
     'qname-service': '976321:131072',
     'qname-space': 'Production',
 }
-
-_WS_STATUS_TEXT = {'connected': '已连接', 'reconnecting': '断线重连中', 'disconnected': '未连接'}
 
 _bot_manager = None
 
@@ -46,7 +44,7 @@ async def handle_get_robot_info(request: web.Request):
     is_webhook = bool(bot and not bot.ws_client)
     ws_state = ws_connection_state(bot) if bot and bot.ws_client else 'disconnected'
     conn_type = 'Webhook' if is_webhook else 'WebSocket'
-    conn_status = '等待接收中' if is_webhook else _WS_STATUS_TEXT[ws_state]
+    conn_status = '等待接收中' if is_webhook else connection_status_text(ws_state)
     channel_url = _CHANNEL_URL.format(appid)
 
     def _qr(u):
