@@ -7,9 +7,9 @@
 - 建议 fork：`xmxxc/ElainaBot_v2_web`（尚未创建）；fork `main` 跟踪上游 `main`，自有改动使用 `feature/*` 分支和 PR。当前只发布了上游问题 issue，未创建该 fork。
 - 前端为 Vue 3 + Vite，入口脚本为 `npm run build`，仓库有 `package-lock.json`，当前未发现 license 文件。主人已确认发布问题 issue；源码 PR、公开 fork 和构建分发仍等待许可证/授权反馈。
 
-## 可重建构建
+## 候选构建方案（待主人决定启用）
 
-在固定源码 commit 的干净工作树执行：
+以下方案尚未启用。收到前端许可证回复后，需由主人决定是否继续 fork 构建路线；前端三态如何实现由上游决定。若方案获准，在固定源码 commit 的干净工作树执行：
 
 ```sh
 node --version
@@ -36,13 +36,13 @@ artifact_files: <文件清单或清单摘要>
 
 1. 已在 `ElainaCore/ElainaBot_v2` 提交后端三态 issue/PR（issue #113，PR #114）。
 2. 已在 `ElainaCore/ElainaBot_v2_web` 提交不含 QQBotForge 专属更新页的前端三态 issue（issue #38）；前端代码 PR 暂不提交。
-3. 上游确认并完成授权后，将 fork `main` 同步上游 `main`；在 fork feature 分支保留 #100/#171 更新页源码，并通过 PR 合并。
+3. 收到许可证回复后，由主人决定是否启用 fork 构建路线，并明确前端代码提交安排。若启用，再将 fork `main` 同步上游 `main`，在 feature 分支保留 #100/#171 更新页源码并通过 PR 合并。
 4. 从 fork 的固定源码 commit 执行上述构建，核对 manifest、产物清单和必要的静态检查。
 5. 在 QQBotForge feature 分支更新 `web/dist` 和来源记录，运行 CI 校验后提交同步 PR。
 
 上游同步冲突、更新页源码迁移和三态源码必须保持可区分的提交，便于回滚和审查。
 
-## QQBotForge CI 校验
+## 方案启用后的 QQBotForge CI 校验
 
 CI 应拒绝缺少来源 manifest、源码 commit、锁摘要或构建器版本的产物；校验产物清单与 manifest 一致，并在可用时用相同 Node/npm 执行 `npm ci`/`npm run build` 对比。CI 不向上游推送、不创建 fork，也不把 dist 的手工修改视为有效来源。
 
