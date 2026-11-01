@@ -95,3 +95,7 @@ G02 先前 `95b0505` 的框架组合有 153 项业务回归通过，但独立复
 原生入群依据（#73，`docs/adr/0001-native-join-admission.md`）：本 Bot 恢复订阅已有基线且无失败时，可信、字段完整且顺序成立的 WS 入群在成员记录上另存 `native_join`（事件 ID、时间、序号、会话、周期、模块代际、依据轮次）；成员仍为 `pending`、`reliable=false`，`usable`、名册与全员报告不变。依据只在同代际、同轮次（每次 `rebuild` 开始递增）、同周期且未离群时当前，离群、不可信事件暂停时清除。`await state.native_join(bot, group, member)` 返回当前依据（不看暂停，供消费通知内写入）；`fact()` 凭据的 `join` 只在未暂停且依据当前时给出；`state.join_current(proof)` 与 `fact_current` 相同复查但以 `join` 代替 `usable`。依据不授予任何资格。
 
 自动验证使用实际 ModuleManager、Application 与 WSClient 消息循环，网络层替换为逐帧 socket，数据库和身份均为临时样例。覆盖四类事件、可信补发、重载、缺标识／时间／身份、同秒与迟到冲突、原生去重、SQLite 写锁、消费异常／取消／超时／卸载及跨重载旧写入者。浏览器仍不可用，真实 QQ 及平台权限未执行。
+
+### 条件式主人确认
+
+模块接口 `confirm_member(..., expected_version=None)` 可选择传入先前成员快照的群版本；加载当前群后、写入确认事实前原子比较该版本，不一致时抛出 `ValueError`，不写入确认。省略时保留单人确认的既有语义。主人菜单的批量确认传入版本，并跳过 `member_departed(record)` 判定的已退群周期（`status/state=left` 或 `left_cycle` 等于当前 `cycle`）；后续真正入群的新周期可以再次确认。
