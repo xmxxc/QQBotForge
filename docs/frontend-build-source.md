@@ -4,8 +4,8 @@
 
 - 上游后端：`ElainaCore/ElainaBot_v2`，观察基线 `53e6f74e112c56f35f85c49343a2d8ec3b2cfe65`。
 - 上游前端：`ElainaCore/ElainaBot_v2_web`，观察基线 `06ce2b8e4fd4ac0c9e131fb6fb554395f702ca2f`。
-- 建议 fork：`xmxxc/ElainaBot_v2_web`（尚未创建）；fork `main` 跟踪上游 `main`，自有改动使用 `feature/*` 分支和 PR。
-- 前端为 Vue 3 + Vite，入口脚本为 `npm run build`，仓库有 `package-lock.json`，当前未发现 license 文件。公开 fork、issue、PR 和构建分发前必须由主人确认 license/授权；本文不表示已获授权。
+- 建议 fork：`xmxxc/ElainaBot_v2_web`（尚未创建）；fork `main` 跟踪上游 `main`，自有改动使用 `feature/*` 分支和 PR。当前只发布了上游问题 issue，未创建该 fork。
+- 前端为 Vue 3 + Vite，入口脚本为 `npm run build`，仓库有 `package-lock.json`，当前未发现 license 文件。主人已确认发布问题 issue；源码 PR、公开 fork 和构建分发仍等待许可证/授权反馈。
 
 ## 可重建构建
 
@@ -34,8 +34,8 @@ artifact_files: <文件清单或清单摘要>
 
 ## 同步顺序与维护
 
-1. 先在 `ElainaCore/ElainaBot_v2` 提交后端三态 issue/PR。
-2. 再在 `ElainaCore/ElainaBot_v2_web` 提交不含 QQBotForge 专属更新页的前端三态 issue/PR。
+1. 已在 `ElainaCore/ElainaBot_v2` 提交后端三态 issue/PR（issue #113，PR #114）。
+2. 已在 `ElainaCore/ElainaBot_v2_web` 提交不含 QQBotForge 专属更新页的前端三态 issue（issue #38）；前端代码 PR 暂不提交。
 3. 上游确认并完成授权后，将 fork `main` 同步上游 `main`；在 fork feature 分支保留 #100/#171 更新页源码，并通过 PR 合并。
 4. 从 fork 的固定源码 commit 执行上述构建，核对 manifest、产物清单和必要的静态检查。
 5. 在 QQBotForge feature 分支更新 `web/dist` 和来源记录，运行 CI 校验后提交同步 PR。
