@@ -8,9 +8,14 @@ _instance = None
 async def setup(ctx):
     global _instance
     candidate = OwnerMenu(ctx)
-    ctx.register_hook('before_event', candidate.on_event, priority=20)
-    ctx.register_hook('group_state_available', candidate.available)
-    candidate.subscription = ctx.subscribe_connection_status(candidate.connection)
+    try:
+        await candidate.store.ready()
+        ctx.register_hook('before_event', candidate.on_event, priority=20)
+        ctx.register_hook('group_state_available', candidate.available)
+        candidate.subscription = ctx.subscribe_connection_status(candidate.connection)
+    except BaseException:
+        await candidate.close()
+        raise
     _instance = candidate
     return candidate
 

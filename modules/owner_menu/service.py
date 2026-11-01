@@ -9,6 +9,7 @@ from core.application import get_app
 from core.base.config import cfg
 from core.display import display_group, display_member
 from core.plugin._blacklist import get_blacklist_map
+from modules.group_state.storage import ExtensionStore
 
 
 class OwnerMenu:
@@ -16,8 +17,9 @@ class OwnerMenu:
         self.ctx = ctx
         self.active = True
         self.clock = time.time
-        self.sessions = {}
+        self.store = ExtensionStore(ctx.get_data_path('owner-menu.db'))
         self.addresses = {}
+        self.action_lock = asyncio.Lock()
         self.pushed = set()
         self.subscription = None
         self.tasks = set()
@@ -66,13 +68,12 @@ class OwnerMenu:
             return 'unknown'
 
     def valid(self, event, session):
-        return (self.active and self.is_owner(event) and session['bot'] == event.appid
-                and session['owner'] == event.raw_user_id and session['channel'] == event.group_id
-                and session['expires'] > self.clock() and session['ninja'] == id(self.ninja(event.appid)))
+        return (self.active and self.is_owner(event) and session.get('bot') == event.appid
+                and session.get('owner') == event.raw_user_id and session.get('channel') == event.group_id
+                and session.get('schema') == 1)
 
-    def card(self, bot, owner, channel, group, title, rows, *, stamp=None):
+    async def card(self, bot, owner, channel, group, title, rows, *, stamp=None):
         now = self.clock()
-        self.sessions = {k: v for k, v in self.sessions.items() if v['expires'] > now}
         token = uuid4().hex
         actions = []
         buttons = []
@@ -82,18 +83,21 @@ class OwnerMenu:
                 actions.append(action)
                 line.append({'text': label[:40], 'type': 1, 'data': f'om:{token}:{len(actions)-1}', 'list': [owner]})
             buttons.append(line)
-        session = self.sessions[token] = dict(bot=bot, owner=owner, channel=channel, group=group,
-                                              expires=now + 300, actions=actions, stamp=stamp, ninja=id(self.ninja(bot)))
+        session = dict(schema=1, bot=bot, owner=owner, channel=channel, group=group,
+                       created=now, actions=actions, stamp=stamp)
+        await self.store.put(bot, 'cards', token, session)
         return title, buttons, token, session
 
     async def show(self, event, group, title, rows, *, stamp=None):
-        content, buttons, token, session = self.card(event.appid, event.raw_user_id, event.group_id, group, title, rows, stamp=stamp)
+        content, buttons, token, session = await self.card(event.appid, event.raw_user_id, event.group_id, group, title, rows, stamp=stamp)
         result = await self.reply(event, content, buttons=buttons, send_check=lambda: self.valid(event, session))
         if result in {'failed', 'unavailable'}:
-            self.sessions.pop(token, None)
+            await self.store.delete(event.appid, 'cards', token)
             await self.reply(event, '按钮暂不可用，请重新打开主人菜单或使用后台')
 
     async def on_event(self, event):
+        if not self.active:
+            return event
         content = (event.content or '').strip()
         command = content in {'主人菜单', '主人命令'} and event.event_type in {'GROUP_AT_MESSAGE_CREATE', 'GROUP_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE'}
         callback = event.event_type == 'INTERACTION_CREATE' and content.startswith(('om:', 'omc:'))
@@ -119,28 +123,26 @@ class OwnerMenu:
                 raw = event.interaction_data or {}
                 if raw.get('application_id', event.appid) != event.appid or raw.get('type') not in {11, 12} or raw.get('scene') != ('group' if event.group_id else 'c2c') or raw.get('chat_type') != (1 if event.group_id else 2):
                     await self.reply(event, '已失效，请重新打开主人菜单')
-                elif content.startswith('omc:'):
-                    match = re.fullmatch(r'omc:(ok|no):([0-9a-f]{32})', content)
-                    if match:
-                        request = self.confirmations.pending.get(match[2])
-                        await self.confirmations.click(event, match[1] == 'ok', match[2])
-                        if (request and match[2] not in self.confirmations.pending
-                                and request['bot'] == event.appid and request['group'] == event.group_id
-                                and request['owner'] == event.raw_user_id and self.is_owner(event)):
-                            await self.return_card(event, request.get('business_group') or '')
-                    else:
-                        await self.reply(event, '已失效，请重新打开主人菜单')
                 else:
-                    await self.click(event)
+                    async with self.action_lock:
+                        if not self.active:
+                            return None
+                        if not self.is_owner(event):
+                            await self.reply(event, '仅主人可用')
+                            return None
+                        if content.startswith('omc:'):
+                            await self.confirmation_click(event)
+                        else:
+                            await self.click(event)
         except (ValueError, RuntimeError, sqlite3.Error, OSError) as error:
             self.ctx.log.error(f'主人菜单未完成: {type(error).__name__}')
-            await self.reply(event, '操作未完成：状态变化或服务暂不可用，请重新打开主人菜单')
+            await self.unavailable(event, '操作未完成：参数或状态已变化，或服务暂不可用')
         return None
 
     async def open(self, event):
         facts = self.module('group_state')
         if not facts:
-            await self.reply(event, '群状态模块未启用')
+            await self.unavailable(event, '群状态模块未启用')
             return
         snapshot = await facts.snapshot(event.appid)
         if not event.group_id:
@@ -171,45 +173,132 @@ class OwnerMenu:
         await self.show(event, group, f'主人菜单 · {await display_group(event.appid, group)}\n群状态' + ('：待恢复' if pending else '：已就绪'), rows)
 
     async def click(self, event):
+        if event.content == 'om:open':
+            await self.open(event)
+            return
         match = re.fullmatch(r'om:([0-9a-f]{32}):([0-9]{1,2})', event.content or '')
-        session = self.sessions.get(match[1]) if match else None
+        session = await self.store.get(event.appid, 'cards', match[1]) if match else None
         if not session or not self.valid(event, session) or int(match[2]) >= len(session['actions']):
-            await self.reply(event, '已失效，请重新打开主人菜单')
+            await self.unavailable(event, '卡片记录不可用或与当前主人、Bot、群不匹配')
             return
         action = session['actions'][int(match[2])]
-        # Consume before awaiting: concurrent replay cannot execute a write twice.
-        del self.sessions[match[1]]
         group = session['group']
         facts = self.module('group_state')
         if not facts:
-            await self.reply(event, '群状态模块未启用')
+            await self.unavailable(event, '群状态模块未启用')
             return
         snapshot = await facts.snapshot(event.appid)
+        if not self.valid(event, session):
+            await self.unavailable(event, '当前主人或菜单状态已变化')
+            return
         if action[0] == 'groups':
             await self.groups(event, snapshot, action[1])
             return
         if action[0] == 'home':
             group = action[1] if len(action) > 1 else group
         if group and group not in {g['group'] for g in snapshot['groups']}:
-            await self.reply(event, '群状态已变化，请重新选群')
+            await self.unavailable(event, '卡片对应的群已不在当前群记录中')
             return
-        if session['stamp'] and session['stamp'][1:] != await self.stamp(event.appid, group):
+        if action[0] == 'list' and session['stamp'] and tuple(session['stamp'][1:]) != await self.stamp(event.appid, group):
             await self.reply(event, '名单状态已变化，已返回第一页')
             await self.listing(event, group, session['stamp'][0], 0)
             return
-        pending = len(self.confirmations.pending)
+        pending = set(self.confirmations.pending)
         await self.dispatch(event, group, action, snapshot)
-        if action[0] in {'member', 'enable', 'recover', 'rebuild', 'recover_all', 'check_update', 'update', 'update_progress', 'batch_confirm'} and len(self.confirmations.pending) <= pending:
+        await self.remember_confirmations(event, group, action, pending)
+        if action[0] in {'member', 'enable', 'recover', 'rebuild', 'recover_all', 'check_update', 'update', 'update_progress', 'batch_confirm'} and not (set(self.confirmations.pending) - pending):
             await self.return_card(event, group)
 
     async def return_card(self, event, group):
         if self.active and self.is_owner(event):
-            await self.show(event, group, '继续管理', [[('返回', ('home',) if group else ('groups', 0))]])
+            await self.show(event, group, '继续管理', [[('返回', ('home',) if group else ('groups', 0)), ('打开新菜单', ('open',))]])
+
+    async def unavailable(self, event, reason):
+        await self.reply(event, reason, buttons=[[{'text': '打开新菜单', 'type': 1, 'data': 'om:open', 'list': [event.raw_user_id]}]])
+
+    async def remember_confirmations(self, event, group, action, before):
+        for token in set(self.confirmations.pending) - before:
+            request = self.confirmations.pending[token]
+            reopen = action
+            if action[0] == 'select':
+                reopen = ('batch_review', request['snapshot'][2]['id'], event.raw_user_id)
+            await self.store.put(event.appid, 'confirmations', token, dict(
+                schema=1, bot=event.appid, owner=event.raw_user_id, channel=event.group_id,
+                group=group, action=reopen,
+            ))
+
+    async def confirmation_click(self, event):
+        match = re.fullmatch(r'omc:(ok|no):([0-9a-f]{32})', event.content or '')
+        if not match:
+            await self.unavailable(event, '确认按钮参数无效')
+            return
+        choice, token = match.groups()
+        request = self.confirmations.pending.get(token)
+        if request and request['expires_at'] > self.clock():
+            await self.confirmations.click(event, choice == 'ok', token)
+            if token not in self.confirmations.pending:
+                await self.return_card(event, request.get('business_group') or '')
+            return
+        self.confirmations.pending.pop(token, None)
+        saved = await self.store.get(event.appid, 'confirmations', token)
+        if not saved or not self.valid(event, saved):
+            await self.unavailable(event, '确认记录不可用或与当前主人、Bot、群不匹配')
+            return
+        if choice == 'no':
+            await self.reply(event, '已取消；历史按钮不会执行操作')
+            await self.return_card(event, saved['group'])
+            return
+        # Durable records contain action IDs only. Fresh confirmation closures
+        # always read today's target; no callable or old permission snapshot is persisted.
+        facts = self.module('group_state')
+        if not facts:
+            await self.unavailable(event, '群状态模块未启用')
+            return
+        snapshot = await facts.snapshot(event.appid)
+        if saved['group'] and saved['group'] not in {g['group'] for g in snapshot['groups']}:
+            await self.unavailable(event, '确认对应的群已不在当前群记录中')
+            return
+        before = set(self.confirmations.pending)
+        await self.dispatch(event, saved['group'], saved['action'], snapshot)
+        await self.remember_confirmations(event, saved['group'], saved['action'], before)
+
+    async def offer_revoke(self, event, group, member, ninja):
+        from plugins.ninja3.owner_commands import TargetStateChangedError
+        acl, facts, bot = self.module('access_control'), self.module('group_state'), event.appid
+
+        if not acl or not facts:
+            await self.unavailable(event, '授权或群状态模块未启用')
+            return
+
+        async def state():
+            if (self.ninja(bot) is not ninja or self.module('access_control') is not acl
+                    or self.module('group_state') is not facts or ninja.emergency.active(bot)):
+                raise TargetStateChangedError
+            return (await acl.access_snapshot(bot, 'ninja3'), await self.stamp(bot, group))
+
+        async def run(click, offered):
+            if await state() != offered or not self.active or not self.is_owner(click):
+                raise TargetStateChangedError
+            try:
+                await acl.manage_access(bot, 'ninja3', 'revoke', function='query', group=group, member=member,
+                                        _expected_version=offered[0]['version'])
+            except ValueError as error:
+                if str(error) == '授权状态已变化':
+                    raise TargetStateChangedError from error
+                raise
+            await self.reply(click, f'已撤销 {await display_member(bot, member)}在 {await display_group(bot, group)} 的忍3查询授权')
+
+        await self.confirmations.offer(
+            event, f'确认撤销 {await display_member(bot, member)}在 {await display_group(bot, group)} 的当前忍3查询授权？',
+            label='撤销', state=state, run=run, business_group=group,
+        )
 
     async def dispatch(self, event, group, action, snapshot):
         kind, bot = action[0], event.appid
         back = [('返回', ('home',))]
-        if kind == 'home':
+        if kind == 'open':
+            await self.open(event)
+        elif kind == 'home':
             await self.home(event, group, snapshot)
         elif kind == 'state':
             from modules.group_state.text import REASONS, group_line, recovery_line
@@ -233,34 +322,35 @@ class OwnerMenu:
         elif kind == 'member':
             ninja = self.ninja(bot)
             if not ninja:
-                await self.reply(event, '忍3未启用')
+                await self.unavailable(event, '忍3功能未启用')
+            elif action[1] == '撤销':
+                await self.offer_revoke(event, group, action[2], ninja)
             else:
                 await ninja.owner_commands.execute(event, action[1], group, action[2], confirmations=self.confirmations)
         elif kind == 'ninja':
             if not self.ninja(bot):
-                await self.reply(event, '忍3未启用')
+                await self.unavailable(event, '忍3功能未启用')
                 return
             await self.show(event, group, '忍3管理', [[('账号列表', ('accounts', 0))], [('批量改密', ('select_accounts', 0))], [('批量进度与取消', ('batches', 0))], [('开放本群', ('enable', True)), ('关闭本群', ('enable', False))], back])
         elif kind == 'enable':
-            await self.require_ninja(bot).manage_group(bot, 'save', {'group': group, 'enabled': action[1]})
-            await self.reply(event, '已' + ('开放' if action[1] else '关闭') + '本群')
+            ninja = self.require_ninja(bot)
+            if not action[1]:
+                await self.offer_close(event, group, ninja)
+            else:
+                await ninja.manage_group(bot, 'save', {'group': group, 'enabled': True})
+                await self.reply(event, '已开放本群')
         elif kind in {'accounts', 'select_accounts', 'batches'}:
             await self.ninja_list(event, group, kind, action[1])
         elif kind == 'select':
             ninja = self.require_ninja(bot)
             batch = await ninja.password_batches.select(bot, event.raw_user_id, None if action[1] is None else [action[1]])
             key, actor = batch['id'], event.raw_user_id
-            async def state():
-                from plugins.ninja3.owner_commands import TargetStateChangedError
-                if self.ninja(bot) is not ninja:
-                    raise TargetStateChangedError
-                return (True, [{k: v for k, v in a.items() if k != 'login'} for a in await ninja.manage_account(bot, 'list')], await ninja.password_batches.get(bot, key))
-            async def run(click, offered):
-                await self.confirm_batch(click, ninja, key, actor)
             if action[1] is None:
-                await self.confirmations.offer(event, f'确认对全部 {len(batch["items"])} 个账号批量改密？', label='批量改密全部', state=state, run=run, business_group=group)
+                await self.review_batch(event, group, ninja, key, actor)
             else:
                 await self.show(event, group, '已选择一个账号，确认后执行改密', [[('确认执行', ('batch_confirm', key, actor))], back])
+        elif kind == 'batch_review':
+            await self.review_batch(event, group, self.require_ninja(bot), action[1], action[2])
         elif kind == 'batch_confirm':
             await self.confirm_batch(event, self.require_ninja(bot), action[1], action[2])
         elif kind in {'batch_get', 'batch_cancel'}:
@@ -272,7 +362,7 @@ class OwnerMenu:
         elif kind in {'check_update', 'update', 'update_progress'}:
             updater = self.updater()
             if not updater:
-                await self.reply(event, '更新器不可用')
+                await self.unavailable(event, '更新功能当前不可用')
                 return
             if kind == 'update_progress':
                 result = updater.get_progress()
@@ -283,6 +373,8 @@ class OwnerMenu:
             else:
                 await self.reply(event, '更新已提交给现有更新器，请在后台查看进度')
                 self.start(self.update(updater, event))
+        else:
+            await self.unavailable(event, '卡片功能已下线或参数版本不再支持')
 
     def require_ninja(self, bot):
         ninja = self.ninja(bot)
@@ -290,12 +382,64 @@ class OwnerMenu:
             raise RuntimeError('忍3未启用')
         return ninja
 
+    async def offer_close(self, event, group, ninja):
+        from plugins.ninja3.owner_commands import TargetStateChangedError
+        bot = event.appid
+
+        async def state():
+            if self.ninja(bot) is not ninja:
+                raise TargetStateChangedError
+            current = await ninja.store.get(bot, 'groups', group)
+            if current is None:
+                raise TargetStateChangedError
+            return current
+
+        async def run(click, offered):
+            if await state() != offered or not self.active or not self.is_owner(click):
+                raise TargetStateChangedError
+            await ninja.manage_group(bot, 'save', {'group': group, 'enabled': False})
+            await self.reply(click, '已关闭本群')
+
+        current = await ninja.store.get(bot, 'groups', group)
+        if not current:
+            await self.unavailable(event, '此群已不在当前忍3开放群记录中')
+            return
+        await self.confirmations.offer(
+            event, f'确认关闭 {await display_group(bot, group)} 的忍3查询入口？',
+            label='关闭本群', state=state, run=run, business_group=group,
+        )
+
     async def confirm_batch(self, event, ninja, key, actor):
         if actor != event.raw_user_id or not self.is_owner(event) or self.ninja(event.appid) is not ninja:
-            await self.reply(event, '已失效')
+            await self.unavailable(event, '批次记录与当前主人或忍3服务不匹配')
             return
         batch = await ninja.password_batches.confirm(event.appid, key, actor)
         await self.reply(event, ninja.batch_summary(batch, detailed=not bool(event.group_id)))
+
+    async def review_batch(self, event, group, ninja, key, actor):
+        from plugins.ninja3.owner_commands import TargetStateChangedError
+        bot = event.appid
+        batch = await ninja.password_batches.get(bot, key)
+        if actor != event.raw_user_id:
+            await self.unavailable(event, '请由选择账号的当前主人操作此批次')
+            return
+        if batch['state'] != 'selected':
+            await self.reply(event, ninja.batch_summary(batch, detailed=not bool(event.group_id)))
+            return
+
+        async def state():
+            if self.ninja(bot) is not ninja:
+                raise TargetStateChangedError
+            return (True, [{k: v for k, v in a.items() if k != 'login'} for a in await ninja.manage_account(bot, 'list')],
+                    await ninja.password_batches.get(bot, key))
+
+        async def run(click, offered):
+            await self.confirm_batch(click, ninja, key, actor)
+
+        await self.confirmations.offer(
+            event, f'确认对当前批次中的 {len(batch["items"])} 个账号批量改密？',
+            label='批量改密全部', state=state, run=run, business_group=group,
+        )
 
     async def update(self, updater, event):
         try:
@@ -332,11 +476,11 @@ class OwnerMenu:
         bot = event.appid
         acl = self.module('access_control')
         if not acl:
-            await self.reply(event, '授权模块未启用')
+            await self.unavailable(event, '授权模块未启用')
             return
         ninja = self.ninja(bot)
         if not ninja:
-            await self.reply(event, '忍3未启用')
+            await self.unavailable(event, '忍3未启用')
             return
         await ninja.declare(acl, bot)
         before = await self.stamp(bot, group)
@@ -382,7 +526,7 @@ class OwnerMenu:
         nav.append(('返回', ('access',)))
         rows.append(nav)
         if before != await self.stamp(bot, group):
-            await self.reply(event, '名单状态已变化，请重新打开')
+            await self.unavailable(event, '名单状态已变化，请重新打开')
             return
         title = '\n'.join(lines)
         if event.group_id:
@@ -406,7 +550,7 @@ class OwnerMenu:
         sender = self.sender(event.appid)
         result = 'unavailable'
         if address and sender:
-            content, buttons, token, session = self.card(event.appid, event.raw_user_id, '', group, title, rows, stamp=(kind, *stamp))
+            content, buttons, token, session = await self.card(event.appid, event.raw_user_id, '', group, title, rows, stamp=(kind, *stamp))
             facts = self.module('group_state')
             acl = self.module('access_control')
             def check():
@@ -422,7 +566,7 @@ class OwnerMenu:
             except Exception:
                 result = 'unknown'
             if result in {'failed', 'unavailable'}:
-                self.sessions.pop(token, None)
+                await self.store.delete(event.appid, 'cards', token)
         await self.reply(event, '已私聊发送' if result == 'sent' else f'共 {count} 人；' + ('私聊未确认送达，请私聊打开主人菜单' if result == 'unknown' else '私聊不可用，请私聊打开主人菜单'))
 
     async def ninja_list(self, event, group, kind, page):
@@ -537,7 +681,7 @@ class OwnerMenu:
             if not address:
                 self.ctx.log.info('主人菜单恢复推送不可用: no_c2c_address')
                 continue
-            content, buttons, token, _ = self.card(bot, actor, '', '', '待恢复群：\n'+'\n'.join(names)+'\n只确认未退群的已记录成员；退群成员请单人确认；恢复影响此 Bot 所有已知群', [[('全部确认在群并恢复', ('recover_all',))]])
+            content, buttons, token, _ = await self.card(bot, actor, '', '', '待恢复群：\n'+'\n'.join(names)+'\n只确认未退群的已记录成员；退群成员请单人确认；恢复影响此 Bot 所有已知群', [[('全部确认在群并恢复', ('recover_all',))]])
             def check(actor=actor):
                 return self.active and actor in (cfg.get_bot_config(bot) or {}).get('owner_ids', []) and actor not in get_blacklist_map(bot, 'user')
             try:
@@ -548,16 +692,17 @@ class OwnerMenu:
                     code = data.get('code') if isinstance(data, dict) else None
                     # Only the platform code, never its response body or group list.
                     self.ctx.log.info(f'主人菜单恢复推送拒绝 code={code if isinstance(code, (int, str)) else "unknown"}')
-                    self.sessions.pop(token, None)
+                    await self.store.delete(bot, 'cards', token)
             except Exception:
                 self.ctx.log.info('主人菜单恢复推送: unknown')
 
     async def close(self):
         self.active = False
-        self.sessions.clear()
         self.confirmations.pending.clear()
         if self.subscription:
             self.subscription.cancel()
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
+        async with self.action_lock:
+            self.store.close()

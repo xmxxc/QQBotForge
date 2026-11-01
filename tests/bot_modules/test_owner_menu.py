@@ -80,7 +80,7 @@ async def test_pagination_four_rows_and_five_by_five(menu, count):
     assert seen == total
 
 
-@pytest.mark.parametrize('fault', ['other_owner', 'other_group', 'other_bot', 'expired', 'removed', 'forged', 'reload'])
+@pytest.mark.parametrize('fault', ['other_owner', 'other_group', 'other_bot', 'removed', 'forged'])
 async def test_token_binding_and_no_writes(menu, monkeypatch, fault):
     from core.base.config import cfg
     h = menu
@@ -90,26 +90,23 @@ async def test_token_binding_and_no_writes(menu, monkeypatch, fault):
         monkeypatch.setitem(cfg.get_bot_config('bot-a'), 'owner_ids', ['owner-a', 'owner-c'])
     if fault == 'removed':
         monkeypatch.setitem(cfg.get_bot_config('bot-a'), 'owner_ids', [])
-    if fault == 'expired':
-        h.menu().clock = lambda: 10**12
-    if fault == 'reload':
-        assert await h.modules.reload('owner_menu')
     if fault == 'forged':
         data = 'om:' + '0'*32 + ':0'
     await h.click(data, user='owner-c' if fault == 'other_owner' else ('owner-b' if fault == 'other_bot' else 'owner-a'),
                   group='group-b' if fault == 'other_group' else 'group-a', bot='bot-b' if fault == 'other_bot' else 'bot-a')
-    assert '已失效' in str(h.texts()) if fault != 'removed' else True
+    text = str(h.texts())
+    assert ('不匹配' in text or '不可用' in text) if fault != 'removed' else True
     assert not h.menu().confirmations.pending
 
 
-async def test_replay_consumed_before_dispatch(menu):
+async def test_navigation_replay_reads_current_state(menu):
     h = menu
     await h.say('主人菜单', user='owner-a')
     data = button(h, '群状态')
     await h.click(data, user='owner-a', group='group-a')
     h.texts()
     await h.click(data, user='owner-a', group='group-a')
-    assert '已失效' in str(h.texts())
+    assert '已记录成员' in str(h.texts())
 
 
 @pytest.mark.parametrize('result,expected', [((True, {'id': 'fake'}), '已私聊发送'), ((False, {'code': 400}), '私聊不可用'), ((True, {}), '未确认送达'), (None, '私聊不可用')])
@@ -160,7 +157,8 @@ async def test_private_business_group_authorization_and_confirmation(menu):
     assert '已拉黑' in str(h.texts())
     assert len((await h.access.access_snapshot('bot-a', 'ninja3'))['denies']) == 1
     await h.click(data, user='owner-a')
-    assert '已失效' in str(h.texts())
+    assert '拒绝名单' in str(h.texts())
+    assert len((await h.access.access_snapshot('bot-a', 'ninja3'))['denies']) == 1
 
 
 async def test_pagination_state_change_resets_first_page(menu):
@@ -250,7 +248,7 @@ async def test_startup_push_once_and_fallback(menu, monkeypatch, caplog, outcome
     await h.menu().push_pending('bot-a')
     assert len(sent) == (0 if outcome == 'no_address' else 1)
     assert 'sensitive body' not in caplog.text
-    assert not h.menu().sessions if outcome in {'failed', 'no_address'} else True
+    assert not await h.menu().store.all('bot-a', 'cards') if outcome in {'failed', 'no_address'} else True
     assert '待恢复' in str(await h.say('主人菜单', user='owner-a'))
     if outcome == 'sent':
         h.sender.keyboards.append(sent[0][1])
@@ -295,7 +293,9 @@ async def test_confirmation_ttl_exact_boundary(menu, seconds, accepted):
     data = button(h, '确认')
     now[0] += seconds
     await h.click(data, user='owner-a')
-    assert ('已拉黑' if accepted else '已失效') in str(h.texts())
+    assert ('已拉黑' if accepted else '确认拉黑') in str(h.texts())
+    if not accepted:
+        assert not (await h.access.access_snapshot('bot-a', 'ninja3'))['denies']
 
 
 @pytest.mark.parametrize('change', ['acl', 'member', 'owner', 'cancel', 'reject_buttons'])
@@ -396,7 +396,7 @@ async def test_password_batch_buttons_real_engine_fake_platform(menu, changing, 
     await h.finished()
     assert h.center.changes == 1
     await h.click(data, user='owner-a')
-    assert '已失效' in str(h.texts()) and h.center.changes == 1
+    assert '批量改密批次' in str(h.texts()) and h.center.changes == 1
     await private_group(h)
     await press(h, '忍3', group='')
     await press(h, '批量进度与取消', group='')
