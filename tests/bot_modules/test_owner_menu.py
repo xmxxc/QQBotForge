@@ -600,3 +600,36 @@ async def test_bulk_recovery_rechecks_leave_before_confirmation(menu, monkeypatc
     assert member['status'] == 'left' and member['state'] == 'left'
     assert '恢复未完成' in str(reply)
     assert '已确认 0 人' in str(reply)
+
+
+async def test_rebuild_without_member_permission_guides_to_owner_confirmation(menu):
+    # The fake platform answers member queries with 11253, like a Bot without member permission.
+    h = menu
+    await members(h, 2)
+    await private_group(h)
+    await press(h, '群状态', group='')
+    reply = await press(h, '恢复基线', group='')
+    assert '已确认 0 人' not in str(reply)
+    assert '恢复基线未完成' in str(reply) and '平台无权限' in str(reply)
+    assert '全部确认在群并恢复' in str(h.sender.keyboards)
+    for member in ('member-0', 'member-1'):
+        assert not (await h.state.fact('bot-a', 'group-a', member))['member']['reliable']
+    await h.click(next(b['data'] for kb in reversed(h.sender.keyboards) for row in kb for b in row if b['text'] == '全部确认在群并恢复'), user='owner-a', group='')
+    assert '恢复已完成' in str(h.texts())
+    for member in ('member-0', 'member-1'):
+        assert (await h.state.fact('bot-a', 'group-a', member))['member']['source'] == 'owner_confirmed'
+
+
+async def test_group_card_confirmation_covers_every_known_group(menu):
+    # Rebuilding re-verifies every group; confirming only the clicked group cannot succeed.
+    h = menu
+    await h.setup()
+    for group, member in (('group-a', 'member-a'), ('group-b', 'member-b')):
+        await h.state.refresh('bot-a', group)
+        await h.state.confirm_member('bot-a', group, member, evidence='fake verification')
+    assert await h.state.rebuild('bot-a')
+    await private_group(h)
+    await press(h, '群状态', group='')
+    reply = await press(h, '全部确认在群并恢复', group='')
+    assert '恢复已完成' in str(reply), reply
+    assert (await h.state.fact('bot-a', 'group-b', 'member-b'))['member']['source'] == 'owner_confirmed'
