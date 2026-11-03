@@ -208,7 +208,7 @@ install_managed_python() {
 }
 
 backup_invalid_venv() {
-    [[ -e "$VENV_DIR" || -L "$VENV_DIR" ]] || return
+    [[ -e "$VENV_DIR" || -L "$VENV_DIR" ]] || return 0
     local backup="$ROOT_DIR/.venv.backup-$(date +%Y%m%d-%H%M%S)"
     step "现有虚拟环境无效，正在将其移动到 ${backup##*/}。"
     mv -- "$VENV_DIR" "$backup"
