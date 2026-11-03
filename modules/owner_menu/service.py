@@ -314,7 +314,9 @@ class OwnerMenu:
             await self.module('group_state').refresh(bot, group)
             await self.dispatch(event, group, ('state',), await self.module('group_state').snapshot(bot))
         elif kind in {'rebuild', 'recover', 'recover_all'}:
-            await self.recover(event, [group] if kind == 'recover' else None, confirm=kind != 'rebuild')
+            # The baseline is Bot-wide and re-verifies every group, so a group card's
+            # 'recover' confirms every known group like the startup card's 'recover_all'.
+            await self.recover(event, group, confirm=kind != 'rebuild')
         elif kind == 'access':
             await self.show(event, group, '授权管理', [[(label, ('list', key, 0))] for label, key in [('成员列表', 'members'), ('授权列表', 'grants'), ('拉黑列表', 'denies'), ('未授权查询通知', 'notices')]] + [back])
         elif kind == 'list':
@@ -599,12 +601,12 @@ class OwnerMenu:
         nav.append(('返回', ('ninja',)))
         await self.show(event, group, '\n'.join(lines), rows+[nav])
 
-    async def recover(self, event, groups, *, confirm):
+    async def recover(self, event, group, *, confirm):
         from modules.group_state.state import member_departed
         from modules.group_state.text import REASONS
         facts, bot = self.module('group_state'), event.appid
         snapshot = await facts.snapshot(bot)
-        groups = groups if groups is not None else [g['group'] for g in snapshot['groups']]
+        groups = [g['group'] for g in snapshot['groups']]
         count, failed, total, skipped, reason = 0, 0, 0, 0, ''
         try:
             if confirm:
@@ -650,7 +652,26 @@ class OwnerMenu:
             ready = False
             failed = max(failed, total-count)
             reason = str(error) if isinstance(error, ValueError) else type(error).__name__
-        await self.reply(event, f'已确认 {count} 人，' + (f'跳过已退群 {skipped} 人，' if skipped else '') + ('恢复已完成' if ready else f'恢复未完成；失败 {failed} 项：{reason or "状态仍待核验"}') + '（恢复范围为此 Bot 的所有已知群）')
+        scope = '（恢复范围为此 Bot 的所有已知群）'
+        if confirm:
+            await self.reply(event, f'已确认 {count} 人，' + (f'跳过已退群 {skipped} 人，' if skipped else '') + ('恢复已完成' if ready else f'恢复未完成；失败 {failed} 项：{reason or "状态仍待核验"}') + scope)
+        elif ready:
+            await self.reply(event, '恢复基线已完成' + scope)
+        else:
+            # Rebuilding re-verifies members not confirmed since the last baseline; a Bot
+            # without member permission leaves them pending until the owner confirms them.
+            unverified = await self.unverified(bot, groups)
+            text = (f'恢复基线未完成：{unverified} 名成员无法通过平台核验（平台无权限），已转为待核验。'
+                    '请点【全部确认在群并恢复】，由主人确认未退群的已记录成员后恢复') if unverified else f'恢复基线未完成：{reason or "状态仍待核验"}'
+            await self.show(event, group, text + scope, [[('全部确认在群并恢复', ('recover_all',))]])
+
+    async def unverified(self, bot, groups):
+        from modules.group_state.state import member_departed
+        try:
+            rows = [r for g in groups for r in await self.known(bot, g)]
+        except (ValueError, RuntimeError, sqlite3.Error, OSError):
+            return 0
+        return sum(not member_departed(r) and not r.get('reliable') and r.get('reason') == 'permission_denied' for r in rows)
 
     async def available(self, facts):
         # The availability hook runs before ModuleManager publishes setup's return.
